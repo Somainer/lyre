@@ -1,4 +1,4 @@
-"""Introspection tools — let personas (especially leader) see system state.
+"""Introspection tools — let personas (especially dispatcher) see system state.
 
 Terminology:
   - **persona** = role definition (one markdown file under personas/). Static.
@@ -244,7 +244,7 @@ async def _next_auto_name(ctx: ToolContext, persona_name: str) -> str:
 
     Used when the model doesn't supply `name`. The numeric suffix is
     intentionally bland — a meaningful name is the model's job. See
-    leader.md's "派活前先盘点" section for the reuse-vs-spawn discipline.
+    dispatcher.md's "派活前先盘点" section for the reuse-vs-spawn discipline.
     """
     existing = await ctx.repos.agents.list_by_persona(
         persona_name, include_archived=True
@@ -321,7 +321,7 @@ async def _create_agent(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any
     # Pre-create the agent's private notes file so future wakeups of this
     # agent can `read_memory("facts/agent-<id>-notes.md")` without needing
     # to discover the path. Mirrors what seed_default_agents does for
-    # owner/leader; covers ad-hoc agents (workers etc.) spawned at runtime.
+    # bootstrap agents; covers ad-hoc agents (workers etc.) spawned at runtime.
     notes_path: str | None = None
     root_str = ctx.extras.get("memory_root")
     if root_str:
@@ -396,7 +396,10 @@ async def _archive_agent(
     agent_id = args.get("agent_id")
     if not isinstance(agent_id, str) or not agent_id:
         raise ToolError("agent_id required (string)")
-    if agent_id in ("owner", "leader"):
+    bootstrap_ids = ctx.extras.get("bootstrap_agent_ids") or frozenset(
+        {"owner", "dispatcher", "analyst-1", "reviewer-1"}
+    )
+    if agent_id in bootstrap_ids:
         raise ToolError(
             f"refusing to archive well-known agent {agent_id!r}; "
             f"this would break system bootstrap"
@@ -418,8 +421,8 @@ ARCHIVE_AGENT = Tool(
     name="archive_agent",
     description=(
         "Soft-archive an agent. New mail/dispatch is blocked but mailbox and "
-        "history stay. In-flight tasks finish. Cannot archive 'owner' or "
-        "'leader' — they are bootstrap-pinned."
+        "history stay. In-flight tasks finish. Cannot archive bootstrap-pinned "
+        "agents (owner, dispatcher, analyst-1, reviewer-1)."
     ),
     input_schema={
         "type": "object",

@@ -230,7 +230,7 @@ def _build_identity_preamble(
     given (agent_id, persona_name, parent_agent_id) — maximizes
     Anthropic / DeepSeek prefix-cache hits across wakeups. The
     parent-agent line only appears when there IS a parent (spawned
-    agents); bootstrap roots like `owner`/`leader` see the prompt
+    agents); bootstrap roots like `owner`/`dispatcher` see the prompt
     without that line, preserving cache reuse for them too."""
     # `persona/name` ids would otherwise hint at a directory layer in
     # the notes path; flatten `/` to `-` to match

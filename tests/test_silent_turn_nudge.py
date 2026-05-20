@@ -41,21 +41,21 @@ from .helpers import build_single_candidate_loop
 async def _ctx(repos: SqliteRepositories) -> ToolContext:
     """Spin up a usable ToolContext so mailbox/list tools actually work."""
     await repos.personas.upsert(
-        Persona(name="leader", role_description="l", system_prompt="l")
+        Persona(name="dispatcher", role_description="l", system_prompt="l")
     )
     await repos.personas.upsert(
         Persona(name="owner", role_description="o", system_prompt="o")
     )
-    await repos.agents.create(agent_id="leader", persona_name="leader")
+    await repos.agents.create(agent_id="dispatcher", persona_name="dispatcher")
     await repos.agents.create(agent_id="owner", persona_name="owner")
     task_id = await repos.tasks.create(
-        TaskSpec(agent_id="leader", goal="g", acceptance="a")
+        TaskSpec(agent_id="dispatcher", goal="g", acceptance="a")
     )
-    wakeup_id = await repos.wakeups.start(task_id, "leader")
+    wakeup_id = await repos.wakeups.start(task_id, "dispatcher")
     await repos.tasks.claim_lease(task_id, wakeup_id, duration_sec=600)
     return ToolContext(
         repos=repos, task_id=task_id, wakeup_id=wakeup_id,
-        persona_name="leader", agent_id="leader",
+        persona_name="dispatcher", agent_id="dispatcher",
     )
 
 

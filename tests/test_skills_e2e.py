@@ -5,9 +5,9 @@ Agent Skills standard):
 
   Worker (task #1)
     → python_exec writes ~/.lyre/skills/proposed/<name>/SKILL.md
-    → mailbox_send to leader "I proposed skill <name>"
+    → mailbox_send to dispatcher "I proposed skill <name>"
 
-  Reviewer-skill (task #2; in production dispatched by leader)
+  Reviewer-skill (task #2; in production dispatched by dispatcher)
     → shell_exec mv proposed/<name>  approved/<name>   (or rm -r to reject)
 
   Worker (task #3) — fresh wakeup
@@ -90,7 +90,7 @@ async def _seed_personas(repos: SqliteRepositories) -> None:
     )
     await repos.personas.upsert(
         Persona(
-            name="leader", role_description="leader",
+            name="dispatcher", role_description="dispatcher",
             system_prompt="l", allowed_lyre_tools=["mailbox_send"],
             model_preference={
                 "tier": "flagship", "requires": ["tool_use"], "prefer": [],
@@ -99,8 +99,8 @@ async def _seed_personas(repos: SqliteRepositories) -> None:
         )
     )
     # Post-A3: scheduler/router/Phase 0 all key off agents.
-    await repos.agents.create(agent_id="leader", persona_name="leader")
-    await repos.agents.create(agent_id="owner", persona_name="leader")
+    await repos.agents.create(agent_id="dispatcher", persona_name="dispatcher")
+    await repos.agents.create(agent_id="owner", persona_name="dispatcher")
     await repos.agents.create(
         agent_id="worker-1", persona_name="worker-maintainer"
     )
@@ -108,7 +108,7 @@ async def _seed_personas(repos: SqliteRepositories) -> None:
         agent_id="reviewer-1", persona_name="reviewer"
     )
     await repos.mailbox.ensure_mailbox("owner")
-    await repos.mailbox.ensure_mailbox("leader")
+    await repos.mailbox.ensure_mailbox("dispatcher")
 
 
 def _registry():
@@ -188,7 +188,7 @@ async def test_skill_proposal_approve_reuse_loop(
         ToolUseComplete(
             id="w1-t2", name="mailbox_send",
             input={
-                "to": "leader",
+                "to": "dispatcher",
                 "body": f"I proposed skill {name}, please request review.",
             },
         ),
@@ -243,7 +243,7 @@ async def test_skill_proposal_approve_reuse_loop(
         ToolUseComplete(
             id="r3", name="mailbox_send",
             input={
-                "to": "leader",
+                "to": "dispatcher",
                 "body": f"approved skill {name} — moved to approved/",
             },
         ),
@@ -355,7 +355,7 @@ async def test_skill_rejection_removes_proposal_and_hides_from_index(
     ])
     reviewer_adapter.push_turn([
         ToolUseComplete(id="r2", name="mailbox_send",
-                        input={"to": "leader",
+                        input={"to": "dispatcher",
                                "body": f"rejected {name}: too task-specific"}),
         TurnComplete(stop_reason="tool_use"),
     ])

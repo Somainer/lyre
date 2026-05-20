@@ -263,8 +263,8 @@ async def test_compact_drops_idempotent_and_listing_tools() -> None:
             {"id": "tu3", "name": "mailbox_read", "input": {}},
         ),
         _tool_results(
-            {"id": "tu1", "result": '[{"id":"leader"}]'},
-            {"id": "tu2", "result": '[{"name":"leader"}]'},
+            {"id": "tu1", "result": '[{"id":"dispatcher"}]'},
+            {"id": "tu2", "result": '[{"name":"dispatcher"}]'},
             {"id": "tu3", "result": '{"messages":[]}'},
         ),
         _assistant_with_tools(

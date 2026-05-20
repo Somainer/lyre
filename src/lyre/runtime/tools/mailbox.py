@@ -50,7 +50,7 @@ async def _mailbox_send(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any
 
     # Recipients are AGENT IDs (post-A3). Validate every one against the
     # agents table — surfaces typos and model hallucinations (e.g. inventing
-    # `leader-scheduler`) as a tool error, so the agent loop hands the
+    # `dispatcher-scheduler`) as a tool error, so the agent loop hands the
     # model the error and lets it retry on the next turn instead of
     # silently dropping mail into a non-existent inbox.
     known: set[str] = {a.id for a in await ctx.repos.agents.list_all()}

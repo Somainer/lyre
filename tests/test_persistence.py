@@ -17,26 +17,26 @@ from lyre.persistence.sqlite_impl import SqliteRepositories
 @pytest.mark.asyncio
 async def test_persona_upsert_and_get(repos: SqliteRepositories) -> None:
     p = Persona(
-        name="leader",
+        name="dispatcher",
         role_description="boss",
         system_prompt="you lead",
         allowed_lyre_tools=["mailbox_send", "dispatch_task"],
     )
     await repos.personas.upsert(p)
-    fetched = await repos.personas.get("leader")
+    fetched = await repos.personas.get("dispatcher")
     assert fetched is not None
-    assert fetched.name == "leader"
+    assert fetched.name == "dispatcher"
     assert fetched.allowed_lyre_tools == ["mailbox_send", "dispatch_task"]
     assert fetched.status == "approved"
 
     p2 = Persona(
-        name="leader",
+        name="dispatcher",
         role_description="boss v2",
         system_prompt="you lead v2",
         allowed_lyre_tools=["mailbox_send"],
     )
     await repos.personas.upsert(p2)
-    fetched2 = await repos.personas.get("leader")
+    fetched2 = await repos.personas.get("dispatcher")
     assert fetched2 is not None
     assert fetched2.role_description == "boss v2"
 
@@ -104,14 +104,14 @@ async def test_task_expired_lease_is_reclaimable(
 @pytest.mark.asyncio
 async def test_mailbox_insert_read_mark(repos: SqliteRepositories) -> None:
     await repos.mailbox.ensure_mailbox("owner")
-    await repos.mailbox.ensure_mailbox("leader")
+    await repos.mailbox.ensure_mailbox("dispatcher")
 
     msg = MailboxMessage(
-        recipient="leader",
+        recipient="dispatcher",
         external_id="ext-1",
         sender="owner",
         urgency="normal",
-        body="hello leader",
+        body="hello dispatcher",
     )
     msg_id = await repos.mailbox.insert_message(msg)
     assert msg_id > 0
@@ -120,18 +120,18 @@ async def test_mailbox_insert_read_mark(repos: SqliteRepositories) -> None:
     dup_id = await repos.mailbox.insert_message(msg)
     assert dup_id == -1, "duplicate external_id should not produce a new row"
 
-    msgs = await repos.mailbox.read_messages("leader")
+    msgs = await repos.mailbox.read_messages("dispatcher")
     assert len(msgs) == 1
-    assert msgs[0].body == "hello leader"
+    assert msgs[0].body == "hello dispatcher"
 
     # Per-message read state: mark + verify it's filtered from read_unread
-    await repos.mailbox.mark_messages_read("leader", [msg_id])
-    assert await repos.mailbox.count_unread("leader") == 0
-    unread = await repos.mailbox.read_unread("leader")
+    await repos.mailbox.mark_messages_read("dispatcher", [msg_id])
+    assert await repos.mailbox.count_unread("dispatcher") == 0
+    unread = await repos.mailbox.read_unread("dispatcher")
     assert unread == []
 
     # since_id filter (system-side read_messages still works)
-    msgs2 = await repos.mailbox.read_messages("leader", since_id=msg_id)
+    msgs2 = await repos.mailbox.read_messages("dispatcher", since_id=msg_id)
     assert msgs2 == []
 
 

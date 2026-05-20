@@ -193,11 +193,11 @@ def test_assemble_system_prompt_includes_parent_hint_for_spawned() -> None:
     from types import SimpleNamespace
 
     other_agents = [
-        SimpleNamespace(id="worker", parent_agent_id="leader"),
+        SimpleNamespace(id="worker", parent_agent_id="dispatcher"),
     ]
     prompt = assemble_system_prompt(_persona(), other_agents=other_agents)
-    assert "You were spawned by `leader`" in prompt
-    assert "mailbox_send to `leader`" in prompt
+    assert "You were spawned by `dispatcher`" in prompt
+    assert "mailbox_send to `dispatcher`" in prompt
 
 
 def test_assemble_system_prompt_with_empty_memory_root_no_section(

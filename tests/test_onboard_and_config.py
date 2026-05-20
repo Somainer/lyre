@@ -119,7 +119,7 @@ def test_config_parses_persona_overrides(
 [owner]
 name = "o"
 
-[personas.leader]
+[personas.dispatcher]
 model_preference = { prefer = ["anthropic.claude-opus-4-7"] }
 """,
         encoding="utf-8",
@@ -127,10 +127,67 @@ model_preference = { prefer = ["anthropic.claude-opus-4-7"] }
 
     cfg = Config.from_env()
 
-    assert "leader" in cfg.persona_overrides
-    o = cfg.persona_overrides["leader"]
+    assert "dispatcher" in cfg.persona_overrides
+    o = cfg.persona_overrides["dispatcher"]
     assert isinstance(o, PersonaOverride)
     assert o.model_preference == {"prefer": ["anthropic.claude-opus-4-7"]}
+
+
+def test_config_bootstrap_defaults_when_section_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LYRE_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    cfg = Config.from_env()
+    assert cfg.bootstrap.dispatcher_id == "dispatcher"
+    assert cfg.bootstrap.analyst_id == "analyst-1"
+    assert cfg.bootstrap.reviewer_id == "reviewer-1"
+
+
+def test_config_bootstrap_reads_custom_agent_ids(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LYRE_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "config.toml").write_text(
+        """
+[owner]
+name = "o"
+
+[bootstrap]
+dispatcher_id = "luna"
+analyst_id = "scribe"
+reviewer_id = "cassandra"
+""",
+        encoding="utf-8",
+    )
+
+    cfg = Config.from_env()
+    assert cfg.bootstrap.dispatcher_id == "luna"
+    assert cfg.bootstrap.analyst_id == "scribe"
+    assert cfg.bootstrap.reviewer_id == "cassandra"
+
+
+def test_bootstrap_runtime_uses_custom_dispatcher_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When config.toml [bootstrap] gives custom names, seeded agents use those."""
+    import asyncio
+
+    monkeypatch.setenv("LYRE_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "config.toml").write_text(
+        '[owner]\nname = "o"\n\n[bootstrap]\ndispatcher_id = "luna"\n'
+        'analyst_id = "scribe"\nreviewer_id = "cassandra"\n',
+        encoding="utf-8",
+    )
+    cfg = Config.from_env()
+    created = asyncio.run(bootstrap_runtime(cfg))
+    assert {"luna", "scribe", "cassandra"} <= set(created)
+    # Notes files created under the custom names.
+    assert (cfg.memory_path / "facts" / "agent-luna-notes.md").is_file()
+    assert (cfg.memory_path / "facts" / "agent-scribe-notes.md").is_file()
+    assert (cfg.memory_path / "facts" / "agent-cassandra-notes.md").is_file()
 
 
 def test_config_is_onboarded_reflects_config_toml_presence(
@@ -598,13 +655,13 @@ async def test_bootstrap_runtime_creates_db_and_seeds(
 
     created_agents = await bootstrap_runtime(cfg)
 
-    # First bootstrap creates owner + leader + reviewer-1.
-    assert set(created_agents) == {"owner", "leader", "reviewer-1"}
+    # First bootstrap creates owner + dispatcher + analyst-1 + reviewer-1.
+    assert set(created_agents) == {"owner", "dispatcher", "analyst-1", "reviewer-1"}
     assert cfg.db_path.exists()
     assert (cfg.memory_path / "facts").is_dir()
     # Per-agent notebook files appeared.
     assert (cfg.memory_path / "facts" / "agent-owner-notes.md").is_file()
-    assert (cfg.memory_path / "facts" / "agent-leader-notes.md").is_file()
+    assert (cfg.memory_path / "facts" / "agent-dispatcher-notes.md").is_file()
 
 
 @pytest.mark.asyncio
@@ -640,7 +697,7 @@ async def test_bootstrap_copies_shipped_personas_as_directory_layout(
 
     user_personas = cfg.user_personas_dir
     # Every shipped persona has been materialized as <name>/identity.md.
-    expected_personas = {"owner", "leader", "worker-maintainer", "reviewer"}
+    expected_personas = {"owner", "dispatcher", "analyst", "worker-maintainer", "reviewer"}
     for name in expected_personas:
         assert (user_personas / name / "identity.md").is_file(), name
 
@@ -656,38 +713,38 @@ async def test_user_persona_edits_survive_re_bootstrap(
     cfg = Config.from_env()
     await bootstrap_runtime(cfg)
 
-    leader_identity = cfg.user_personas_dir / "leader" / "identity.md"
+    dispatcher_identity = cfg.user_personas_dir / "dispatcher" / "identity.md"
     user_marker = "\n\n# USER-EDITED LINE (do not overwrite)\n"
-    leader_identity.write_text(
-        leader_identity.read_text(encoding="utf-8") + user_marker,
+    dispatcher_identity.write_text(
+        dispatcher_identity.read_text(encoding="utf-8") + user_marker,
         encoding="utf-8",
     )
 
     await bootstrap_runtime(cfg)
 
-    assert user_marker.strip() in leader_identity.read_text(encoding="utf-8")
+    assert user_marker.strip() in dispatcher_identity.read_text(encoding="utf-8")
 
 
 def test_discover_persona_prefers_directory_over_flat(tmp_path: Path) -> None:
     """If both <name>.md and <name>/identity.md exist, directory wins."""
     from lyre.personas.seed import discover_persona_files
 
-    (tmp_path / "leader.md").write_text(
-        "---\nname: leader\nrole_description: flat\n---\nflat body",
+    (tmp_path / "dispatcher.md").write_text(
+        "---\nname: dispatcher\nrole_description: flat\n---\nflat body",
         encoding="utf-8",
     )
-    leader_dir = tmp_path / "leader"
-    leader_dir.mkdir()
-    (leader_dir / "identity.md").write_text(
-        "---\nname: leader\nrole_description: dir\n---\ndir body",
+    dispatcher_dir = tmp_path / "dispatcher"
+    dispatcher_dir.mkdir()
+    (dispatcher_dir / "identity.md").write_text(
+        "---\nname: dispatcher\nrole_description: dir\n---\ndir body",
         encoding="utf-8",
     )
 
     files = discover_persona_files(tmp_path)
-    leader_files = [p for p in files if p.stem in ("leader", "identity")]
-    assert len(leader_files) == 1
-    # Directory wins → the resolved file lives under leader/ .
-    assert leader_files[0] == leader_dir / "identity.md"
+    dispatcher_files = [p for p in files if p.stem in ("dispatcher", "identity")]
+    assert len(dispatcher_files) == 1
+    # Directory wins → the resolved file lives under dispatcher/ .
+    assert dispatcher_files[0] == dispatcher_dir / "identity.md"
 
 
 def test_discover_persona_falls_back_to_shipped_when_user_dir_empty(
@@ -702,4 +759,4 @@ def test_discover_persona_falls_back_to_shipped_when_user_dir_empty(
     files = discover_persona_files(empty)
     # Falls back to shipped personas.
     names = {p.stem for p in files}
-    assert names == {"owner", "leader", "worker-maintainer", "reviewer"}
+    assert names == {"owner", "dispatcher", "analyst", "worker-maintainer", "reviewer"}

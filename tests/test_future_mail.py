@@ -59,17 +59,17 @@ def _config(tmp_path: Path) -> Config:
 
 
 async def _seed(repos: SqliteRepositories) -> None:
-    for name in ("leader", "worker-maintainer", "owner"):
+    for name in ("dispatcher", "worker-maintainer", "owner"):
         await repos.personas.upsert(
             Persona(name=name, role_description=name, system_prompt=name)
         )
     await repos.agents.create(agent_id="owner", persona_name="owner")
-    await repos.agents.create(agent_id="leader", persona_name="leader")
+    await repos.agents.create(agent_id="dispatcher", persona_name="dispatcher")
     await repos.agents.create(
         agent_id="worker-1", persona_name="worker-maintainer"
     )
     await repos.mailbox.ensure_mailbox("owner")
-    await repos.mailbox.ensure_mailbox("leader")
+    await repos.mailbox.ensure_mailbox("dispatcher")
 
 
 def _make_scheduler(repos: SqliteRepositories, cfg: Config) -> Scheduler:
@@ -184,13 +184,13 @@ async def ctx(repos: SqliteRepositories) -> ToolContext:
     task_id = await repos.tasks.create(
         # Use TaskSpec via direct insert to keep this independent of dispatch.
         __import__("lyre.persistence.models", fromlist=["TaskSpec"]).TaskSpec(
-            agent_id="leader", goal="g", acceptance="a"
+            agent_id="dispatcher", goal="g", acceptance="a"
         )
     )
-    wakeup_id = await repos.wakeups.start(task_id, "leader")
+    wakeup_id = await repos.wakeups.start(task_id, "dispatcher")
     return ToolContext(
         repos=repos, task_id=task_id, wakeup_id=wakeup_id,
-        persona_name="leader", agent_id="leader",
+        persona_name="dispatcher", agent_id="dispatcher",
     )
 
 
@@ -330,7 +330,7 @@ async def test_phase_minus_one_delivers_one_shot(
     past = datetime.now(UTC) - timedelta(minutes=5)
     sid = await repos.scheduled_mail.create(
         ScheduledMail(
-            recipient="leader", sender="owner", urgency="normal",
+            recipient="dispatcher", sender="owner", urgency="normal",
             body="overdue", scheduled_for=past, created_by_agent="owner",
         )
     )
@@ -342,7 +342,7 @@ async def test_phase_minus_one_delivers_one_shot(
     assert row.status == "completed"
     assert row.last_delivery_id is not None
     assert row.occurrence_count == 1
-    msgs = await repos.mailbox.read_messages("leader", since_id=0)
+    msgs = await repos.mailbox.read_messages("dispatcher", since_id=0)
     assert any(m.body == "overdue" for m in msgs)
 
 
@@ -357,7 +357,7 @@ async def test_phase_minus_one_recurring_advances_scheduled_for(
     past = datetime.now(UTC) - timedelta(minutes=5)
     sid = await repos.scheduled_mail.create(
         ScheduledMail(
-            recipient="leader", sender="owner", urgency="normal",
+            recipient="dispatcher", sender="owner", urgency="normal",
             body="recur", scheduled_for=past,
             recur_kind="interval", recur_value="1h",
             recur_until=datetime.now(UTC) + timedelta(days=7),
@@ -390,7 +390,7 @@ async def test_phase_minus_one_completes_past_recur_until(
     # recur_until is BEFORE the next-would-be-fire (1h ahead).
     sid = await repos.scheduled_mail.create(
         ScheduledMail(
-            recipient="leader", sender="owner", urgency="normal",
+            recipient="dispatcher", sender="owner", urgency="normal",
             body="last", scheduled_for=past,
             recur_kind="interval", recur_value="1h",
             recur_until=datetime.now(UTC) - timedelta(minutes=1),
@@ -416,8 +416,8 @@ async def test_phase_minus_one_bounces_archived_recipient(
     past = datetime.now(UTC) - timedelta(minutes=5)
     sid = await repos.scheduled_mail.create(
         ScheduledMail(
-            recipient="worker-1", sender="leader", urgency="normal",
-            body="ping", scheduled_for=past, created_by_agent="leader",
+            recipient="worker-1", sender="dispatcher", urgency="normal",
+            body="ping", scheduled_for=past, created_by_agent="dispatcher",
         )
     )
 
@@ -427,7 +427,7 @@ async def test_phase_minus_one_bounces_archived_recipient(
     row = await repos.scheduled_mail.get(sid)
     assert row.status == "bounced"
     # Leader (creator) got a bounce notice
-    msgs = await repos.mailbox.read_messages("leader", since_id=0)
+    msgs = await repos.mailbox.read_messages("dispatcher", since_id=0)
     bounce_msgs = [
         m for m in msgs
         if m.metadata and m.metadata.get("bounce") is True
@@ -445,7 +445,7 @@ async def test_phase_minus_one_skips_not_yet_due(
     future = datetime.now(UTC) + timedelta(hours=1)
     sid = await repos.scheduled_mail.create(
         ScheduledMail(
-            recipient="leader", sender="owner", urgency="normal",
+            recipient="dispatcher", sender="owner", urgency="normal",
             body="later", scheduled_for=future, created_by_agent="owner",
         )
     )
@@ -453,7 +453,7 @@ async def test_phase_minus_one_skips_not_yet_due(
     await sched._deliver_scheduled_mail()
     row = await repos.scheduled_mail.get(sid)
     assert row.status == "pending"
-    msgs = await repos.mailbox.read_messages("leader", since_id=0)
+    msgs = await repos.mailbox.read_messages("dispatcher", since_id=0)
     assert not any(m.body == "later" for m in msgs)
 
 
@@ -502,7 +502,7 @@ async def test_cancel_stops_recurring(
     past = datetime.now(UTC) - timedelta(minutes=5)
     sid = await repos.scheduled_mail.create(
         ScheduledMail(
-            recipient="leader", sender="owner", urgency="normal",
+            recipient="dispatcher", sender="owner", urgency="normal",
             body="r", scheduled_for=past,
             recur_kind="interval", recur_value="1h",
             recur_until=datetime.now(UTC) + timedelta(days=7),
@@ -510,10 +510,10 @@ async def test_cancel_stops_recurring(
         )
     )
     await repos.scheduled_mail.mark_cancelled(sid, "owner", "test")
-    before = await repos.mailbox.read_messages("leader", since_id=0)
+    before = await repos.mailbox.read_messages("dispatcher", since_id=0)
     sched = _make_scheduler(repos, cfg)
     await sched._deliver_scheduled_mail()
-    after = await repos.mailbox.read_messages("leader", since_id=0)
+    after = await repos.mailbox.read_messages("dispatcher", since_id=0)
     assert len(after) == len(before)
 
 
@@ -555,7 +555,7 @@ async def test_double_tick_does_not_double_deliver_oneshot(
     past = datetime.now(UTC) - timedelta(minutes=5)
     sid = await repos.scheduled_mail.create(
         ScheduledMail(
-            recipient="leader", sender="owner", urgency="normal",
+            recipient="dispatcher", sender="owner", urgency="normal",
             body="once", scheduled_for=past, created_by_agent="owner",
         )
     )
@@ -568,5 +568,5 @@ async def test_double_tick_does_not_double_deliver_oneshot(
     )
     await repos.scheduled_mail.conn.commit()
     await sched._deliver_scheduled_mail()
-    msgs = await repos.mailbox.read_messages("leader", since_id=0)
+    msgs = await repos.mailbox.read_messages("dispatcher", since_id=0)
     assert sum(1 for m in msgs if m.body == "once") == 1

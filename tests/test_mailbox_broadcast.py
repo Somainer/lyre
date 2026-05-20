@@ -65,22 +65,22 @@ async def test_migration_runner_idempotent_on_reinit(tmp_path: Path) -> None:
 
 @pytest.fixture
 async def ctx(repos: SqliteRepositories) -> ToolContext:
-    for name in ("leader", "worker-maintainer", "reviewer", "owner"):
+    for name in ("dispatcher", "worker-maintainer", "reviewer", "owner"):
         await repos.personas.upsert(
             Persona(name=name, role_description=f"{name} role", system_prompt=name)
         )
         # Seed a matching agent so post-A3 recipient validation accepts
-        # mail addressed to these names (the seeded owner/leader follow
+        # mail addressed to these names (the seeded owner/dispatcher follow
         # the same id == persona pattern in production).
         await repos.agents.create(agent_id=name, persona_name=name)
     task_id = await repos.tasks.create(
-        TaskSpec(agent_id="leader", goal="g", acceptance="a")
+        TaskSpec(agent_id="dispatcher", goal="g", acceptance="a")
     )
-    wakeup_id = await repos.wakeups.start(task_id, "leader")
+    wakeup_id = await repos.wakeups.start(task_id, "dispatcher")
     await repos.tasks.claim_lease(task_id, wakeup_id, duration_sec=600)
     return ToolContext(
         repos=repos, task_id=task_id, wakeup_id=wakeup_id,
-        persona_name="leader", agent_id="leader",
+        persona_name="dispatcher", agent_id="dispatcher",
     )
 
 
@@ -153,11 +153,11 @@ async def test_broadcast_delivered_via_dispatcher_yields_n_rows(
 
 @pytest.mark.asyncio
 async def test_reply_to_sets_parent_msg_id(ctx: ToolContext) -> None:
-    # Seed a parent message in leader's mailbox
-    await ctx.repos.mailbox.ensure_mailbox("leader")
+    # Seed a parent message in dispatcher's mailbox
+    await ctx.repos.mailbox.ensure_mailbox("dispatcher")
     parent_id = await ctx.repos.mailbox.insert_message(
         MailboxMessage(
-            recipient="leader", external_id="px",
+            recipient="dispatcher", external_id="px",
             sender="owner", urgency="normal", body="please report",
         )
     )
@@ -179,10 +179,10 @@ async def test_reply_to_sets_parent_msg_id(ctx: ToolContext) -> None:
 
 @pytest.mark.asyncio
 async def test_forward_msg_id_lands_in_metadata(ctx: ToolContext) -> None:
-    await ctx.repos.mailbox.ensure_mailbox("leader")
+    await ctx.repos.mailbox.ensure_mailbox("dispatcher")
     original_id = await ctx.repos.mailbox.insert_message(
         MailboxMessage(
-            recipient="leader", external_id="o",
+            recipient="dispatcher", external_id="o",
             sender="owner", urgency="normal", body="big intent",
         )
     )
@@ -208,7 +208,7 @@ async def test_refuse_to_send_to_self(ctx: ToolContext) -> None:
     with pytest.raises(ToolError, match="refusing to send to self"):
         await MAILBOX_SEND.handler(
             ctx,
-            {"to": ["leader", "owner"], "body": "x", "_tool_use_id": "t"},
+            {"to": ["dispatcher", "owner"], "body": "x", "_tool_use_id": "t"},
         )
 
 
@@ -238,7 +238,7 @@ async def test_mailbox_get_message_fetches_any_recipient(
         MailboxMessage(
             recipient="worker-maintainer",
             external_id="e",
-            sender="leader",
+            sender="dispatcher",
             urgency="normal",
             body="hi worker",
             broadcast_id="bc-x",
@@ -277,18 +277,18 @@ class _FakeAgent:
 
 def test_format_agents_directory_excludes_self() -> None:
     personas = [
-        Persona(name="leader", role_description="lead", system_prompt=""),
+        Persona(name="dispatcher", role_description="lead", system_prompt=""),
         Persona(name="worker-maintainer", role_description="works", system_prompt=""),
         Persona(name="owner", role_description="the human", system_prompt=""),
     ]
     agents = [
-        _FakeAgent("leader", "leader"),
+        _FakeAgent("dispatcher", "dispatcher"),
         _FakeAgent("worker-1", "worker-maintainer"),
         _FakeAgent("owner", "owner"),
     ]
-    out = _format_agents_directory(agents, self_id="leader", personas=personas)
+    out = _format_agents_directory(agents, self_id="dispatcher", personas=personas)
     # Self never appears in own directory
-    assert "leader (persona=" not in out
+    assert "dispatcher (persona=" not in out
     assert "worker-1 (persona=worker-maintainer)" in out
     assert "owner (persona=owner)" in out
     # The header now talks about agent ids, not persona names
@@ -301,10 +301,10 @@ def test_assemble_system_prompt_no_longer_lists_agents_in_prompt() -> None:
     directory removed from the prompt — model calls list_agents() on
     demand instead."""
     personas = [
-        Persona(name="leader", role_description="lead", system_prompt=""),
+        Persona(name="dispatcher", role_description="lead", system_prompt=""),
         Persona(name="worker-maintainer", role_description="works", system_prompt=""),
     ]
-    me = Persona(name="leader", role_description="lead", system_prompt="be terse")
+    me = Persona(name="dispatcher", role_description="lead", system_prompt="be terse")
     prompt = assemble_system_prompt(me, other_personas=personas)
     # The static directory block is gone — no header, no per-agent lines.
     assert "## Agents you can mailbox_send to" not in prompt
@@ -315,13 +315,13 @@ def test_assemble_system_prompt_no_longer_lists_agents_in_prompt() -> None:
 
 
 def test_assemble_system_prompt_includes_identity_preamble() -> None:
-    """Regression for the 'leader-scheduler' hallucination: the model
+    """Regression for the 'dispatcher-scheduler' hallucination: the model
     needs an unambiguous declaration of its own agent id as the very
     first thing in the prompt so it doesn't synthesize variants."""
-    me = Persona(name="leader", role_description="lead", system_prompt="be terse")
-    prompt = assemble_system_prompt(me, agent_id="leader")
-    assert prompt.lstrip().startswith("You are agent **leader**")
-    assert "mailbox key is `leader`" in prompt
+    me = Persona(name="dispatcher", role_description="lead", system_prompt="be terse")
+    prompt = assemble_system_prompt(me, agent_id="dispatcher")
+    assert prompt.lstrip().startswith("You are agent **dispatcher**")
+    assert "mailbox key is `dispatcher`" in prompt
     assert "synthesize variants" in prompt
 
 
@@ -342,8 +342,8 @@ def test_identity_preamble_states_text_is_not_delivered() -> None:
     text WAS the reply (Claude API convention) and ended turn without
     mailbox_send. The preamble must explicitly say only tool calls
     deliver anything — text is internal monologue."""
-    me = Persona(name="leader", role_description="lead", system_prompt="b")
-    prompt = assemble_system_prompt(me, agent_id="leader")
+    me = Persona(name="dispatcher", role_description="lead", system_prompt="b")
+    prompt = assemble_system_prompt(me, agent_id="dispatcher")
     # Must clarify text != delivery
     assert "internal monologue" in prompt
     # Must name the canonical reply tool
@@ -358,14 +358,14 @@ def test_identity_preamble_teaches_stateless_wakeups() -> None:
     preamble must explicitly call out statelessness AND list the
     canonical persistence channels: sent-box recall, future mail to
     self, the notes file, and report_progress (crash-recovery only)."""
-    me = Persona(name="leader", role_description="lead", system_prompt="b")
-    prompt = assemble_system_prompt(me, agent_id="leader")
+    me = Persona(name="dispatcher", role_description="lead", system_prompt="b")
+    prompt = assemble_system_prompt(me, agent_id="dispatcher")
     assert "STATELESS WAKEUPS" in prompt
     # Canonical persistence channels
     assert 'mailbox_read(box="sent")' in prompt
-    assert "deliver_in" in prompt and 'to="leader"' in prompt
+    assert "deliver_in" in prompt and 'to="dispatcher"' in prompt
     # Notes file path must be in the preamble, plugged with agent id
-    assert "facts/agent-leader-notes.md" in prompt
+    assert "facts/agent-dispatcher-notes.md" in prompt
     # report_progress repositioned as crash-recovery only
     assert "crash" in prompt.lower()
 
@@ -377,8 +377,8 @@ def test_identity_preamble_teaches_ack_and_stop_anti_pattern() -> None:
     to 'ACK-AND-STOP IS A LIE' once the agent_loop bug was fixed —
     the loop now enforces the mechanics, so the prompt only needs to
     teach the behavioral preference."""
-    me = Persona(name="leader", role_description="lead", system_prompt="b")
-    prompt = assemble_system_prompt(me, agent_id="leader")
+    me = Persona(name="dispatcher", role_description="lead", system_prompt="b")
+    prompt = assemble_system_prompt(me, agent_id="dispatcher")
     # Anti-pattern named with the exact phrases models tend to emit
     assert "background task" in prompt
     assert "IOU" in prompt or "稍后回复" in prompt
@@ -393,8 +393,8 @@ def test_identity_preamble_blocks_phantom_delegation() -> None:
     """If the model says 'I started a background task' WITHOUT calling
     dispatch_task, that's a hallucination. The preamble must name
     this failure mode explicitly so the model recognises it."""
-    me = Persona(name="leader", role_description="lead", system_prompt="b")
-    prompt = assemble_system_prompt(me, agent_id="leader")
+    me = Persona(name="dispatcher", role_description="lead", system_prompt="b")
+    prompt = assemble_system_prompt(me, agent_id="dispatcher")
     assert "No phantom delegation" in prompt or "phantom delegation" in prompt.lower()
     assert "task_id" in prompt  # must require a concrete artifact
 
@@ -403,8 +403,8 @@ def test_identity_preamble_teaches_delegation_and_progress_via_mail() -> None:
     """Delegating to subagents must come with the 'always report before
     idling' invariant; long-running work reports progress via mail
     (no special tool)."""
-    me = Persona(name="leader", role_description="lead", system_prompt="b")
-    prompt = assemble_system_prompt(me, agent_id="leader")
+    me = Persona(name="dispatcher", role_description="lead", system_prompt="b")
+    prompt = assemble_system_prompt(me, agent_id="dispatcher")
     assert "DELEGATING WORK" in prompt
     assert "PROGRESS VIA MAIL" in prompt
     # Subagent → idle without reporting is the failure mode we warn about
@@ -420,7 +420,7 @@ def test_global_system_md_is_appended(tmp_path):
     """`~/.lyre/SYSTEM.md` content is concatenated last so it acts as the
     org-wide instruction layer."""
     (tmp_path / "SYSTEM.md").write_text("ORG_RULE: always say 'hi' first")
-    me = Persona(name="leader", role_description="lead", system_prompt="body")
+    me = Persona(name="dispatcher", role_description="lead", system_prompt="body")
     prompt = assemble_system_prompt(me, lyre_home=tmp_path)
     assert "ORG_RULE" in prompt
     # SYSTEM.md is the tail
@@ -428,7 +428,7 @@ def test_global_system_md_is_appended(tmp_path):
 
 
 def test_global_system_md_absent_is_fine(tmp_path):
-    me = Persona(name="leader", role_description="lead", system_prompt="body")
+    me = Persona(name="dispatcher", role_description="lead", system_prompt="body")
     prompt = assemble_system_prompt(me, lyre_home=tmp_path)
     assert "body" in prompt  # base content still present
 
@@ -436,10 +436,10 @@ def test_global_system_md_absent_is_fine(tmp_path):
 def test_persona_append_md_is_appended(tmp_path):
     """Per-persona `~/.lyre/personas/<name>/APPEND.md` content joins after
     the persona body."""
-    persona_dir = tmp_path / "personas" / "leader"
+    persona_dir = tmp_path / "personas" / "dispatcher"
     persona_dir.mkdir(parents=True)
     (persona_dir / "APPEND.md").write_text("LEADER_EXTRA: be terse")
-    me = Persona(name="leader", role_description="lead", system_prompt="body")
+    me = Persona(name="dispatcher", role_description="lead", system_prompt="body")
     prompt = assemble_system_prompt(me, lyre_home=tmp_path)
     assert "LEADER_EXTRA" in prompt
     # Comes after the persona body
@@ -450,8 +450,8 @@ def test_persona_append_md_only_applies_to_matching_persona(tmp_path):
     persona_dir = tmp_path / "personas" / "worker-maintainer"
     persona_dir.mkdir(parents=True)
     (persona_dir / "APPEND.md").write_text("FOR_WORKER_ONLY")
-    leader = Persona(name="leader", role_description="lead", system_prompt="b")
-    prompt = assemble_system_prompt(leader, lyre_home=tmp_path)
+    dispatcher = Persona(name="dispatcher", role_description="lead", system_prompt="b")
+    prompt = assemble_system_prompt(dispatcher, lyre_home=tmp_path)
     assert "FOR_WORKER_ONLY" not in prompt
 
 

@@ -32,7 +32,7 @@ async def _seed(tmp_path: Path):
     await repos.personas.upsert(
         Persona(name="worker", role_description="w", system_prompt="w")
     )
-    await repos.agents.create(agent_id="leader", persona_name="worker")
+    await repos.agents.create(agent_id="dispatcher", persona_name="worker")
     await repos.mailbox.ensure_mailbox("owner")
     return conn, repos
 
@@ -74,7 +74,7 @@ async def test_new_mailbox_message_fires_stats_and_activity(
             await repos.mailbox.insert_message(
                 MailboxMessage(
                     recipient="owner", external_id="new-1",
-                    sender="leader", urgency="normal", body="hi",
+                    sender="dispatcher", urgency="normal", body="hi",
                 )
             )
             events = await asyncio.wait_for(q.get(), timeout=2.0)
@@ -130,7 +130,7 @@ async def test_does_not_replay_pre_existing_state(tmp_path: Path) -> None:
         await repos.mailbox.insert_message(
             MailboxMessage(
                 recipient="owner", external_id="historical",
-                sender="leader", urgency="normal", body="old",
+                sender="dispatcher", urgency="normal", body="old",
             )
         )
         bc = DashboardBroadcaster(repos=repos, poll_interval_s=0.05)

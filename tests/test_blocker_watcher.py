@@ -35,11 +35,11 @@ def _msg(recipient: str, body: str, urgency: str = "blocker", ext: str = "") -> 
 async def test_watcher_raises_signal_on_new_blocker(
     repos: SqliteRepositories,
 ) -> None:
-    await _seed_persona(repos, "leader")
-    watcher = BlockerWatcher(repos=repos, recipient="leader", baseline_msg_id=0, poll_interval_s=0.05)
+    await _seed_persona(repos, "dispatcher")
+    watcher = BlockerWatcher(repos=repos, recipient="dispatcher", baseline_msg_id=0, poll_interval_s=0.05)
     await watcher.start()
     try:
-        await repos.mailbox.insert_message(_msg("leader", "STOP", ext="b1"))
+        await repos.mailbox.insert_message(_msg("dispatcher", "STOP", ext="b1"))
         # Wait up to 1s for the watcher to notice.
         for _ in range(40):
             if watcher.signal.is_set():
@@ -56,12 +56,12 @@ async def test_watcher_raises_signal_on_new_blocker(
 async def test_watcher_ignores_messages_below_baseline(
     repos: SqliteRepositories,
 ) -> None:
-    await _seed_persona(repos, "leader")
+    await _seed_persona(repos, "dispatcher")
     # Pre-insert a blocker BEFORE we start the watcher; set baseline to it.
-    msg_id = await repos.mailbox.insert_message(_msg("leader", "old", ext="b0"))
+    msg_id = await repos.mailbox.insert_message(_msg("dispatcher", "old", ext="b0"))
 
     watcher = BlockerWatcher(
-        repos=repos, recipient="leader",
+        repos=repos, recipient="dispatcher",
         baseline_msg_id=msg_id, poll_interval_s=0.05,
     )
     await watcher.start()
@@ -79,22 +79,22 @@ async def test_watcher_ignores_below_threshold_urgency(
     """With default min_urgency='high', normal/low don't fire. high+ does.
     (Renamed from the old "ignores_non_blocker" since the watcher now
     widened to high; only normal/low stay silent.)"""
-    await _seed_persona(repos, "leader")
-    watcher = BlockerWatcher(repos=repos, recipient="leader", baseline_msg_id=0, poll_interval_s=0.05)
+    await _seed_persona(repos, "dispatcher")
+    watcher = BlockerWatcher(repos=repos, recipient="dispatcher", baseline_msg_id=0, poll_interval_s=0.05)
     await watcher.start()
     try:
         await repos.mailbox.insert_message(
-            _msg("leader", "FYI", urgency="normal", ext="n1")
+            _msg("dispatcher", "FYI", urgency="normal", ext="n1")
         )
         await repos.mailbox.insert_message(
-            _msg("leader", "archive", urgency="low", ext="l1")
+            _msg("dispatcher", "archive", urgency="low", ext="l1")
         )
         await asyncio.sleep(0.2)
         assert not watcher.signal.is_set()
         # Now insert a high — MUST fire (no mid-stream privilege, but the
         # watcher signal still goes up so agent_loop's turn boundary picks it up)
         await repos.mailbox.insert_message(
-            _msg("leader", "please reply", urgency="high", ext="h1")
+            _msg("dispatcher", "please reply", urgency="high", ext="h1")
         )
         for _ in range(40):
             if watcher.signal.is_set():
@@ -112,11 +112,11 @@ async def test_watcher_ignores_below_threshold_urgency(
 async def test_acknowledge_clears_signal_and_drains_pending(
     repos: SqliteRepositories,
 ) -> None:
-    await _seed_persona(repos, "leader")
-    watcher = BlockerWatcher(repos=repos, recipient="leader", baseline_msg_id=0, poll_interval_s=0.05)
+    await _seed_persona(repos, "dispatcher")
+    watcher = BlockerWatcher(repos=repos, recipient="dispatcher", baseline_msg_id=0, poll_interval_s=0.05)
     await watcher.start()
     try:
-        await repos.mailbox.insert_message(_msg("leader", "STOP", ext="b1"))
+        await repos.mailbox.insert_message(_msg("dispatcher", "STOP", ext="b1"))
         for _ in range(40):
             if watcher.signal.is_set():
                 break
@@ -136,11 +136,11 @@ async def test_signal_re_raises_only_for_NEW_blockers_after_ack(
     """After acknowledge(), the watcher's in-memory baseline advances so the
     same blocker isn't shown again. A second blocker with higher id MUST
     still fire."""
-    await _seed_persona(repos, "leader")
-    watcher = BlockerWatcher(repos=repos, recipient="leader", baseline_msg_id=0, poll_interval_s=0.05)
+    await _seed_persona(repos, "dispatcher")
+    watcher = BlockerWatcher(repos=repos, recipient="dispatcher", baseline_msg_id=0, poll_interval_s=0.05)
     await watcher.start()
     try:
-        await repos.mailbox.insert_message(_msg("leader", "first", ext="b1"))
+        await repos.mailbox.insert_message(_msg("dispatcher", "first", ext="b1"))
         for _ in range(40):
             if watcher.signal.is_set():
                 break
@@ -152,7 +152,7 @@ async def test_signal_re_raises_only_for_NEW_blockers_after_ack(
         assert watcher.pending == []
 
         # 2nd blocker (higher id) MUST raise the signal again.
-        await repos.mailbox.insert_message(_msg("leader", "second", ext="b2"))
+        await repos.mailbox.insert_message(_msg("dispatcher", "second", ext="b2"))
         for _ in range(40):
             if watcher.signal.is_set():
                 break
@@ -167,8 +167,8 @@ async def test_signal_re_raises_only_for_NEW_blockers_after_ack(
 async def test_stop_is_idempotent_and_kills_task(
     repos: SqliteRepositories,
 ) -> None:
-    await _seed_persona(repos, "leader")
-    watcher = BlockerWatcher(repos=repos, recipient="leader", baseline_msg_id=0, poll_interval_s=0.05)
+    await _seed_persona(repos, "dispatcher")
+    watcher = BlockerWatcher(repos=repos, recipient="dispatcher", baseline_msg_id=0, poll_interval_s=0.05)
     await watcher.start()
     await watcher.stop()
     await watcher.stop()  # second stop is a no-op

@@ -30,16 +30,18 @@ class Agent(BaseModel):
 
     Spawned agents use `<persona>/<name>` ids (e.g.
     `worker-maintainer/refactor-auth`). Bootstrap agents (`owner`,
-    `leader`) keep bare ids. `parent_agent_id` records the spawner so
-    a child can escalate / reply up the chain without searching.
+    `dispatcher`, `analyst-1`, `reviewer-1`, or their custom equivalents)
+    keep bare ids. `parent_agent_id` records the spawner so a child can
+    escalate / reply up the chain without searching.
     """
 
     id: str
     persona_name: str
     status: AgentStatus = "idle"
     # The agent that spawned this one. NULL for bootstrap agents
-    # (`owner`, `leader`). String "owner" when the human created the
-    # agent directly via CLI/dashboard. Otherwise an existing agent_id.
+    # (`owner`, `dispatcher`, `analyst-1`, `reviewer-1`, or custom names).
+    # String "owner" when the human created the agent directly via
+    # CLI/dashboard. Otherwise an existing agent_id.
     parent_agent_id: str | None = None
     created_at: datetime | None = None
     archived_at: datetime | None = None

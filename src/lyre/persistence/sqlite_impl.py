@@ -1,6 +1,6 @@
 """SQLite implementations of Repository Protocols.
 
-MVP Sprint 0 scope: just enough methods to run `lyre dispatch leader "hello"` end-to-end.
+MVP Sprint 0 scope: just enough methods to run `lyre dispatch dispatcher "hello"` end-to-end.
 Methods not needed in Sprint 0 are still declared (to satisfy Protocol) but raise
 NotImplementedError. They get filled in during Sprint 1/2 as needed.
 """

@@ -30,7 +30,7 @@ _PERSONA_RE = r"[a-z][a-z0-9-]*"
 _NAME_RE = r"[a-z0-9][a-z0-9-]*"
 AGENT_ID_RE = re.compile(rf"^{_PERSONA_RE}(/{_NAME_RE})?$")
 
-BOOTSTRAP_IDS: frozenset[str] = frozenset({"owner", "leader"})
+BOOTSTRAP_IDS: frozenset[str] = frozenset({"owner", "dispatcher"})
 
 
 def is_valid_agent_id(agent_id: str) -> bool:
@@ -39,8 +39,15 @@ def is_valid_agent_id(agent_id: str) -> bool:
 
 
 def is_bootstrap(agent_id: str) -> bool:
-    """`owner` and `leader` are special: bare ids, no parent, can't be
-    spawned via `create_agent`. Everything else must use persona/name."""
+    """`owner` and `dispatcher` are reserved bootstrap personas: no parent,
+    can't be spawned via `create_agent` (the system seeds exactly one).
+    Everything else must use `<persona>/<name>`.
+
+    Note: analyst and reviewer ALSO have bootstrap-seeded singletons
+    (`analyst-1`, `reviewer-1`) — but those personas are NOT reserved, so
+    `create_agent(persona="analyst", name="x")` is allowed for parallel
+    research. The set here is just the owner-facing singleton roles.
+    """
     return agent_id in BOOTSTRAP_IDS
 
 

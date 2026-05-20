@@ -32,19 +32,42 @@ from ..config import PersonaOverride
 from ..persistence.models import Persona
 from ..persistence.repositories import AgentRepository, PersonaRepository
 
-# Agent ids that always exist after `lyre onboard`. These are the long-lived
-# "well-known" agents users (owner) and the CLI default `lyre send leader ...`
-# expect to be addressable from day one. Workers spawn on demand.
-#
-# `reviewer-1` is seeded so worker can mailbox_send directly to it without
-# going through leader — auto-wake-on-mail picks it up. Multiple reviewers
-# can be created later via create_agent if parallel review throughput is
-# needed.
-DEFAULT_AGENTS: tuple[tuple[str, str], ...] = (
-    ("owner", "owner"),   # (agent_id, persona_name)
-    ("leader", "leader"),
-    ("reviewer-1", "reviewer"),
-)
+# Agent ids that always exist after `lyre onboard`. The owner agent id is
+# pinned to literal "owner" (it's the human's identity in the mail graph;
+# renaming would just be confusing). The three role agents have configurable
+# ids — see Config.bootstrap — so the owner can give them names with personality
+# ("luna" for the dispatcher, "scribe" for the analyst, etc.). Persona names
+# stay fixed; only the agent identity is owner-customizable.
+DEFAULT_PERSONA_TO_AGENT_ID: dict[str, str] = {
+    "owner": "owner",
+    "dispatcher": "dispatcher",
+    "analyst": "analyst-1",
+    "reviewer": "reviewer-1",
+}
+
+
+def _resolved_default_agents(
+    dispatcher_id: str = "dispatcher",
+    analyst_id: str = "analyst-1",
+    reviewer_id: str = "reviewer-1",
+) -> tuple[tuple[str, str], ...]:
+    """Resolve (agent_id, persona_name) pairs for bootstrap seeding.
+
+    The default identifiers are used when no overrides are provided; otherwise
+    the wizard / config.toml supplies custom owner-facing names.
+    """
+    return (
+        ("owner", "owner"),
+        (dispatcher_id, "dispatcher"),
+        (analyst_id, "analyst"),
+        (reviewer_id, "reviewer"),
+    )
+
+
+# Back-compat alias for any external caller that imported the tuple directly.
+# Resolves to the default ids; runtime callers should use _resolved_default_agents
+# with the active Config.bootstrap fields.
+DEFAULT_AGENTS: tuple[tuple[str, str], ...] = _resolved_default_agents()
 
 
 def _parse_markdown_with_frontmatter(text: str) -> tuple[dict[str, Any], str]:
@@ -197,20 +220,28 @@ async def seed_personas(
 
 
 async def seed_default_agents(
-    repo: AgentRepository, memory_root: Path | None = None
+    repo: AgentRepository,
+    memory_root: Path | None = None,
+    *,
+    agents: tuple[tuple[str, str], ...] | None = None,
 ) -> list[str]:
-    """Ensure the well-known `owner` and `leader` agents exist.
+    """Ensure the well-known bootstrap agents exist.
+
+    Pass ``agents`` to override the (agent_id, persona_name) list — typically
+    constructed from ``Config.bootstrap`` so the owner can pick names like
+    "luna" instead of literal "dispatcher". Defaults to ``DEFAULT_AGENTS``.
 
     Idempotent: skips any agent that already exists. Workers are NOT seeded —
-    leader (or owner via CLI) creates them on demand. If `memory_root` is
+    dispatcher (or owner via CLI) creates them on demand. If `memory_root` is
     provided, a notes file is pre-created at
     `<memory_root>/facts/agent-<id>-notes.md` for each seeded agent — this
     is the "agent's private scratchpad for cross-wakeup memory" that the
     identity preamble teaches about (Codex-style: pre-create the path so
     the agent naturally `ls` / `cat`s it).
     """
+    pairs = agents if agents is not None else DEFAULT_AGENTS
     created: list[str] = []
-    for agent_id, persona_name in DEFAULT_AGENTS:
+    for agent_id, persona_name in pairs:
         if not await repo.exists(agent_id):
             await repo.create(
                 agent_id=agent_id,

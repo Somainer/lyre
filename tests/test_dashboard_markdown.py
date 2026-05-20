@@ -37,15 +37,15 @@ def client_with_mail(tmp_path: Path):
         conn = await init_db(db)
         repos = SqliteRepositories(conn)
         await repos.personas.upsert(
-            Persona(name="leader", role_description="lead", system_prompt="b")
+            Persona(name="dispatcher", role_description="lead", system_prompt="b")
         )
-        await repos.agents.create(agent_id="leader", persona_name="leader")
+        await repos.agents.create(agent_id="dispatcher", persona_name="dispatcher")
         await repos.mailbox.ensure_mailbox("owner")
-        # Rich markdown body — the kind leader actually writes in replies
+        # Rich markdown body — the kind dispatcher actually writes in replies
         await repos.mailbox.insert_message(
             MailboxMessage(
                 recipient="owner", external_id="md-rich",
-                sender="leader", urgency="normal",
+                sender="dispatcher", urgency="normal",
                 title="Pi research summary",
                 body=(
                     "**Pi** = github.com/earendil-works/pi\n\n"
@@ -61,7 +61,7 @@ def client_with_mail(tmp_path: Path):
         await repos.mailbox.insert_message(
             MailboxMessage(
                 recipient="owner", external_id="md-xss",
-                sender="leader", urgency="normal",
+                sender="dispatcher", urgency="normal",
                 title="hostile",
                 body='<script>alert("pwned")</script>\n\n**bold** still works',
             )

@@ -143,7 +143,7 @@ def format_memory_index(
     `allowed_tools` is the persona's allowlist. Used to phrase the "how to
     read these" hint with a tool the persona actually has — otherwise the
     model will hallucinate a tool that's not on its list (seen on
-    DeepSeek v4 pro: leader has no shell/python tools but was told to
+    DeepSeek v4 pro: dispatcher has no shell/python tools but was told to
     `shell_exec cat`, then gave up when the call was blocked).
     """
     if not entries:

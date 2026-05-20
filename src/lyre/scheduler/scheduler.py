@@ -481,7 +481,7 @@ class Scheduler:
         # Resolve the running agent. After A3 every task has agent_id; legacy
         # callers that only set persona_name still work — we treat the
         # persona name as a degenerate agent_id (which is exactly how the
-        # bootstrap-seeded owner/leader agents are set up anyway).
+        # bootstrap-seeded agents are set up anyway).
         agent_id = task.agent_id or task.persona_name
         agent = await self.repos.agents.get(agent_id)
         persona_name = agent.persona_name if agent else task.persona_name
@@ -574,6 +574,15 @@ class Scheduler:
             # list_models / future router-aware tools read these.
             extras["model_registry"] = self.registry
             extras["health_tracker"] = self.health
+            # archive_agent reads this to refuse archiving bootstrap agents.
+            extras["bootstrap_agent_ids"] = frozenset(
+                {
+                    "owner",
+                    self.config.bootstrap.dispatcher_id,
+                    self.config.bootstrap.analyst_id,
+                    self.config.bootstrap.reviewer_id,
+                }
+            )
             tool_ctx = ToolContext(
                 repos=self.repos,
                 task_id=task_id,
