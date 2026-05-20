@@ -18,7 +18,18 @@
 {% endif %}
 
 {% for e in events %}
-  {% if e.kind == "mailbox" %}
+  {% if e.kind == "spawn" %}
+    <div class="spawn-row">
+      <span class="spawn-glyph">{{ glyph("spark", 11) }}</span>
+      <span class="spawn-label">spawned</span>
+      {{ agent_id_pill(e.detail.parent, size='sm') }}
+      <span class="spawn-arrow">→</span>
+      {{ agent_id_pill(e.detail.child, size='sm') }}
+      {% if e.detail.note %}<span class="spawn-note">· {{ e.detail.note }}</span>{% endif %}
+      <span class="spawn-when">{{ e.at[11:16] }}</span>
+    </div>
+
+  {% elif e.kind == "mailbox" %}
     <div class="evt">
       <div class="evt-gutter">
         <span class="evt-icon" style="color:{% if e.detail.urgency == 'blocker' %}var(--urg-blocker){% elif e.detail.urgency == 'high' %}var(--urg-high){% else %}var(--fg-2){% endif %};">{{ glyph("mail", 11) }}</span>

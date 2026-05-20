@@ -19,7 +19,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from ..persistence.models import MailboxMessage, Task, Wakeup
+from ..persistence.models import Agent, MailboxMessage, Task, Wakeup
 from ..persistence.repositories import Repositories
 
 
@@ -207,6 +207,40 @@ def _fmt_tokens(n: int) -> str:
     if n >= 1_000:
         return f"{n / 1_000:.1f}K"
     return str(n)
+
+
+def _build_spawn_events(
+    agents: list[Agent], cutoff_iso: str
+) -> list[ActivityEvent]:
+    """Emit a "spawn" row for every agent created since `cutoff_iso`
+    that has a `parent_agent_id`. Centered, low-key — the lineage is
+    interesting context, not action."""
+    events: list[ActivityEvent] = []
+    for a in agents:
+        if not a.parent_agent_id:
+            continue
+        at = (
+            a.created_at.isoformat()
+            if isinstance(a.created_at, datetime)
+            else (a.created_at or "")
+        )
+        if not at or at < cutoff_iso:
+            continue
+        events.append(
+            ActivityEvent(
+                at=at,
+                kind="spawn",
+                severity="info",
+                headline=f"{a.parent_agent_id} → spawned {a.id}",
+                detail={
+                    "parent": a.parent_agent_id,
+                    "child": a.id,
+                    "persona": a.persona_name,
+                    "note": a.description or "",
+                },
+            )
+        )
+    return events
 
 
 def _build_mailbox_events(msgs: list[MailboxMessage]) -> list[ActivityEvent]:
@@ -476,6 +510,10 @@ async def build_activity(
     tasks = await repos.tasks.find_recently_changed(cutoff, limit=100)
     wakeups = await repos.wakeups.list_since(cutoff, limit=100)
     msgs = await repos.mailbox.read_recent_for_audit(cutoff, limit=200)
+    # Spawn events: surface every agent created within the window (with
+    # a parent — bootstrap roots are not interesting). Cheap: just one
+    # extra list_all + a date filter.
+    agents = await repos.agents.list_all(include_archived=True)
 
     if agent_id is not None:
         # Filter to events that involve this agent. We match on agent_id
@@ -499,11 +537,19 @@ async def build_activity(
         tasks = [t for t in tasks if _task_matches(t)]
         wakeups = [w for w in wakeups if _wakeup_matches(w)]
         msgs = [m for m in msgs if _msg_matches(m)]
+        # Per-agent view: include spawns involving this agent as parent
+        # or child — same intuition as a chat showing both sides of a
+        # threaded handoff.
+        agents = [
+            a for a in agents
+            if a.id == agent_id or a.parent_agent_id == agent_id
+        ]
 
     events = (
         _build_task_events(tasks)
         + _build_wakeup_events(wakeups, model_context_windows)
         + _build_mailbox_events(msgs)
+        + _build_spawn_events(agents, cutoff)
     )
 
     if include_transcript:
