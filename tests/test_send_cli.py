@@ -155,3 +155,67 @@ def test_send_external_id_is_unique_per_invocation(
     )
     assert len(rows) == 2
     assert rows[0]["external_id"] != rows[1]["external_id"]
+
+
+def test_send_persona_slash_name_auto_spawns(
+    cli_env: tuple[CliRunner, Path],
+) -> None:
+    """`lyre send worker-maintainer/refactor-auth "..."` should create
+    the agent if it doesn't already exist (default behavior — saves an
+    extra `lyre agent create` step for the common case)."""
+    runner, db_path = cli_env
+    result = runner.invoke(
+        cli, ["send", "worker-maintainer/refactor-auth", "kick off"],
+    )
+    assert result.exit_code == 0, result.output
+    assert "spawned agent worker-maintainer/refactor-auth" in result.output
+
+    # Side effect: agent row exists with parent_agent_id=owner.
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            "SELECT id, parent_agent_id, persona_name FROM agents "
+            "WHERE id = ?",
+            ("worker-maintainer/refactor-auth",),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row is not None
+    assert row["parent_agent_id"] == "owner"
+    assert row["persona_name"] == "worker-maintainer"
+
+
+def test_send_no_spawn_rejects_missing_persona_name(
+    cli_env: tuple[CliRunner, Path],
+) -> None:
+    """`--no-spawn` disables the auto-spawn convenience — useful for
+    scripts that want to fail loudly if an expected agent isn't there."""
+    runner, _ = cli_env
+    result = runner.invoke(
+        cli, ["send", "worker-maintainer/refactor-auth", "x", "--no-spawn"],
+    )
+    assert result.exit_code != 0
+    assert "doesn't exist" in result.output.lower() or "no-spawn" in result.output.lower()
+
+
+def test_send_rejects_unknown_persona_for_spawn(
+    cli_env: tuple[CliRunner, Path],
+) -> None:
+    """Spawning requires a real persona — `bogus/refactor` errors
+    instead of creating an orphan agent under a non-existent persona."""
+    runner, _ = cli_env
+    result = runner.invoke(cli, ["send", "bogus/anything", "x"])
+    assert result.exit_code != 0
+    assert "persona" in result.output.lower()
+
+
+def test_send_rejects_uppercase_in_id(
+    cli_env: tuple[CliRunner, Path],
+) -> None:
+    """Anti-hallucination: model invents `Worker-Maintainer/Foo` — must
+    fail validation rather than spawn a typo'd agent."""
+    runner, _ = cli_env
+    result = runner.invoke(cli, ["send", "Worker-Maintainer/foo", "x"])
+    assert result.exit_code != 0
+    assert "invalid agent id" in result.output.lower()

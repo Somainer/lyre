@@ -20,13 +20,11 @@ Tools:
 from __future__ import annotations
 
 import os
-import re
 from pathlib import Path
 from typing import Any
 
+from ..identity import compose_id, is_bootstrap, is_valid_agent_id
 from . import Tool, ToolContext, ToolError
-
-_AGENT_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 _MAX_BYTES = 64 * 1024  # 64 KiB; the index already shows description, body
 # rarely needs more. Truncates with a clear marker so the model doesn't
@@ -223,24 +221,39 @@ LIST_TASKS = Tool(
 # ---------------------------------------------------------------------------
 
 
-def _validate_agent_id(agent_id: str) -> None:
-    if not isinstance(agent_id, str) or not _AGENT_ID_RE.match(agent_id):
+def _validate_short_name(name: str) -> None:
+    """Validate just the right-hand side of `persona/name`.
+
+    The caller passes a bare token (e.g. `refactor-auth`); we compose
+    `<persona>/<name>` ourselves. So this validates the name-segment
+    grammar only, not the full id.
+    """
+    if not isinstance(name, str) or not name:
+        raise ToolError("name must be a non-empty string")
+    # Probe with a throwaway persona so the full-id check exercises the
+    # name-segment rules.
+    if not is_valid_agent_id(f"p/{name}"):
         raise ToolError(
-            f"invalid agent id {agent_id!r}: must be 1–64 chars of "
-            f"[a-z0-9_-], starting with a letter or digit"
+            f"invalid agent name {name!r}: must start with a letter or "
+            f"digit and contain only lowercase letters, digits, and hyphens"
         )
 
 
 async def _next_auto_name(ctx: ToolContext, persona_name: str) -> str:
-    """Return `<persona>-<n>` for the smallest unused n ≥ 1."""
+    """Return `<persona>/<n>` for the smallest unused n ≥ 1.
+
+    Used when the model doesn't supply `name`. The numeric suffix is
+    intentionally bland — a meaningful name is the model's job. See
+    leader.md's "派活前先盘点" section for the reuse-vs-spawn discipline.
+    """
     existing = await ctx.repos.agents.list_by_persona(
         persona_name, include_archived=True
     )
     used = {a.id for a in existing}
     n = 1
-    while f"{persona_name}-{n}" in used:
+    while compose_id(persona_name, str(n)) in used:
         n += 1
-    return f"{persona_name}-{n}"
+    return compose_id(persona_name, str(n))
 
 
 async def _create_agent(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
@@ -254,6 +267,11 @@ async def _create_agent(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any
     persona_name = args.get("persona")
     if not isinstance(persona_name, str) or not persona_name:
         raise ToolError("persona required (string)")
+    if is_bootstrap(persona_name):
+        raise ToolError(
+            f"persona {persona_name!r} is reserved for bootstrap agents; "
+            f"pick a different persona"
+        )
     persona = await ctx.repos.personas.get(persona_name)
     if persona is None or persona.status != "approved":
         raise ToolError(f"persona '{persona_name}' not found or not approved")
@@ -262,12 +280,15 @@ async def _create_agent(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any
     if name is None:
         agent_id = await _next_auto_name(ctx, persona_name)
     else:
-        if not isinstance(name, str):
-            raise ToolError("name must be a string if provided")
-        _validate_agent_id(name)
-        if await ctx.repos.agents.exists(name):
-            raise ToolError(f"agent id {name!r} already exists")
-        agent_id = name
+        _validate_short_name(name)
+        agent_id = compose_id(persona_name, name)
+        if not is_valid_agent_id(agent_id):
+            raise ToolError(
+                f"composed agent id {agent_id!r} is invalid; the persona "
+                f"name probably contains an unsupported character"
+            )
+        if await ctx.repos.agents.exists(agent_id):
+            raise ToolError(f"agent id {agent_id!r} already exists")
 
     metadata: dict[str, Any] = {}
     description = args.get("description")
@@ -290,7 +311,10 @@ async def _create_agent(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any
     await ctx.repos.agents.create(
         agent_id=agent_id,
         persona_name=persona_name,
-        created_by=ctx.persona_name,
+        # The agent that called this tool becomes the parent. Used by
+        # the dashboard's lineage view, by the identity preamble's
+        # "escalate to your parent" hint, and by list_agents output.
+        parent_agent_id=ctx.self_mailbox,
         metadata=metadata or None,
     )
 
@@ -310,6 +334,7 @@ async def _create_agent(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any
     return {
         "agent_id": agent_id,
         "persona": persona_name,
+        "parent_agent_id": ctx.self_mailbox,
         "status": "idle",
         "metadata": metadata or {},
         "notes_file": notes_path,
@@ -321,9 +346,13 @@ CREATE_AGENT = Tool(
     description=(
         "Create a new agent instance of an existing persona. Agents are the "
         "addressable identity for mailbox + dispatch_task — one persona can "
-        "have many agents running in parallel. Pass `name` to choose the "
-        "agent id; omit it for auto-naming (<persona>-<n>). Pass `model` to "
-        "pin to a specific model_id (use list_models() to discover)."
+        "have many agents running in parallel. Agent id is composed as "
+        "`<persona>/<name>`; pass `name` to pick the right-hand side, omit "
+        "for auto-naming (<persona>/<n>). Before calling this, prefer "
+        "`list_agents` and reuse an available agent of the same persona "
+        "(see `occupancy` field) — spawning unnecessary agents wastes mailbox "
+        "and model budget. Pass `model` to pin to a specific model_id "
+        "(use list_models() to discover)."
     ),
     input_schema={
         "type": "object",
@@ -335,8 +364,11 @@ CREATE_AGENT = Tool(
             "name": {
                 "type": "string",
                 "description": (
-                    "Optional agent id (1–64 chars of [a-z0-9_-]). "
-                    "Auto-generated as <persona>-<n> if omitted."
+                    "Right-hand side of the agent id, composed as "
+                    "`<persona>/<name>` (e.g. `refactor-auth`, `pr-142`). "
+                    "Lowercase letters, digits, hyphens; must start with "
+                    "letter or digit. Auto-generated as a numeric suffix "
+                    "if omitted."
                 ),
             },
             "model": {
@@ -400,28 +432,80 @@ ARCHIVE_AGENT = Tool(
 )
 
 
+_IN_FLIGHT = frozenset({"pending", "in_progress", "needs_input"})
+
+
 async def _list_agents(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
-    """Live agent instances (not persona templates — those are list_personas)."""
+    """Live agent instances (not persona templates — those are list_personas).
+
+    Each agent is annotated with `occupancy` ∈ {available, queued, busy,
+    archived} so leader can make reuse-vs-spawn decisions without a
+    separate query:
+
+      - available: idle AND zero in-flight tasks. Free to take new work.
+      - queued:    idle AND ≥1 in-flight task waiting. Don't add more.
+      - busy:      currently inside a wakeup.
+      - archived:  retired; cannot accept new work.
+
+    `active_task_id` / `last_active_at` give the leader enough context
+    to write a meaningful kick-off mail without round-tripping
+    `list_tasks` / `mailbox_read`.
+    """
     include_archived = bool(args.get("include_archived", False))
     agents = await ctx.repos.agents.list_all(include_archived=include_archived)
+
+    # In-flight task fan-out: pull once, group in Python.
+    tasks = await ctx.repos.tasks.find_recent(limit=500)
+    in_flight_by_agent: dict[str, list] = {}
+    for t in tasks:
+        key = t.agent_id or t.persona_name
+        if t.status in _IN_FLIGHT:
+            in_flight_by_agent.setdefault(key, []).append(t)
+
+    # last_active_at: most recent wakeup_started_at per agent.
+    recent_wakeups = await ctx.repos.wakeups.list_recent(limit=200)
+    last_active: dict[str, str] = {}
+    for w in recent_wakeups:
+        key = w.agent_id or w.persona_name
+        ts = (
+            w.started_at.isoformat()
+            if hasattr(w.started_at, "isoformat")
+            else str(w.started_at)
+        )
+        # list_recent returns newest-first; keep the first hit per agent.
+        last_active.setdefault(key, ts)
+
+    def _occupancy(agent) -> str:
+        if agent.status == "archived":
+            return "archived"
+        if agent.status == "busy":
+            return "busy"
+        return "queued" if in_flight_by_agent.get(agent.id) else "available"
+
+    enriched = []
+    for a in agents:
+        in_flight = in_flight_by_agent.get(a.id, [])
+        enriched.append({
+            "id": a.id,
+            "persona": a.persona_name,
+            "status": a.status,
+            "occupancy": _occupancy(a),
+            "parent_agent_id": a.parent_agent_id,
+            "in_flight_count": len(in_flight),
+            "active_task_id": in_flight[0].id if in_flight else None,
+            "last_active_at": last_active.get(a.id),
+            "created_at": a.created_at.isoformat() if a.created_at else None,
+            "model_id": a.model_id,
+            "description": a.description,
+        })
     return {
-        "agents": [
-            {
-                "id": a.id,
-                "persona": a.persona_name,
-                "status": a.status,
-                "created_by": a.created_by,
-                "created_at": a.created_at.isoformat() if a.created_at else None,
-                "model_id": a.model_id,
-                "description": a.description,
-            }
-            for a in agents
-        ],
-        "count": len(agents),
+        "agents": enriched,
+        "count": len(enriched),
         "note": (
-            "These are running instances. mailbox_send / dispatch_task / "
-            "mailbox_read target an `id` from this list. Use list_personas() "
-            "to see role definitions you can spawn new agents of."
+            "Reuse-vs-spawn: prefer dispatch_task to an agent with "
+            "occupancy='available'. Only call create_agent when no live "
+            "agent of the right persona is available AND queued/busy ones "
+            "would block this work."
         ),
     }
 

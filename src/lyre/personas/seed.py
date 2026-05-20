@@ -209,7 +209,7 @@ async def seed_default_agents(
             await repo.create(
                 agent_id=agent_id,
                 persona_name=persona_name,
-                created_by="system:init",
+                parent_agent_id=None,  # bootstrap roots
             )
             created.append(agent_id)
         if memory_root is not None:
@@ -218,18 +218,23 @@ async def seed_default_agents(
 
 
 def ensure_agent_notes_file(memory_root: Path, agent_id: str) -> Path:
-    """Create `<memory_root>/facts/agent-<id>-notes.md` if it doesn't yet
-    exist. Returns the absolute path either way. Used by `lyre onboard`
-    (via seed_default_agents) and by the `create_agent` tool.
+    """Create `<memory_root>/facts/agent-<flattened-id>-notes.md` if
+    it doesn't yet exist. Returns the absolute path either way.
+
+    `persona/name` ids would otherwise create a directory layer
+    (`agent-worker/foo-notes.md` ≠ a single file); we flatten `/` to `-`
+    in the filename so every agent's notes live as one flat file under
+    facts/. The frontmatter still records the unflattened `agent_id`.
     """
     facts_dir = memory_root / "facts"
     facts_dir.mkdir(parents=True, exist_ok=True)
-    path = facts_dir / f"agent-{agent_id}-notes.md"
+    flat_id = agent_id.replace("/", "-")
+    path = facts_dir / f"agent-{flat_id}-notes.md"
     if path.exists():
         return path
     now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     seed = f"""---
-name: agent-{agent_id}-notes
+name: agent-{flat_id}-notes
 description: {agent_id}'s private notebook for cross-wakeup memory.
 type: agent_notes
 agent_id: {agent_id}
@@ -241,7 +246,7 @@ created: {now}
 This is your private notebook. Every wakeup is stateless — anything you
 want to remember across wakeups goes here. The identity preamble points
 you at this file by path; you read it with `read_memory(
-"facts/agent-{agent_id}-notes.md")` and append to it with shell_exec /
+"facts/agent-{flat_id}-notes.md")` and append to it with shell_exec /
 python_exec.
 
 Suggested sections (free-form — edit as you like):
