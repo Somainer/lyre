@@ -111,8 +111,11 @@ def test_home_renders_with_cards_and_blockers(
     r = client.get("/")
     assert r.status_code == 200
     body = r.text
-    assert "in-progress" in body
+    # Stat-tile labels (new IA — snake_case statuses, breakdown segments).
+    assert "in_progress" in body
     assert "blockers unread" in body
+    assert "Tasks in flight" in body
+    assert "Unread mail to owner" in body
     assert "STOP, awaiting decision" in body  # blocker preview
 
 
@@ -279,9 +282,9 @@ def test_agent_detail_surfaces_assistant_text_from_completed_wakeup(
         r = client.get("/agents/leader?minutes=60")
         assert r.status_code == 200
         body = r.text
-        # Assistant text rendered as a 'thought' bubble in the new
-        # chat-style feed (was: 'said:' headline in the old timeline).
-        assert "thought" in body
+        # Assistant text rendered as a chat-style "assistant" bubble in
+        # the new design.
+        assert "bub assistant" in body
         # Both content_delta chunks aggregated together
         assert "Let me think about this before replying." in body
         # And the completed wakeup's tool_use is included
@@ -290,71 +293,81 @@ def test_agent_detail_surfaces_assistant_text_from_completed_wakeup(
         _asyncio.get_event_loop().run_until_complete(conn.close())
 
 
-def test_agent_status_partial_shows_active_persona(
+def test_agent_status_partial_shows_active_count(
     seeded_dashboard: tuple[TestClient, SqliteRepositories, dict],
 ) -> None:
+    """The topnav agent-status badge now shows a live-dot + running count
+    (the persona/agent identity moved into Activity's chat-bubble who-column).
+    """
     client, *_ = seeded_dashboard
     r = client.get("/partials/agent-status")
     assert r.status_code == 200
-    assert "worker-maintainer" in r.text
-    assert "idle" not in r.text
+    assert "running" in r.text
+    assert "live-dot" in r.text
 
 
-def test_inbox_shows_all_urgencies_by_default(
+def test_mail_shows_all_urgencies_by_default(
     seeded_dashboard: tuple[TestClient, SqliteRepositories, dict],
 ) -> None:
-    """Inbox now shows ALL urgencies by default — the earlier hard-coded
-    min_urgency='high' silently hid normal-urgency replies (user
-    reported 'reply 到我的邮件的邮件无法看到')."""
+    """Mail (merged inbox+feed) shows ALL urgencies by default — the
+    earlier hard-coded min_urgency='high' silently hid normal-urgency
+    replies (user reported 'reply 到我的邮件的邮件无法看到')."""
     client, *_ = seeded_dashboard
-    r = client.get("/inbox")
+    r = client.get("/mail")
     assert r.status_code == 200
     body = r.text
     assert "STOP, awaiting decision" in body  # blocker
     assert "status update" in body  # normal — was hidden before
 
 
-def test_inbox_filters_when_urgency_query_set(
+def test_mail_filters_to_blocker_band(
     seeded_dashboard: tuple[TestClient, SqliteRepositories, dict],
 ) -> None:
-    """Explicit `?urgency=high` brings back the old filtered view."""
+    """`?u=blocker` filter chip restricts to blocker urgency only."""
     client, *_ = seeded_dashboard
-    r = client.get("/inbox?urgency=high")
+    r = client.get("/mail?u=blocker")
     assert r.status_code == 200
     body = r.text
     assert "STOP, awaiting decision" in body
-    assert "status update" not in body  # normal hidden by filter
+    # mail-row markup wraps each row; "status update" was urgency=normal
+    # so it should NOT appear in the rendered list (it may still appear
+    # in script literals, so anchor on the mail-row class).
+    assert 'href="/send?reply_to=' in body  # at least one row rendered
+    rows = body.count('class="mail-row')
+    assert rows == 1, f"blocker band should leave exactly 1 row, got {rows}"
 
 
-def test_feed_shows_all_urgencies(
+def test_mail_feed_band_shows_low_and_normal(
     seeded_dashboard: tuple[TestClient, SqliteRepositories, dict],
 ) -> None:
+    """`?u=feed` covers normal + low (the old /feed semantic)."""
     client, *_ = seeded_dashboard
-    r = client.get("/feed")
+    r = client.get("/mail?u=feed")
     assert r.status_code == 200
     body = r.text
-    assert "status update" in body
-    assert "STOP, awaiting decision" in body
+    assert "status update" in body  # normal
+    assert "STOP, awaiting decision" not in body.split("<script")[0]  # blocker excluded
 
 
-def test_tasks_lists_all_with_status_filter(
+def test_runs_tasks_tab_lists_all_with_status_filter(
     seeded_dashboard: tuple[TestClient, SqliteRepositories, dict],
 ) -> None:
+    """The Runs page replaces the old /tasks + /wakeups split. Tasks tab
+    shows all tasks by default; ?status=<x> narrows."""
     client, _, ids = seeded_dashboard
-    r = client.get("/tasks")
+    r = client.get("/runs")
     assert r.status_code == 200
     body = r.text
     assert ids["running_task"][:8] in body
     assert ids["done_task"][:8] in body
-    # Both must appear with their full goal text (uniquely identifying).
     assert "demo task" in body
     assert "prior task" in body
 
-    r = client.get("/tasks?status=in_progress")
+    r = client.get("/runs?tab=tasks&status=in_progress")
     assert r.status_code == 200
     body = r.text
-    assert "demo task" in body  # the running one
-    assert "prior task" not in body  # the completed one filtered out
+    assert "demo task" in body
+    assert "prior task" not in body
 
 
 def test_task_detail_lists_children(
@@ -376,11 +389,11 @@ def test_task_detail_404_for_unknown(
     assert r.status_code == 404
 
 
-def test_wakeups_lists_recent(
+def test_runs_wakeups_tab_lists_recent(
     seeded_dashboard: tuple[TestClient, SqliteRepositories, dict],
 ) -> None:
     client, _, ids = seeded_dashboard
-    r = client.get("/wakeups")
+    r = client.get("/runs?tab=wakeups")
     assert r.status_code == 200
     body = r.text
     assert ids["running_wakeup"][:8] in body
@@ -407,7 +420,7 @@ def test_send_post_writes_message_and_shows_banner(
     )
     assert r.status_code == 200
     body = r.text
-    assert "banner-ok" in body
+    assert "banner success" in body
     assert "leader" in body
     assert "watch what happens in Activity" in body
 
@@ -481,7 +494,7 @@ def test_send_post_with_reply_to_threads_parent_msg_id(
         },
     )
     assert r.status_code == 200
-    assert "banner-ok" in r.text
+    assert "banner success" in r.text
     assert f"in reply to #{parent_id}" in r.text
 
     async def _last_reply() -> object:
@@ -504,7 +517,7 @@ def test_send_post_rejects_bad_urgency(
               "urgency": "panic", "sender": "owner"},
     )
     assert r.status_code == 400
-    assert "banner-err" in r.text
+    assert "banner-err" in r.text or "banner error" in r.text
 
 
 # ---------------------------------------------------------------------------

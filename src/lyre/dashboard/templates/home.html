@@ -1,42 +1,111 @@
 {% extends "base.html" %}
+{% from "_macros.html" import glyph, live_dot, agent_id_pill, urgency_chip, status_pill, model_pill, spark %}
 {% block content %}
-<section class="cards"
-         hx-get="/partials/home/cards"
-         hx-trigger="every 5s"
-         hx-swap="innerHTML">
-  {% include "partials/home_cards.html" %}
-</section>
+<div class="page">
+  <div class="page-header">
+    <div>
+      <h1 class="page-title">{{ greeting }}, {{ owner_name }}</h1>
+      <div class="page-subtitle">
+        <span class="mono">{{ agents_online }}</span> agents online ·
+        <span class="mono">{{ in_progress }}</span> active tasks ·
+        last wakeup <span class="mono">{{ last_wakeup_rel }}</span>
+      </div>
+    </div>
+    <div class="row">
+      <a href="/send" class="btn">{{ glyph("send", 12) }} Send mail</a>
+    </div>
+  </div>
 
-<section>
-  <h2>最近 5 条 blocker</h2>
-  {% if recent_blockers %}
-    <ul class="mailbox-list">
-      {% for m in recent_blockers %}
-        {% include "partials/mailbox_item.html" %}
-      {% endfor %}
-    </ul>
-  {% else %}
-    <p class="empty">没有 blocker 消息</p>
-  {% endif %}
-</section>
+  <div class="stats"
+       hx-get="/partials/home/cards"
+       hx-trigger="every 5s"
+       hx-swap="innerHTML">
+    {% include "partials/home_cards.html" %}
+  </div>
 
-<section>
-  <h2>Live mailbox</h2>
-  <ul id="live-feed" class="mailbox-list"></ul>
-  <script>
-    const es = new EventSource('/sse/mailbox?recipient=owner');
-    es.addEventListener('mailbox', (e) => {
-      const msg = JSON.parse(e.data);
-      const li = document.createElement('li');
-      li.className = 'msg msg-' + msg.urgency;
-      const safe = (s) => (s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;');
-      const display = msg.title || msg.body || '(empty)';
-      li.innerHTML =
-        '<span class="urgency">' + msg.urgency + '</span> ' +
-        '<span class="sender">' + safe(msg.sender) + ' →</span> ' +
-        '<span class="title">' + safe(display) + '</span>';
-      document.getElementById('live-feed').prepend(li);
-    });
-  </script>
-</section>
+  <div class="grid-2">
+    <div class="card">
+      <div class="card-h">
+        <span class="title">Needs your attention <span class="num">· {{ recent_blockers|length }}</span></span>
+        <a href="/mail" class="btn ghost sm">Open mail →</a>
+      </div>
+      <div>
+        {% if recent_blockers %}
+          {% for m in recent_blockers %}
+            <a class="mail-row{% if not m.read_at %} is-unread{% endif %}"
+               href="/send?reply_to={{ m.id }}"
+               style="padding:10px 16px;text-decoration:none;color:inherit;">
+              <div>{{ urgency_chip(m.urgency) }}</div>
+              <div class="who">
+                {{ agent_id_pill(m.sender, size='sm', dim=True) }}
+                <span class="arrow">→</span>
+                {{ agent_id_pill(m.recipient, size='sm', dim=True) }}
+              </div>
+              <div>
+                <div class="mail-title">
+                  {% if not m.read_at %}<span class="unread-dot" aria-label="unread"></span>{% endif %}
+                  {{ m.title or "(no title)" }}
+                </div>
+              </div>
+              <div class="when">{{ m.delivered_at | rel_time }}<br><span class="dim">#{{ m.id }}</span></div>
+            </a>
+          {% endfor %}
+        {% else %}
+          <p class="muted" style="padding:16px;font-size:var(--t-meta);">Nothing urgent. Inbox is calm.</p>
+        {% endif %}
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-h">
+        <span class="title">Live feed {{ live_dot() }}</span>
+        <span class="dim mono" style="font-size:var(--t-micro);">SSE</span>
+      </div>
+      <ul id="live-feed" class="live-feed-list" style="max-height:480px;overflow:auto;list-style:none;padding:0;margin:0;">
+        {% for m in recent_feed %}
+          <li class="feed-li" data-msg-id="{{ m.id }}">
+            <span class="chip chip-urg {{ m.urgency }}">{{ m.urgency }}</span>
+            <span class="feed-li-body">
+              <span class="mono dim" style="font-size:var(--t-micro);">
+                {{ m.sender }} <span style="color:var(--fg-4);">→</span> {{ m.recipient }}
+              </span>
+              <span class="feed-li-title">{{ m.title or (m.body or "")[:80] }}</span>
+            </span>
+            <span class="mono dim" style="font-size:var(--t-micro);">{{ m.delivered_at | clock_time }}</span>
+          </li>
+        {% endfor %}
+      </ul>
+      <script>
+        (function () {
+          const list = document.getElementById('live-feed');
+          if (!list) return;
+          const es = new EventSource('/sse/mailbox?recipient=owner');
+          es.addEventListener('mailbox', (e) => {
+            try {
+              const msg = JSON.parse(e.data);
+              const li = document.createElement('li');
+              li.className = 'feed-li';
+              li.dataset.msgId = msg.id;
+              const safe = (s) => (s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;');
+              const display = msg.title || (msg.body || '').slice(0, 80) || '(empty)';
+              const clock = new Date(msg.at || Date.now()).toLocaleTimeString(
+                [], { hour: '2-digit', minute: '2-digit', hour12: false }
+              );
+              li.innerHTML =
+                '<span class="chip chip-urg ' + msg.urgency + '">' + msg.urgency + '</span>' +
+                '<span class="feed-li-body">' +
+                  '<span class="mono dim" style="font-size:var(--t-micro);">' +
+                    safe(msg.sender) + ' <span style="color:var(--fg-4);">→</span> ' + safe(msg.recipient) +
+                  '</span>' +
+                  '<span class="feed-li-title">' + safe(display) + '</span>' +
+                '</span>' +
+                '<span class="mono dim" style="font-size:var(--t-micro);">' + clock + '</span>';
+              list.prepend(li);
+            } catch (_) { /* ignore malformed */ }
+          });
+        })();
+      </script>
+    </div>
+  </div>
+</div>
 {% endblock %}

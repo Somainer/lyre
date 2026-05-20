@@ -1,0 +1,147 @@
+{# ============================================================
+   Shared rendering macros — chips, pills, agent-id, glyphs.
+   Each macro outputs the exact markup the new design tokens (main.css)
+   style. Keep these self-contained: no template inheritance, no app
+   state — just inputs in, HTML out.
+   ============================================================ #}
+
+{# ---- Inline SVG icons -------------------------------------------------- #}
+{% macro glyph(name, size=14, stroke=1.5) %}
+  {%- set s = size -%}
+  <svg width="{{ s }}" height="{{ s }}" viewBox="0 0 16 16" fill="none"
+       stroke="currentColor" stroke-width="{{ stroke }}"
+       stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    {% if name == "mail" %}<rect x="2" y="3.5" width="12" height="9" rx="1.5"/><path d="M2.5 4.5 8 9l5.5-4.5"/>
+    {% elif name == "tool" %}<path d="M11 2.5 13.5 5l-3 3-2.5-2.5z"/><path d="m10.5 5.5-6 6L2.5 13l1.5-2 6-6"/>
+    {% elif name == "brain" %}<path d="M5 3.5a2 2 0 0 0-2 2v2a2 2 0 0 0 0 4 2 2 0 0 0 2 2"/><path d="M11 3.5a2 2 0 0 1 2 2v2a2 2 0 0 1 0 4 2 2 0 0 1-2 2"/><path d="M5 3.5h6v9H5z"/>
+    {% elif name == "chat" %}<path d="M3 3.5h10v7H7l-3 2.5v-2.5H3z"/>
+    {% elif name == "play" %}<path d="M5 3.5v9l7-4.5z"/>
+    {% elif name == "stop" %}<rect x="4" y="4" width="8" height="8" rx="1"/>
+    {% elif name == "task" %}<rect x="2.5" y="3.5" width="11" height="9" rx="1.5"/><path d="M5 6.5h6M5 8.5h4M5 10.5h5"/>
+    {% elif name == "arrow" %}<path d="M3.5 8h9M9 4.5 12.5 8 9 11.5"/>
+    {% elif name == "send" %}<path d="M2.5 8 13.5 3 9.5 13 8 9z"/>
+    {% elif name == "search" %}<circle cx="7" cy="7" r="3.5"/><path d="m13 13-3.5-3.5"/>
+    {% elif name == "filter" %}<path d="M2.5 4h11M4.5 8h7M6.5 12h3"/>
+    {% elif name == "plus" %}<path d="M8 3v10M3 8h10"/>
+    {% elif name == "sheet" %}<path d="M3 3h10v10H3z"/><path d="M3 7h10M7 3v10"/>
+    {% elif name == "x" %}<path d="m4 4 8 8M12 4l-8 8"/>
+    {% elif name == "warn" %}<path d="M8 2.5 14 13H2zM8 7v3M8 11.5v.01"/>
+    {% elif name == "check" %}<path d="m3.5 8 3 3 6-6"/>
+    {% elif name == "inbox" %}<path d="M2.5 8.5V12a1 1 0 0 0 1 1h9a1 1 0 0 0 1-1V8.5l-2-5h-7z"/><path d="M2.5 8.5h3l1 2h3l1-2h3"/>
+    {% elif name == "agent" %}<circle cx="8" cy="5.5" r="2.5"/><path d="M3.5 13c0-2.5 2-4 4.5-4s4.5 1.5 4.5 4"/>
+    {% elif name == "home" %}<path d="m2.5 7.5 5.5-4.5 5.5 4.5V13H2.5z"/><path d="M6 13V9.5h4V13"/>
+    {% elif name == "run" %}<path d="M3.5 8 8 3.5 12.5 8 8 12.5z"/>
+    {% elif name == "reply" %}<path d="M6 3.5 2.5 7 6 10.5"/><path d="M2.5 7h7a4 4 0 0 1 4 4v1.5"/>
+    {% elif name == "spark" %}<path d="M8 2v3M8 11v3M2 8h3M11 8h3M4 4l2 2M10 10l2 2M4 12l2-2M10 6l2-2"/>
+    {% elif name == "tree" %}<circle cx="3.5" cy="8" r="1.5"/><circle cx="12.5" cy="4" r="1.5"/><circle cx="12.5" cy="12" r="1.5"/><path d="M5 8h2c1 0 2-1 2-2V5h2M5 8h2c1 0 2 1 2 2v1h2"/>
+    {% endif %}
+  </svg>
+{%- endmacro %}
+
+{# ---- Live dot --------------------------------------------------------- #}
+{% macro live_dot() %}<span class="live-dot"></span>{% endmacro %}
+
+{# ---- Urgency chip ---------------------------------------------------- #}
+{% macro urgency_chip(level) %}<span class="chip chip-urg {{ level }}">{{ level }}</span>{% endmacro %}
+
+{# ---- Status pill (task / wakeup status) ------------------------------ #}
+{% macro status_pill(status) -%}
+  {%- set m = {
+    "completed":   ["ok",   "completed"],
+    "busy":        ["run",  "busy"],
+    "running":     ["run",  "running"],
+    "in_progress": ["run",  "in_progress"],
+    "idle":        ["idle", "idle"],
+    "pending":     ["idle", "pending"],
+    "needs_input": ["warn", "needs_input"],
+    "silent_close":["warn", "silent_close"],
+    "needs_continuation": ["warn", "needs_continuation"],
+    "failed":      ["fail", "failed"],
+    "error":       ["fail", "error"],
+    "cancelled":   ["idle", "cancelled"],
+    "archived":    ["idle", "archived"],
+  } -%}
+  {%- set pair = m.get(status, ["idle", status]) -%}
+  <span class="pill {{ pair[0] }}"><span class="pill-dot"></span>{{ pair[1] }}</span>
+{%- endmacro %}
+
+{# ---- Model pill (shows shortened model name) ------------------------- #}
+{% macro model_pill(model) -%}
+  {%- if not model -%}
+    <span class="pill-model dim">persona default</span>
+  {%- else -%}
+    {%- set short = model.replace("anthropic.","").replace("openai.","").replace("claude-","").replace("gpt-","gpt-") -%}
+    <span class="pill-model" title="{{ model }}">{{ short }}</span>
+  {%- endif -%}
+{%- endmacro %}
+
+{# ---- Agent id pill — persona/name w/ dim slash ----------------------- #}
+{# Bootstrap ids (owner, leader) render bare; agents with persona/name
+   format render two segments with a dim slash. Long names get max-width
+   ellipsis via CSS. #}
+{% macro agent_id_pill(agent_id, dim=False, size="md", show_persona=True) -%}
+  {%- if not agent_id -%}{%- set agent_id = "" -%}{%- endif -%}
+  {%- set is_boot = agent_id in ("owner", "leader") -%}
+  {%- if "/" in agent_id -%}
+    {%- set parts = agent_id.split("/", 1) -%}
+    {%- set persona = parts[0] -%}
+    {%- set name = parts[1] -%}
+  {%- else -%}
+    {%- set persona = agent_id -%}
+    {%- set name = "" -%}
+  {%- endif -%}
+  <span class="agent-pill{% if size == 'sm' %} sm{% endif %}{% if dim %} dim{% endif %}" title="{{ agent_id }}">
+    {%- if is_boot or not name -%}
+      <span class="ap-bare">{{ agent_id }}</span>
+    {%- else -%}
+      {%- if show_persona -%}<span class="ap-persona">{{ persona }}</span><span class="ap-slash">/</span>{%- endif -%}
+      <span class="ap-name">{{ name }}</span>
+    {%- endif -%}
+  </span>
+{%- endmacro %}
+
+{# ---- Occupancy pill -------------------------------------------------- #}
+{# Derived from raw status + in-flight task count. agent_obj has .status;
+   in_flight is the count of pending/in_progress/needs_input tasks. #}
+{% macro occupancy_pill(agent_obj, in_flight=0) -%}
+  {%- if agent_obj is none -%}
+  {%- elif agent_obj.status == "archived" -%}
+    <span class="occ-pill archived" title="archived">archived</span>
+  {%- elif agent_obj.status == "busy" -%}
+    <span class="occ-pill busy" title="currently in a wakeup">
+      <span class="occ-dot">{{ live_dot() }}</span>running
+    </span>
+  {%- elif in_flight and in_flight > 0 -%}
+    <span class="occ-pill queued" title="idle, {{ in_flight }} in-flight task(s) queued">
+      queued{% if in_flight > 1 %}<span class="occ-n">{{ in_flight }}</span>{% endif %}
+    </span>
+  {%- else -%}
+    <span class="occ-pill available" title="idle, no in-flight tasks — free to take work">
+      <span class="occ-tick">●</span>available
+    </span>
+  {%- endif -%}
+{%- endmacro %}
+
+{# ---- Inline SVG sparkline ------------------------------------------- #}
+{% macro spark(values, color="var(--accent)") -%}
+  {%- set w = 200 -%}{%- set h = 32 -%}{%- set pad = 2 -%}
+  {%- set max = values | max if values else 1 -%}
+  {%- if max < 1 %}{%- set max = 1 -%}{%- endif -%}
+  {%- set step = (w - pad * 2) / (values | length - 1) if values | length > 1 else 0 -%}
+  {%- set pts = [] -%}
+  {%- for v in values -%}
+    {%- set x = pad + loop.index0 * step -%}
+    {%- set y = h - pad - (v / max) * (h - pad * 2) -%}
+    {%- set _ = pts.append([x, y]) -%}
+  {%- endfor -%}
+  <svg class="spark" viewBox="0 0 {{ w }} {{ h }}" preserveAspectRatio="none">
+    <defs>
+      <linearGradient id="sg-{{ pts | length }}-{{ values | sum }}" x1="0" x2="0" y1="0" y2="1">
+        <stop offset="0%" stop-color="{{ color }}" stop-opacity="0.22"/>
+        <stop offset="100%" stop-color="{{ color }}" stop-opacity="0"/>
+      </linearGradient>
+    </defs>
+    <path d="M {% for p in pts %}{{ '%.1f'|format(p[0]) }},{{ '%.1f'|format(p[1]) }}{% if not loop.last %} L {% endif %}{% endfor %} L {{ '%.1f'|format(pts[-1][0]) }},{{ h }} L {{ '%.1f'|format(pts[0][0]) }},{{ h }} Z" fill="url(#sg-{{ pts | length }}-{{ values | sum }})"/>
+    <path d="M {% for p in pts %}{{ '%.1f'|format(p[0]) }},{{ '%.1f'|format(p[1]) }}{% if not loop.last %} L {% endif %}{% endfor %}" fill="none" stroke="{{ color }}" stroke-width="1.25"/>
+  </svg>
+{%- endmacro %}

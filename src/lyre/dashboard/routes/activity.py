@@ -1,4 +1,4 @@
-"""Activity tab — audit timeline with auto-refresh."""
+"""Activity tab — chat-bubble timeline with sticky compose dock."""
 
 from __future__ import annotations
 
@@ -12,12 +12,9 @@ router = APIRouter()
 
 @router.get("/activity", response_class=HTMLResponse)
 async def activity_page(
-    request: Request, minutes: int = 30
+    request: Request, minutes: int = 30,
 ) -> HTMLResponse:
     repos = request.app.state.repos
-    # /activity is the **overview**: high-level events only (tasks /
-    # wakeup boundaries / mailbox). Per-agent transcript drill-down
-    # lives at /agents/<id> so this page stays scan-able.
     events = await build_activity(
         repos, minutes_back=minutes, include_transcript=False,
         model_context_windows=getattr(
@@ -25,6 +22,11 @@ async def activity_page(
         ),
     )
     active = await list_active_wakeups(repos)
+    # Compose dock dropdown: every non-archived agent is a candidate
+    # recipient. Owner is the sender; we exclude owner from the list.
+    agents = await repos.agents.list_all(include_archived=False)
+    recipients = [a for a in agents if a.id != "owner"]
+
     templates = request.app.state.templates
     return templates.TemplateResponse(
         request, "activity.html",
@@ -33,13 +35,14 @@ async def activity_page(
             "events": events,
             "active_wakeups": active,
             "window_minutes": minutes,
+            "compose_recipients": recipients,
         },
     )
 
 
 @router.get("/partials/activity", response_class=HTMLResponse)
 async def activity_partial(
-    request: Request, minutes: int = 30
+    request: Request, minutes: int = 30,
 ) -> HTMLResponse:
     repos = request.app.state.repos
     events = await build_activity(
@@ -62,7 +65,7 @@ async def activity_partial(
 
 @router.get("/partials/agent-status", response_class=HTMLResponse)
 async def agent_status_partial(request: Request) -> HTMLResponse:
-    """Header indicator: list of currently active wakeups (or "idle")."""
+    """Topnav indicator badge for the Activity tab — shows running count."""
     repos = request.app.state.repos
     active = await list_active_wakeups(repos)
     templates = request.app.state.templates

@@ -81,8 +81,8 @@ def client_with_mail(tmp_path: Path):
         _asyncio.get_event_loop().run_until_complete(conn.close())
 
 
-def test_inbox_renders_markdown_bold_and_list(client_with_mail: TestClient) -> None:
-    r = client_with_mail.get("/inbox")
+def test_mail_renders_markdown_bold_and_list(client_with_mail: TestClient) -> None:
+    r = client_with_mail.get("/mail")
     assert r.status_code == 200
     body = r.text
     # Bold + list + inline code all rendered
@@ -95,13 +95,13 @@ def test_inbox_renders_markdown_bold_and_list(client_with_mail: TestClient) -> N
     assert "md-body" in body
 
 
-def test_inbox_escapes_raw_html_no_script_tag(
+def test_mail_escapes_raw_html_no_script_tag(
     client_with_mail: TestClient,
 ) -> None:
     """The hostile body contains a <script> tag. Renderer must escape
     it — only the entity-encoded form may appear, never an actual
     `<script>` element."""
-    r = client_with_mail.get("/inbox")
+    r = client_with_mail.get("/mail")
     body = r.text
     # Raw <script> must NOT appear anywhere in the rendered response.
     assert "<script>alert" not in body

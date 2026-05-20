@@ -24,15 +24,20 @@ from ..persistence.repositories import Repositories
 from .routes import (
     activity,
     agents,
-    feed,
     home,
-    inbox,
+    mail,
+    runs,
     send,
     sse_route,
-    tasks,
-    wakeups,
 )
 from .sse import MailboxBroadcaster
+from .view_helpers import (
+    clock_time,
+    context_peak_pct,
+    fmt_ms,
+    fmt_tokens,
+    rel_time,
+)
 
 TEMPLATE_DIR = Path(__file__).parent / "templates"
 STATIC_DIR = Path(__file__).parent / "static"
@@ -77,7 +82,13 @@ def create_app(
     app.state.broadcaster = broadcaster
     app.state.model_context_windows = model_context_windows or {}
     app.state.templates = Jinja2Templates(directory=str(TEMPLATE_DIR))
-    app.state.templates.env.filters["markdown"] = _render_markdown
+    env = app.state.templates.env
+    env.filters["markdown"] = _render_markdown
+    env.filters["rel_time"] = rel_time
+    env.filters["clock_time"] = clock_time
+    env.filters["fmt_tokens"] = fmt_tokens
+    env.filters["fmt_ms"] = fmt_ms
+    env.filters["context_peak_pct"] = lambda peak, window: context_peak_pct(peak, window)
 
     app.mount(
         "/static",
@@ -88,10 +99,8 @@ def create_app(
     app.include_router(home.router)
     app.include_router(activity.router)
     app.include_router(agents.router)
-    app.include_router(inbox.router)
-    app.include_router(feed.router)
-    app.include_router(tasks.router)
-    app.include_router(wakeups.router)
+    app.include_router(mail.router)
+    app.include_router(runs.router)
     app.include_router(send.router)
     app.include_router(sse_route.router)
 

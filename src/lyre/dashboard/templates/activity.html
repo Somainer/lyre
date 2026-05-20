@@ -1,36 +1,73 @@
 {% extends "base.html" %}
+{% from "_macros.html" import glyph, live_dot %}
 {% block content %}
-<h2>Activity <small>(audit timeline · last {{ window_minutes }} min)</small></h2>
+<div class="activity-shell">
+  <div class="activity-toolbar">
+    <div class="row" style="flex:1;">
+      <span style="font-size:var(--t-meta);color:var(--fg-3);">Window</span>
+      <div class="tw-chips" role="tablist" aria-label="Time window">
+        {% for opt in [("5","5m"), ("15","15m"), ("30","30m"), ("120","2h"), ("1440","24h")] %}
+          <a href="/activity?minutes={{ opt[0] }}"
+             class="tw-chip{% if window_minutes|string == opt[0] %} is-active{% endif %}">{{ opt[1] }}</a>
+        {% endfor %}
+      </div>
+      <span style="font-size:var(--t-meta);color:var(--fg-4);margin-left:var(--s-3);">·</span>
+      <div class="row" style="gap:var(--s-2);color:var(--fg-3);font-size:var(--t-meta);">
+        {{ live_dot() }}<span>live · polling every 2s</span>
+      </div>
+    </div>
+  </div>
 
-<div class="filters">
-  <a href="/activity?minutes=5"   class="{{ 'active' if window_minutes==5  else '' }}">5m</a>
-  <a href="/activity?minutes=15"  class="{{ 'active' if window_minutes==15 else '' }}">15m</a>
-  <a href="/activity?minutes=30"  class="{{ 'active' if window_minutes==30 else '' }}">30m</a>
-  <a href="/activity?minutes=120" class="{{ 'active' if window_minutes==120 else '' }}">2h</a>
-  <a href="/activity?minutes=1440" class="{{ 'active' if window_minutes==1440 else '' }}">24h</a>
-</div>
+  <div class="activity-stream" id="activity-stream"
+       hx-get="/partials/activity?minutes={{ window_minutes }}"
+       hx-trigger="load, every 2s"
+       hx-target="#activity-stream-inner"
+       hx-swap="innerHTML">
+    <div class="activity-inner" id="activity-stream-inner">
+      {% include "partials/activity_body.html" %}
+    </div>
+  </div>
 
-<div id="activity-body"
-     hx-get="/partials/activity?minutes={{ window_minutes }}"
-     hx-trigger="every 2s"
-     hx-swap="innerHTML">
-  {% include "partials/activity_body.html" %}
+  <div class="compose-dock">
+    <form class="compose-inner" method="post" action="/send" id="compose-dock-form">
+      <div class="field" style="flex:0 0 auto;">
+        <span class="dim mono" style="font-size:var(--t-micro);">to</span>
+        <select name="recipient">
+          {% for a in compose_recipients %}
+            <option value="{{ a.id }}">{{ a.id }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="field" style="flex:0 0 auto;">
+        <span class="dim mono" style="font-size:var(--t-micro);">urg</span>
+        <select name="urgency">
+          <option value="blocker">blocker</option>
+          <option value="high">high</option>
+          <option value="normal" selected>normal</option>
+          <option value="low">low</option>
+        </select>
+      </div>
+      <div class="field" style="flex:1;">
+        <input name="body" placeholder="Send mail to leader…" required/>
+      </div>
+      <input type="hidden" name="sender" value="owner"/>
+      <button type="submit" class="btn primary">
+        {{ glyph("send", 12) }} Send <span class="kbd" style="margin-left:4px;">⌘↵</span>
+      </button>
+    </form>
+  </div>
 </div>
 <script>
-  // Sticky-bottom + preserve <details> open state across htmx swaps.
-  // See agent_detail.html for rationale.
   (function () {
     const STICKY_PX = 120;
     let stickToBottom = true;
     const openFolds = new Set();
+    const streamEl = () => document.getElementById('activity-stream');
 
-    function isNearBottom() {
-      return window.innerHeight + window.scrollY
-        >= document.body.offsetHeight - STICKY_PX;
+    function isNearBottom(el) {
+      return el.scrollHeight - el.scrollTop - el.clientHeight < STICKY_PX;
     }
-    function scrollToBottom() {
-      window.scrollTo({ top: document.body.scrollHeight, behavior: "instant" });
-    }
+    function scrollToBottom(el) { el.scrollTop = el.scrollHeight; }
     function snapshotOpenFolds(root) {
       root.querySelectorAll("details[data-fold-id][open]").forEach((d) => {
         openFolds.add(d.getAttribute("data-fold-id"));
@@ -41,35 +78,31 @@
     }
     function restoreOpenFolds(root) {
       root.querySelectorAll("details[data-fold-id]").forEach((d) => {
-        if (openFolds.has(d.getAttribute("data-fold-id"))) {
-          d.open = true;
-        }
+        if (openFolds.has(d.getAttribute("data-fold-id"))) d.open = true;
       });
     }
     document.body.addEventListener("toggle", (e) => {
       const d = e.target;
       if (d.tagName !== "DETAILS" || !d.hasAttribute("data-fold-id")) return;
       const id = d.getAttribute("data-fold-id");
-      if (d.open) openFolds.add(id);
-      else openFolds.delete(id);
+      if (d.open) openFolds.add(id); else openFolds.delete(id);
     }, true);
-
-    window.addEventListener("scroll", () => {
-      stickToBottom = isNearBottom();
-    });
-    window.addEventListener("load", () => {
-      snapshotOpenFolds(document);
-      scrollToBottom();
+    document.addEventListener("DOMContentLoaded", () => {
+      const s = streamEl();
+      if (!s) return;
+      snapshotOpenFolds(s);
+      scrollToBottom(s);
+      s.addEventListener("scroll", () => { stickToBottom = isNearBottom(s); });
     });
     document.body.addEventListener("htmx:beforeSwap", (e) => {
-      if (e.detail.target.id === "activity-body") {
+      if (e.detail.target.id === "activity-stream-inner") {
         snapshotOpenFolds(e.detail.target);
       }
     });
     document.body.addEventListener("htmx:afterSwap", (e) => {
-      if (e.detail.target.id === "activity-body") {
+      if (e.detail.target.id === "activity-stream-inner") {
         restoreOpenFolds(e.detail.target);
-        if (stickToBottom) scrollToBottom();
+        if (stickToBottom) scrollToBottom(streamEl());
       }
     });
   })();

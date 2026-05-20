@@ -1,0 +1,72 @@
+{% extends "base.html" %}
+{% from "_macros.html" import glyph, live_dot, agent_id_pill, urgency_chip %}
+{% block content %}
+<div class="page">
+  <div class="page-header">
+    <div>
+      <h1 class="page-title">Mail</h1>
+      <div class="page-subtitle">
+        <span class="mono">{{ unread_total }}</span> unread ·
+        last delivery <span class="mono">{{ last_delivery_rel }}</span> ·
+        SSE {{ live_dot() }}
+      </div>
+    </div>
+    <div class="row">
+      <a href="/send" class="btn">{{ glyph("send", 12) }} Compose</a>
+    </div>
+  </div>
+
+  <div class="row" style="margin-bottom:var(--s-4);">
+    <div class="fchips">
+      {% for k, label in [
+        ("all",     "All"),
+        ("blocker", "Blocker only"),
+        ("high",    "High +"),
+        ("normal",  "Normal +"),
+        ("feed",    "Feed (low+normal)"),
+      ] %}
+        <a class="fchip{% if filter == k %} is-active{% endif %}"
+           href="/mail?u={{ k }}">{{ label }}<span class="count">{{ counts.get(k, 0) }}</span></a>
+      {% endfor %}
+    </div>
+  </div>
+
+  <div class="card">
+    <div style="display:grid;grid-template-columns:80px 180px 1fr 100px;gap:var(--s-4);padding:var(--s-2) var(--s-4);font-size:var(--t-micro);color:var(--fg-3);text-transform:uppercase;letter-spacing:0.04em;border-bottom:1px solid var(--line-1);">
+      <div>urgency</div><div>from → to</div><div>title · preview</div><div style="text-align:right;">delivered · id</div>
+    </div>
+    {% if messages %}
+      {% for m in messages %}
+        <a class="mail-row{% if not m.read_at %} is-unread{% endif %}"
+           href="/send?reply_to={{ m.id }}"
+           style="text-decoration:none;color:inherit;">
+          <div>{{ urgency_chip(m.urgency) }}</div>
+          <div class="who">
+            {{ agent_id_pill(m.sender, size='sm', dim=True) }}
+            <span class="arrow">→</span>
+            {{ agent_id_pill(m.recipient, size='sm', dim=True) }}
+          </div>
+          <div>
+            <div class="mail-title">
+              {% if not m.read_at %}<span class="unread-dot" aria-label="unread"></span>{% endif %}
+              {{ m.title or "(no title)" }}
+            </div>
+            {% if m.body %}
+              <details class="mail-body-fold" data-fold-id="mail-{{ m.id }}"
+                       onclick="event.stopPropagation();">
+                <summary class="mail-preview">show body ({{ m.body|length }} chars)</summary>
+                <div class="md-body" style="padding:var(--s-3) 0 0;">{{ m.body | markdown }}</div>
+              </details>
+            {% endif %}
+          </div>
+          <div class="when">{{ m.delivered_at | rel_time }}<br><span class="dim">#{{ m.id }}</span></div>
+        </a>
+      {% endfor %}
+    {% else %}
+      <p class="empty">
+        {% if filter and filter != "all" %}no {{ filter }} mail{% else %}mailbox is empty{% endif %}
+      </p>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}

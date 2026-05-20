@@ -1,36 +1,60 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <title>Lyre — {{ tab|default("Dashboard") }}</title>
-  <link rel="stylesheet" href="{{ url_for('static', path='main.css') }}">
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Lyre — {{ tab|default("observation panel") }}</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+  <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet"/>
+  <link rel="stylesheet" href="{{ url_for('static', path='main.css') }}"/>
   <script src="https://unpkg.com/htmx.org@1.9.10" defer></script>
 </head>
 <body>
-  <header>
-    <nav>
-      <a class="brand" href="/">⌁ Lyre</a>
-      <a href="/" class="{{ 'active' if tab=='home' else '' }}">Home</a>
-      <a href="/activity" class="{{ 'active' if tab=='activity' else '' }}">Activity</a>
-      <a href="/agents" class="{{ 'active' if tab=='agents' else '' }}">Agents</a>
-      <a href="/inbox" class="{{ 'active' if tab=='inbox' else '' }}">Inbox</a>
-      <a href="/feed" class="{{ 'active' if tab=='feed' else '' }}">Feed</a>
-      <a href="/tasks" class="{{ 'active' if tab=='tasks' else '' }}">Tasks</a>
-      <a href="/wakeups" class="{{ 'active' if tab=='wakeups' else '' }}">Wakeups</a>
-      <a href="/send" class="{{ 'active' if tab=='send' else '' }}">Send</a>
-      <span class="agent-status"
-            hx-get="/partials/agent-status"
-            hx-trigger="load, every 3s"
-            hx-swap="innerHTML">
-        <span class="dot dim"></span> <small>checking…</small>
-      </span>
-    </nav>
-  </header>
-  <main>
+{% from "_macros.html" import glyph, live_dot %}
+<div class="app">
+  <nav class="topnav">
+    <div class="brand">
+      <span class="brand-mark"></span>
+      <span>lyre</span>
+      <span class="dim mono" style="margin-left:4px;font-size:11px;">v0.41-design</span>
+    </div>
+    <div class="nav-tabs">
+      <a href="/" class="nav-tab{% if tab == 'home' %} is-active{% endif %}">
+        {{ glyph("home", 13) }}<span>Home</span>
+      </a>
+      <a href="/activity" class="nav-tab{% if tab == 'activity' %} is-active{% endif %}">
+        {{ glyph("chat", 13) }}<span>Activity</span>
+        <span class="agent-status-slot"
+              hx-get="/partials/agent-status"
+              hx-trigger="load, every 3s"
+              hx-swap="innerHTML"></span>
+      </a>
+      <a href="/agents" class="nav-tab{% if tab == 'agents' %} is-active{% endif %}">
+        {{ glyph("agent", 13) }}<span>Agents</span>
+      </a>
+      <a href="/mail" class="nav-tab{% if tab == 'mail' %} is-active{% endif %}">
+        {{ glyph("inbox", 13) }}<span>Mail</span>
+        {% if unread_count and unread_count > 0 %}<span class="badge">{{ unread_count }}</span>{% endif %}
+      </a>
+      <a href="/runs" class="nav-tab{% if tab == 'runs' %} is-active{% endif %}">
+        {{ glyph("task", 13) }}<span>Runs</span>
+        {% if needs_input_count and needs_input_count > 0 %}<span class="badge">{{ needs_input_count }}</span>{% endif %}
+      </a>
+    </div>
+    <div class="nav-right">
+      <div class="health"
+           hx-get="/partials/health"
+           hx-trigger="load, every 5s"
+           hx-swap="innerHTML">
+        {{ live_dot() }}<span>checking…</span>
+      </div>
+      <a href="/send" class="btn sm">{{ glyph("send", 11) }} Send</a>
+    </div>
+  </nav>
+  <main{% if tab == 'activity' or tab == 'agent_detail' %} class="no-page-scroll"{% endif %}>
     {% block content %}{% endblock %}
   </main>
-  <footer>
-    <span>Lyre Dashboard v0.1 · {{ tab }}</span>
-  </footer>
+</div>
 </body>
 </html>
