@@ -21,6 +21,7 @@ from markdown_it import MarkdownIt
 from markupsafe import Markup
 
 from ..persistence.repositories import Repositories
+from .dashboard_broadcaster import DashboardBroadcaster
 from .routes import (
     activity,
     agents,
@@ -63,12 +64,18 @@ def create_app(
     repos: Repositories,
     broadcaster: MailboxBroadcaster,
     *,
+    dashboard_broadcaster: DashboardBroadcaster | None = None,
     model_context_windows: dict[str, int] | None = None,
 ) -> FastAPI:
     """`model_context_windows` is a `{model_id_or_alias: context_window_tokens}`
     map used by the activity feed to compute "context usage %" for each
     wakeup. Either pass it explicitly (production), or leave None and
     the dashboard will show absolute token counts only (tests).
+
+    `dashboard_broadcaster` drives the SSE event stream that replaces
+    per-element HTMX polling. Optional for tests / minimal embedding —
+    when None, the /sse/dashboard endpoint returns a stub that just
+    keepalive-pings.
     """
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -80,6 +87,7 @@ def create_app(
     app = FastAPI(title="Lyre Dashboard", lifespan=lifespan)
     app.state.repos = repos
     app.state.broadcaster = broadcaster
+    app.state.dashboard_broadcaster = dashboard_broadcaster
     app.state.model_context_windows = model_context_windows or {}
     app.state.templates = Jinja2Templates(directory=str(TEMPLATE_DIR))
     env = app.state.templates.env

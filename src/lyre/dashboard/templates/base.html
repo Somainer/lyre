@@ -8,9 +8,20 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
   <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet"/>
   <link rel="stylesheet" href="{{ url_for('static', path='main.css') }}"/>
-  <script src="https://unpkg.com/htmx.org@1.9.10" defer></script>
+  <script src="https://unpkg.com/htmx.org@1.9.10"></script>
+  <script src="https://unpkg.com/htmx.org@1.9.10/dist/ext/sse.js"></script>
 </head>
-<body>
+{# Connect ONE SSE stream from <body> — every descendant element can
+   `sse-swap="<event-name>"` to hot-swap its innerHTML when that named
+   event arrives. Replaces the per-element `hx-trigger="every Ns"`
+   polling that drove the old dashboard. The connection is shared by
+   the topnav health pill, the agent-status badge, the home stat tiles,
+   and the activity timeline. Per-agent timelines pass ?agent_id=<id>
+   so the activity event is scoped to that agent.
+   `minutes` is set by the {body_minutes} context var (defaults to 30
+   for global, overridden per agent_detail view). #}
+<body hx-ext="sse"
+      sse-connect="/sse/dashboard{% if sse_agent_id %}?agent_id={{ sse_agent_id }}{% endif %}{% if sse_minutes %}{% if sse_agent_id %}&{% else %}?{% endif %}minutes={{ sse_minutes }}{% endif %}">
 {% from "_macros.html" import glyph, live_dot %}
 <div class="app">
   <nav class="topnav">
@@ -25,10 +36,7 @@
       </a>
       <a href="/activity" class="nav-tab{% if tab == 'activity' %} is-active{% endif %}">
         {{ glyph("chat", 13) }}<span>Activity</span>
-        <span class="agent-status-slot"
-              hx-get="/partials/agent-status"
-              hx-trigger="load, every 3s"
-              hx-swap="innerHTML"></span>
+        <span class="agent-status-slot" sse-swap="agent-status"></span>
       </a>
       <a href="/agents" class="nav-tab{% if tab == 'agents' %} is-active{% endif %}">
         {{ glyph("agent", 13) }}<span>Agents</span>
@@ -43,10 +51,7 @@
       </a>
     </div>
     <div class="nav-right">
-      <div class="health"
-           hx-get="/partials/health"
-           hx-trigger="load, every 5s"
-           hx-swap="innerHTML">
+      <div class="health" sse-swap="health">
         {{ live_dot() }}<span>checking…</span>
       </div>
       <a href="/send" class="btn sm">{{ glyph("send", 11) }} Send</a>

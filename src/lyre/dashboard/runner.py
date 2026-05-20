@@ -18,6 +18,7 @@ import uvicorn
 
 from ..persistence.repositories import Repositories
 from . import MailboxBroadcaster, create_app
+from .dashboard_broadcaster import DashboardBroadcaster
 
 log = structlog.get_logger()
 
@@ -49,8 +50,18 @@ async def run_dashboard(
     await broadcaster.prime()
     await broadcaster.start()
 
+    # Dashboard-wide change broadcaster replaces the per-element HTMX
+    # polls (stats / activity / agent-status / health). 1s interval is
+    # plenty for owner observation; the broadcaster only emits when a
+    # high-water mark actually moves.
+    dashboard_bc = DashboardBroadcaster(repos=repos, poll_interval_s=1.0)
+    await dashboard_bc.prime()
+    await dashboard_bc.start()
+
     app = create_app(
-        repos, broadcaster, model_context_windows=model_context_windows
+        repos, broadcaster,
+        dashboard_broadcaster=dashboard_bc,
+        model_context_windows=model_context_windows,
     )
     # lifespan="off": we don't use ASGI lifespan messages (the handler in
     # app.py is a no-op `yield`). With it on, Starlette's lifespan task
@@ -91,6 +102,7 @@ async def run_dashboard(
             except (asyncio.CancelledError, Exception):
                 pass
         await broadcaster.stop()
+        await dashboard_bc.stop()
 
 
 async def serve_until_signal(
