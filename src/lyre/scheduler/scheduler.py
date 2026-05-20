@@ -48,6 +48,7 @@ from ..runtime.model_router import ModelPreference, ModelRouter
 from ..runtime.tools import ToolContext, ToolRegistry
 from ..runtime.tools.builtin import build_default_registry
 from ..runtime.transcript import TranscriptWriter
+from ..runtime.wakeup_summary import summarize_and_append
 from ..runtime.worktree import WorktreeHandle, WorktreeManager
 
 log = structlog.get_logger()
@@ -660,6 +661,24 @@ class Scheduler:
                 fallbacks=len(result.fallback_events),
                 interrupts=len(result.interrupt_events),
             )
+
+            # Best-effort post-wakeup summary. Replaces the old summary-agent
+            # persona: instead of scheduling a separate agent that reads
+            # other agents' transcripts, we do one cheap-model call inline
+            # here and append a few bullets to the agent's notes file. The
+            # wakeup is already finalized in the DB above; this only adds
+            # filesystem context for the agent's NEXT wakeup. Any failure
+            # is swallowed inside the helper.
+            if not is_simulated_kill_in_flight() and task.agent_id is not None:
+                await summarize_and_append(
+                    wakeup_id=wakeup_id,
+                    agent_id=task.agent_id,
+                    persona_name=persona.name,
+                    result=result,
+                    memory_path=self.config.memory_path,
+                    router=self.router,
+                    adapter_for_entry=self._adapter_for_entry,
+                )
         except Exception as e:  # noqa: BLE001
             log.exception("task_failed", task_id=task_id, error=str(e))
             await self.repos.wakeups.end(
