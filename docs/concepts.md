@@ -32,8 +32,8 @@ These are settled. The rest of the system is built to honor them.
 
 4. **Persistence in three tiers.**
    - **Local-hot** (task-scoped): `task.checkpoint`, dropped when task ends
-   - **Global** (cross-task, owner-scoped): `~/.lyre/memory/` markdown
-     files (facts, skills, persona profiles, agent notes)
+   - **Global** (cross-task, owner-scoped): `~/.lyre/` markdown files
+     (`user.md`, `personas/`, `skills/`, `memory/facts/`, agent notes)
    - **Cold** (audit): transcripts in `~/.lyre/object_store/`,
      append-only, never read back into runtime
 

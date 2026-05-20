@@ -1,21 +1,38 @@
-"""Seed the 6 MVP personas into the database from markdown files.
+"""Seed personas into the database from markdown files.
 
-Each persona is a Markdown file with YAML frontmatter. Run once on `lyre init`,
-idempotent on re-runs (upserts by name).
+After ``lyre onboard`` (or the first ``lyre serve``), the single source of
+truth for personas is ``~/.lyre/personas/``. Shipped personas at
+``src/lyre/personas/*.md`` are only used to populate that directory on
+bootstrap — once they're there, the user can edit / rename / delete
+freely without further surprise from the runtime.
+
+Two layouts are supported in ``~/.lyre/personas/`` (directory wins if
+both exist for the same name):
+
+  * Directory:  ``<name>/identity.md`` (frontmatter + system prompt)
+                — preferred. Allows companion files like APPEND.md.
+  * Flat:       ``<name>.md`` — legacy / minimal-fuss alternative.
+
+Plus optional per-field overrides from ``Config.persona_overrides`` (loaded
+from ``config.toml [personas.<name>]``), applied last on whichever file won.
+
+Idempotent on re-runs (upserts by name).
 """
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import shutil
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import yaml
 
+from ..config import PersonaOverride
 from ..persistence.models import Persona
 from ..persistence.repositories import AgentRepository, PersonaRepository
 
-# Agent ids that always exist after `lyre init`. These are the long-lived
+# Agent ids that always exist after `lyre onboard`. These are the long-lived
 # "well-known" agents users (owner) and the CLI default `lyre send leader ...`
 # expect to be addressable from day one. Workers spawn on demand.
 DEFAULT_AGENTS: tuple[tuple[str, str], ...] = (
@@ -53,20 +70,121 @@ def load_persona_from_file(path: Path) -> Persona:
     )
 
 
-def discover_persona_files() -> list[Path]:
-    """All *.md files in src/lyre/personas/ except this module's own files."""
-    here = Path(__file__).parent
-    excluded = {"__init__.py", "seed.py"}
+SHIPPED_PERSONAS_EXCLUDED = {"__init__.py", "seed.py"}
+
+
+def _shipped_personas_dir() -> Path:
+    return Path(__file__).parent
+
+
+def _shipped_persona_files() -> list[Path]:
     return sorted(
-        p for p in here.glob("*.md") if p.name not in excluded
+        p for p in _shipped_personas_dir().glob("*.md")
+        if p.name not in SHIPPED_PERSONAS_EXCLUDED
     )
 
 
-async def seed_personas(repo: PersonaRepository) -> list[str]:
-    """Upsert all persona files into DB. Returns list of persona names seeded."""
+def ensure_user_personas(
+    user_personas_dir: Path, *, overwrite: bool = False
+) -> list[str]:
+    """Copy shipped personas into ``user_personas_dir`` using directory layout.
+
+    Each shipped ``<name>.md`` becomes ``<user_personas_dir>/<name>/identity.md``.
+    Skips any name that already has either layout present in the user dir
+    (so user edits, renames, and deletions are preserved across re-runs).
+
+    Returns the list of names actually copied.
+    """
+    user_personas_dir.mkdir(parents=True, exist_ok=True)
+    copied: list[str] = []
+    for src in _shipped_persona_files():
+        name = src.stem
+        flat_target = user_personas_dir / f"{name}.md"
+        dir_target = user_personas_dir / name / "identity.md"
+        if not overwrite and (flat_target.exists() or dir_target.exists()):
+            continue
+        dir_target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(src, dir_target)
+        copied.append(name)
+    return copied
+
+
+def discover_persona_files(user_personas_dir: Path | None = None) -> list[Path]:
+    """All persona ``*.md`` files Lyre will load.
+
+    In production, ``bootstrap_runtime`` calls :func:`ensure_user_personas`
+    first so ``~/.lyre/personas/`` is populated; ``user_personas_dir`` is the
+    single source of truth. Resolution per name (directory wins over flat
+    if both exist):
+
+      * ``<user_personas_dir>/<name>/identity.md``  ← preferred
+      * ``<user_personas_dir>/<name>.md``           ← legacy / minimal
+
+    Fallback for callers that bypass bootstrap (mostly test fixtures): if
+    ``user_personas_dir`` is None or empty, return the shipped files
+    directly.
+    """
+    if user_personas_dir is not None and user_personas_dir.is_dir():
+        by_name: dict[str, Path] = {}
+
+        # Flat <name>.md first (gets overridden by directory layout below).
+        for p in sorted(user_personas_dir.glob("*.md")):
+            if p.name.startswith("."):
+                continue
+            by_name[p.stem] = p
+
+        # Directory layout: <name>/identity.md
+        for d in sorted(user_personas_dir.iterdir()):
+            if not d.is_dir() or d.name.startswith("."):
+                continue
+            identity = d / "identity.md"
+            if identity.is_file():
+                by_name[d.name] = identity
+
+        if by_name:
+            return sorted(
+                by_name.values(),
+                key=lambda p: (p.parent.name if p.name == "identity.md" else p.stem),
+            )
+
+    # Fallback: shipped personas (test fixtures only — production paths
+    # always populate user_personas_dir first via bootstrap_runtime).
+    return _shipped_persona_files()
+
+
+def _apply_field_override(persona: Persona, override: PersonaOverride) -> Persona:
+    """Apply single-field ``[personas.<name>]`` overrides from config.toml.
+
+    Each field replaces the persona's value if non-None; the persona's
+    ``system_prompt`` and ``role_description`` are never touched by this
+    path (use a whole-file override in ``~/.lyre/personas/`` for that).
+    """
+    updates: dict[str, Any] = {}
+    if override.model_preference is not None:
+        updates["model_preference"] = override.model_preference
+    if override.allowed_lyre_tools is not None:
+        updates["allowed_lyre_tools"] = list(override.allowed_lyre_tools)
+    if not updates:
+        return persona
+    return persona.model_copy(update=updates)
+
+
+async def seed_personas(
+    repo: PersonaRepository,
+    user_personas_dir: Path | None = None,
+    persona_overrides: dict[str, PersonaOverride] | None = None,
+) -> list[str]:
+    """Upsert all persona files into DB. Returns list of persona names seeded.
+
+    Lookup order per name: ``user_personas_dir/<name>.md`` > shipped.
+    Per-field overrides from ``persona_overrides`` apply last.
+    """
+    overrides = persona_overrides or {}
     seeded: list[str] = []
-    for path in discover_persona_files():
+    for path in discover_persona_files(user_personas_dir):
         persona = load_persona_from_file(path)
+        if persona.name in overrides:
+            persona = _apply_field_override(persona, overrides[persona.name])
         await repo.upsert(persona)
         seeded.append(persona.name)
     return seeded
@@ -101,7 +219,7 @@ async def seed_default_agents(
 
 def ensure_agent_notes_file(memory_root: Path, agent_id: str) -> Path:
     """Create `<memory_root>/facts/agent-<id>-notes.md` if it doesn't yet
-    exist. Returns the absolute path either way. Used by `lyre init`
+    exist. Returns the absolute path either way. Used by `lyre onboard`
     (via seed_default_agents) and by the `create_agent` tool.
     """
     facts_dir = memory_root / "facts"
@@ -109,7 +227,7 @@ def ensure_agent_notes_file(memory_root: Path, agent_id: str) -> Path:
     path = facts_dir / f"agent-{agent_id}-notes.md"
     if path.exists():
         return path
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     seed = f"""---
 name: agent-{agent_id}-notes
 description: {agent_id}'s private notebook for cross-wakeup memory.

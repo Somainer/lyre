@@ -70,12 +70,6 @@ class Persona(BaseModel):
     updated_at: datetime | None = None
 
 
-class PersonaProfile(BaseModel):
-    persona_name: str
-    profile: dict[str, Any]
-    updated_at: datetime | None = None
-
-
 class Task(BaseModel):
     id: str
     parent_task_id: str | None = None

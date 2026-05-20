@@ -7,6 +7,7 @@ import json
 import os
 import signal
 import sys
+from datetime import UTC
 
 import click
 import structlog
@@ -16,9 +17,6 @@ from .outbox.dispatcher import OutboxDispatcher
 from .persistence.db import init_db
 from .persistence.models import MailboxMessage, TaskSpec
 from .persistence.sqlite_impl import SqliteRepositories
-from .personas.seed import seed_default_agents, seed_personas
-from .runtime.memory import ensure_skeleton, write_default_owner_soul
-from .runtime.skills import ensure_skills_skeleton
 from .scheduler.scheduler import Scheduler
 
 log = structlog.get_logger()
@@ -44,53 +42,48 @@ def cli() -> None:
 
 
 # ----------------------------------------------------------------------
-# lyre init
+# lyre onboard
 # ----------------------------------------------------------------------
 
-@cli.command("init")
-def init_cmd() -> None:
-    """Initialize DB schema and seed default personas."""
+@cli.command("onboard")
+def onboard_cmd() -> None:
+    """Interactive first-run / reconfigure wizard.
 
-    async def _run() -> None:
-        cfg = Config.from_env()
-        click.echo(f"Initializing DB at {cfg.db_path}")
-        conn = await init_db(cfg.db_path)
-        try:
-            repos = SqliteRepositories(conn)
-            await repos.mailbox.ensure_mailbox("owner")
-            seeded = await seed_personas(repos.personas)
-            click.echo(f"Seeded {len(seeded)} personas: {', '.join(seeded)}")
+    Writes ``~/.lyre/config.toml``, ``~/.lyre/.env``, ``~/.lyre/user.md``,
+    copies shipped personas into ``~/.lyre/personas/``, initializes the
+    database, and seeds default agents. Safe to re-run — every overwrite
+    is gated by a confirmation prompt.
+    """
+    from .onboard import bootstrap_runtime, run_wizard
 
-            click.echo(f"Setting up memory dir at {cfg.memory_path}")
-            created = ensure_skeleton(cfg.memory_path)
-            for p in created:
-                click.echo(f"  created {p.relative_to(cfg.memory_path)}")
+    cfg = Config.from_env()
+    plan = run_wizard(lyre_home=cfg.lyre_home)
 
-            # Seed agents AFTER memory skeleton exists so per-agent notes
-            # files land in <memory>/facts/ on the same `lyre init`.
-            created_agents = await seed_default_agents(
-                repos.agents, memory_root=cfg.memory_path,
-            )
-            if created_agents:
-                click.echo(
-                    f"Created {len(created_agents)} default agents: "
-                    + ", ".join(created_agents)
-                )
-            else:
-                click.echo("Default agents already exist (owner, leader).")
-            soul = write_default_owner_soul(cfg.memory_path)
-            click.echo(f"  owner Soul: {soul.relative_to(cfg.memory_path)}")
+    # Wizard wrote config.toml + env + user.md + dirs; reload Config so the
+    # bootstrap sees fresh owner_name / paths.
+    bootstrap_cfg = Config.from_env()
+    click.echo("")
+    click.echo(f"Initializing DB at {bootstrap_cfg.db_path}")
+    created_agents = asyncio.run(bootstrap_runtime(bootstrap_cfg))
+    click.echo(f"  ✓ DB ready, {bootstrap_cfg.memory_path} dirs ensured")
+    if created_agents:
+        click.echo(f"  ✓ created default agents: {', '.join(created_agents)}")
 
-            lyre_home = cfg.memory_path.parent  # ~/.lyre/
-            skills_created = ensure_skills_skeleton(lyre_home)
-            for p in skills_created:
-                click.echo(f"  created {p.relative_to(lyre_home)}")
-
-            click.echo("Done.")
-        finally:
-            await conn.close()
-
-    asyncio.run(_run())
+    click.echo("")
+    click.echo(click.style("All set.", bold=True))
+    click.echo(f"  Owner: {plan.owner_name}" + (
+        f" <{plan.owner_email}>" if plan.owner_email else ""
+    ))
+    if plan.models:
+        click.echo(f"  Models configured ({len(plan.models)}):")
+        for m in plan.models:
+            endpoint_label = m.endpoint or "(SDK default)"
+            mark = " (default)" if m.id == plan.default_model else ""
+            click.echo(f"    • {m.id}  →  {endpoint_label}  [${m.auth_env}]{mark}")
+    click.echo("")
+    click.echo("Next:")
+    click.echo("  lyre serve                 # start the runtime + dashboard")
+    click.echo('  lyre send leader "hi"      # send a test message')
 
 
 # ----------------------------------------------------------------------
@@ -124,14 +117,14 @@ def serve_cmd(
     """Start scheduler + outbox dispatcher (+ dashboard) in one process."""
 
     async def _run() -> None:
-        from .runtime.model_registry import default_registry_path, load_registry
+        from .runtime.model_registry import load_registry_for_config
 
         cfg = Config.from_env()
-        # Q9: each model entry declares its own auth_env. Validate that at
-        # least one enabled entry (or the override entry, if set) is reachable
+        # Each model entry declares its own auth_env. Validate that at least
+        # one enabled entry (or the override entry, if set) is reachable
         # before starting — gives a fast, actionable error instead of failing
         # silently on the first dispatched task.
-        registry = load_registry(default_registry_path())
+        registry = load_registry_for_config(cfg)
         candidates = registry.enabled()
         if cfg.model_override:
             candidates = [e for e in candidates if e.id == cfg.model_override]
@@ -162,17 +155,14 @@ def serve_cmd(
             + ", ".join(e.id for e in reachable)
         )
 
+        # Bootstrap the runtime if needed — `lyre serve` after `lyre onboard`
+        # works in one step. Phase 0 needs at least owner+leader present.
+        from .onboard import bootstrap_runtime
+        await bootstrap_runtime(cfg)
+
         conn = await init_db(cfg.db_path)
         try:
             repos = SqliteRepositories(conn)
-            # Always make sure the well-known agents exist before scheduler
-            # starts — `lyre serve` straight after `lyre init` should work
-            # without a separate bootstrap step, and Phase 0 needs at least
-            # owner+leader to address mail to.
-            await seed_personas(repos.personas)
-            await seed_default_agents(
-                repos.agents, memory_root=cfg.memory_path,
-            )
 
             scheduler = Scheduler(
                 repos, cfg,
@@ -355,10 +345,10 @@ def dashboard_cmd(host: str, port: int) -> None:
     from .dashboard.runner import run_dashboard
 
     async def _run() -> None:
-        from .runtime.model_registry import default_registry_path, load_registry
+        from .runtime.model_registry import load_registry_for_config
 
         cfg = Config.from_env()
-        registry = load_registry(default_registry_path())
+        registry = load_registry_for_config(cfg)
         ctx_windows = {
             e.id: e.context_window
             for e in registry.entries
@@ -1205,9 +1195,10 @@ def model_group() -> None:
 def model_list_cmd() -> None:
     """Show every model + auth/health status."""
 
-    from .runtime.model_registry import default_registry_path, load_registry
+    from .runtime.model_registry import load_registry_for_config
 
-    registry = load_registry(default_registry_path())
+    cfg = Config.from_env()
+    registry = load_registry_for_config(cfg)
     click.echo(
         f"{'ID':40s} {'TIER':10s} {'PROVIDER':12s} {'AUTH':6s} {'CAPS'}"
     )
@@ -1233,7 +1224,7 @@ def _parse_since_to_iso(since: str | None) -> str | None:
     if not since:
         return None
     import re
-    from datetime import datetime, timedelta, timezone
+    from datetime import datetime, timedelta
 
     m = re.match(r"^(\d+)([smhdw])$", since.strip())
     if not m:
@@ -1242,7 +1233,7 @@ def _parse_since_to_iso(since: str | None) -> str | None:
         )
     n = int(m.group(1))
     unit = m.group(2)
-    cutoff = datetime.now(timezone.utc) - timedelta(seconds=n * _SINCE_UNITS[unit])
+    cutoff = datetime.now(UTC) - timedelta(seconds=n * _SINCE_UNITS[unit])
     return cutoff.strftime("%Y-%m-%dT%H:%M:%S.%fZ")[:-4] + "Z"
 
 
@@ -1305,7 +1296,7 @@ def wakeups_list_cmd(
         lyre wakeups list --since 1h --status silent_close
         lyre wakeups list --persona leader --json | jq '.id'
     """
-    from .runtime.model_registry import default_registry_path, load_registry
+    from .runtime.model_registry import load_registry_for_config
 
     cutoff = _parse_since_to_iso(since)
 
@@ -1313,7 +1304,7 @@ def wakeups_list_cmd(
         cfg = Config.from_env()
         # context_window per model — for ctx_peak_pct column.
         try:
-            registry = load_registry(default_registry_path())
+            registry = load_registry_for_config(cfg)
             ctx_windows = {
                 e.id: e.context_window for e in registry.entries if e.context_window
             }

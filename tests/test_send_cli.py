@@ -18,14 +18,29 @@ from lyre.main import cli
 
 @pytest.fixture
 def cli_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[CliRunner, Path]:
+    """A bootstrapped Lyre environment for CLI tests.
+
+    Calls ``bootstrap_runtime`` directly (the non-interactive subset of
+    ``lyre onboard``) so the CLI fixture stays sync-friendly and doesn't
+    require feeding the interactive wizard prompts.
+    """
+    import asyncio
+
+    from lyre.config import Config
+    from lyre.onboard import bootstrap_runtime
+
     db_path = tmp_path / "lyre.db"
     obj = tmp_path / "objstore"
+    home = tmp_path / "lyre_home"
+    monkeypatch.setenv("LYRE_HOME", str(home))
     monkeypatch.setenv("LYRE_DB_PATH", str(db_path))
     monkeypatch.setenv("LYRE_OBJECT_STORE", str(obj))
     monkeypatch.chdir(tmp_path)  # so dotenv loader doesn't pick up project .env
+
+    cfg = Config.from_env()
+    asyncio.run(bootstrap_runtime(cfg))
+
     runner = CliRunner()
-    result = runner.invoke(cli, ["init"])
-    assert result.exit_code == 0, result.output
     return runner, db_path
 
 
@@ -103,7 +118,7 @@ def test_send_rejects_invalid_urgency(cli_env: tuple[CliRunner, Path]) -> None:
 def test_send_attaches_task_id(cli_env: tuple[CliRunner, Path]) -> None:
     runner, db_path = cli_env
     # Pre-insert a task directly (the schema CHECKs status against an enum;
-    # the FK on tasks.persona_name has been satisfied by `lyre init` seeding).
+    # the FK on tasks.persona_name has been satisfied by `lyre onboard` seeding).
     conn = sqlite3.connect(str(db_path))
     try:
         conn.execute(

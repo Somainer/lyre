@@ -22,7 +22,6 @@ from .models import (
     MailboxMessage,
     OutboxRow,
     Persona,
-    PersonaProfile,
     ScheduledMail,
     Skill,
     Task,
@@ -201,32 +200,6 @@ class SqlitePersonaRepository:
             WHERE name = ?
             """,
             (status, reviewer, _now_iso(), persona_name),
-        )
-        await self.conn.commit()
-
-    async def get_profile(self, persona_name: str) -> PersonaProfile | None:
-        async with self.conn.execute(
-            "SELECT * FROM persona_profiles WHERE persona_name = ?", (persona_name,)
-        ) as cur:
-            row = await cur.fetchone()
-        if not row:
-            return None
-        return PersonaProfile(
-            persona_name=row["persona_name"],
-            profile=_parse_json(row["profile"]),
-            updated_at=row["updated_at"],
-        )
-
-    async def upsert_profile(self, persona_name: str, profile: dict[str, Any]) -> None:
-        await self.conn.execute(
-            """
-            INSERT INTO persona_profiles (persona_name, profile)
-            VALUES (?, ?)
-            ON CONFLICT(persona_name) DO UPDATE SET
-              profile = excluded.profile,
-              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-            """,
-            (persona_name, json.dumps(profile)),
         )
         await self.conn.commit()
 
@@ -1526,37 +1499,6 @@ class SqliteArtifactRepository:
         return []
 
 
-class SqliteGlobalFactsRepository:
-    def __init__(self, conn: aiosqlite.Connection):
-        self.conn = conn
-
-    async def insert(
-        self, fact_kind: str, scope: str | None, body: str, **kwargs: Any
-    ) -> str:
-        fact_id = _uuid7()
-        await self.conn.execute(
-            """
-            INSERT INTO global_facts (id, kind, scope, body, source_task_id, metadata)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                fact_id,
-                fact_kind,
-                scope,
-                body,
-                kwargs.get("source_task_id"),
-                _json(kwargs.get("metadata")),
-            ),
-        )
-        await self.conn.commit()
-        return fact_id
-
-    async def search_by_kind(
-        self, kind: str, scope: str | None = None, limit: int = 10
-    ) -> list[dict[str, Any]]:
-        return []
-
-
 # -----------------------------------------------------------------------
 # Aggregate facade
 # -----------------------------------------------------------------------
@@ -1575,4 +1517,3 @@ class SqliteRepositories:
         self.skills = SqliteSkillRepository(conn)
         self.artifacts = SqliteArtifactRepository(conn)
         self.local_hot = SqliteLocalHotRepository(conn)
-        self.global_facts = SqliteGlobalFactsRepository(conn)

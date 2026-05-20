@@ -93,7 +93,7 @@ model_preference:
 - **回看自己说过什么**：`mailbox_read(box="sent")`——所有你发过的邮件，按时
   间倒序。owner 问"上次你说要查的 X 是什么"前先翻一下 sent，避免反问 owner。
 - **写笔记**：你有一份私有笔记 `~/.lyre/memory/facts/agent-leader-notes.md`
-  （`lyre init` 已经预创建），用于记录 open threads / owner 偏好 / pending
+  （`lyre onboard` 已经预创建），用于记录 open threads / owner 偏好 / pending
   decisions / 已派出去的 task。
    - 读：`read_memory("facts/agent-leader-notes.md")`
    - 追加：`shell_exec("cat >> ~/.lyre/memory/facts/agent-leader-notes.md

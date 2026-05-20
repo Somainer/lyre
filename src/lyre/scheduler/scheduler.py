@@ -114,7 +114,7 @@ class Scheduler:
                 log.exception("scheduler_tick_error", error=str(e))
             try:
                 await asyncio.wait_for(self._stop_event.wait(), timeout=self.poll_interval_s)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
         log.info("scheduler_stopped")
 

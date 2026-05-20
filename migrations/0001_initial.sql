@@ -1,5 +1,5 @@
 -- Lyre initial schema
--- See PERSISTENCE_SCHEMA.md §3 for full design and Postgres equivalents.
+-- See docs/design/PERSISTENCE_SCHEMA.md for design and Postgres equivalents.
 -- This file is idempotent (CREATE TABLE IF NOT EXISTS) so it can be re-run safely.
 
 ------------------------------------------------------------
@@ -10,8 +10,7 @@ CREATE TABLE IF NOT EXISTS personas (
   role_description     TEXT NOT NULL,
   system_prompt        TEXT NOT NULL,
   allowed_lyre_tools   TEXT NOT NULL DEFAULT '[]',
-  -- Q9 (2026-05-17): renamed from model_routing. JSON with tier/requires/prefer.
-  model_preference     TEXT,
+  model_preference     TEXT,  -- JSON with tier/requires/prefer
   needs_worktree       INTEGER NOT NULL DEFAULT 1,
   status               TEXT NOT NULL DEFAULT 'approved'
                        CHECK (status IN ('proposed','approved','deprecated')),
@@ -26,16 +25,24 @@ CREATE TABLE IF NOT EXISTS personas (
 CREATE INDEX IF NOT EXISTS personas_status ON personas(status);
 
 ------------------------------------------------------------
--- Persona profiles (含 owner Soul)
+-- Agents (running instances of a persona)
 ------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS persona_profiles (
-  persona_name         TEXT PRIMARY KEY REFERENCES personas(name),
-  profile              TEXT NOT NULL,
-  updated_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+-- persona = role definition (the personas table; one md file)
+-- agent   = running instance with own identity, mailbox, task queue.
+--           Multiple agents can share one persona.
+CREATE TABLE IF NOT EXISTS agents (
+  id            TEXT PRIMARY KEY,
+  persona_name  TEXT NOT NULL REFERENCES personas(name),
+  status        TEXT NOT NULL DEFAULT 'idle'
+                CHECK (status IN ('idle','busy','archived')),
+  created_by    TEXT,    -- 'owner' or another agent_id
+  created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  archived_at   TEXT,
+  metadata      TEXT     -- JSON: {model_id?, description?, ...}
 );
 
--- Vector companion table (sqlite-vec); enable at runtime via loadable extension
--- CREATE VIRTUAL TABLE persona_profiles_vec USING vec0(persona_name TEXT PRIMARY KEY, embedding FLOAT[768]);
+CREATE INDEX IF NOT EXISTS agents_persona ON agents(persona_name, status);
+CREATE INDEX IF NOT EXISTS agents_status ON agents(status);
 
 ------------------------------------------------------------
 -- Tasks
@@ -44,6 +51,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   id                TEXT PRIMARY KEY,
   parent_task_id    TEXT REFERENCES tasks(id),
   persona_name      TEXT NOT NULL REFERENCES personas(name),
+  agent_id          TEXT REFERENCES agents(id),
   goal              TEXT NOT NULL,
   acceptance        TEXT NOT NULL,
   status            TEXT NOT NULL
@@ -63,35 +71,47 @@ CREATE TABLE IF NOT EXISTS tasks (
 
 CREATE INDEX IF NOT EXISTS tasks_status_lease ON tasks(status, lease_until);
 CREATE INDEX IF NOT EXISTS tasks_parent ON tasks(parent_task_id);
+CREATE INDEX IF NOT EXISTS tasks_agent_status ON tasks(agent_id, status);
 
 ------------------------------------------------------------
 -- Wakeups (cold-archive index)
 ------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS wakeups (
-  id               TEXT PRIMARY KEY,
-  task_id          TEXT NOT NULL REFERENCES tasks(id),
-  persona_name     TEXT NOT NULL REFERENCES personas(name),
-  started_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-  ended_at         TEXT,
-  end_status       TEXT,
-  token_input      INTEGER,
-  token_output     INTEGER,
-  wall_clock_ms    INTEGER,
-  tool_call_count  INTEGER,
-  provider         TEXT,
-  model            TEXT,
-  failure_report   TEXT,
-  transcript_uri   TEXT
+  id                    TEXT PRIMARY KEY,
+  task_id               TEXT NOT NULL REFERENCES tasks(id),
+  persona_name          TEXT NOT NULL REFERENCES personas(name),
+  agent_id              TEXT REFERENCES agents(id),
+  started_at            TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  ended_at              TEXT,
+  end_status            TEXT,
+  token_input           INTEGER,
+  token_output          INTEGER,
+  wall_clock_ms         INTEGER,
+  tool_call_count       INTEGER,
+  provider              TEXT,
+  model                 TEXT,
+  failure_report        TEXT,
+  transcript_uri        TEXT,
+  -- Largest input_tokens reported across the wakeup's turns. Each API call
+  -- resends the full message list, so per-turn input_tokens equals the
+  -- running context size — this column captures the max.
+  context_peak_tokens   INTEGER,
+  -- Number of mid-wakeup auto-compactions (>0 means we crossed the threshold
+  -- at least once).
+  compaction_count      INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS wakeups_task ON wakeups(task_id, started_at);
+CREATE INDEX IF NOT EXISTS wakeups_agent ON wakeups(agent_id, started_at);
 
 ------------------------------------------------------------
 -- Mailboxes + messages + outbox
 ------------------------------------------------------------
+-- mailboxes.recipient is conceptually an agent_id. No hard FK because
+-- bootstrap order requires the `owner` mailbox before any agent exists.
+-- Tool-level validation in mailbox_send/read rejects unknown recipients.
 CREATE TABLE IF NOT EXISTS mailboxes (
   recipient                TEXT PRIMARY KEY,
-  last_processed_msg_id    INTEGER NOT NULL DEFAULT 0,
   metadata                 TEXT
 );
 
@@ -101,16 +121,30 @@ CREATE TABLE IF NOT EXISTS mailbox_messages (
   external_id     TEXT NOT NULL,
   sender          TEXT NOT NULL,
   urgency         TEXT NOT NULL CHECK (urgency IN ('blocker','high','normal','low')),
+  -- Subject-line summary for inbox listings. Written at send time:
+  --   explicit `title` param if provided (≤140 char), or
+  --   first non-empty line of body truncated to 140 char.
+  title           TEXT,
   body            TEXT NOT NULL,
   task_id         TEXT REFERENCES tasks(id),
   parent_msg_id   INTEGER REFERENCES mailbox_messages(id),
+  -- Broadcast: broadcast_id groups copies of one multi-recipient send;
+  -- recipients_all is a JSON list of every recipient on the thread.
+  broadcast_id    TEXT,
+  recipients_all  TEXT,
   metadata        TEXT,
   delivered_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  -- NULL = unread. Set by `mailbox_read` (auto-mark) or explicit `mark_read`.
+  read_at         TEXT,
   UNIQUE (recipient, external_id)
 );
 
 CREATE INDEX IF NOT EXISTS mailbox_messages_inbox
   ON mailbox_messages(recipient, urgency, id);
+CREATE INDEX IF NOT EXISTS mailbox_messages_broadcast
+  ON mailbox_messages(broadcast_id);
+CREATE INDEX IF NOT EXISTS mailbox_messages_unread
+  ON mailbox_messages(recipient, urgency, id) WHERE read_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS outbox (
   id                 INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -131,7 +165,55 @@ CREATE INDEX IF NOT EXISTS outbox_undispatched ON outbox(created_at)
   WHERE dispatched_at IS NULL;
 
 ------------------------------------------------------------
--- Local-hot, Global facts, Artifacts, Skills
+-- Scheduled mail (future mail / cron)
+------------------------------------------------------------
+-- Lifecycle:
+--   pending    — scheduled_for is in the future; scheduler tick delivers when due
+--   completed  — delivered (and, for recurring, no more occurrences in window)
+--   cancelled  — explicit cancel; future fires stopped
+--   bounced    — recipient was archived at delivery time; notice to creator
+--
+-- Recurrence (NULL recur_kind = one-shot):
+--   interval → recur_value is duration like '1h', '24h', '1w' (min 1m)
+--   cron     → recur_value is 5-field POSIX cron expression; next-fire via croniter
+CREATE TABLE IF NOT EXISTS scheduled_mail (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  recipient         TEXT NOT NULL,
+  sender            TEXT NOT NULL,
+  urgency           TEXT NOT NULL
+                    CHECK(urgency IN ('blocker','high','normal','low')),
+  title             TEXT,
+  body              TEXT NOT NULL,
+  task_id           TEXT REFERENCES tasks(id),
+  parent_msg_id     INTEGER REFERENCES mailbox_messages(id),
+  metadata          TEXT,
+  scheduled_for     TEXT NOT NULL,    -- ISO 8601 UTC, mutated after each delivery
+  recur_kind        TEXT CHECK(recur_kind IN ('interval','cron')),
+  recur_value       TEXT,
+  recur_until       TEXT,             -- NULL = no horizon
+  occurrence_count  INTEGER NOT NULL DEFAULT 0,
+  created_at        TEXT NOT NULL
+                    DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  created_by_agent  TEXT,
+  created_by_task   TEXT REFERENCES tasks(id),
+  status            TEXT NOT NULL DEFAULT 'pending'
+                    CHECK(status IN ('pending','completed','cancelled','bounced')),
+  last_delivery_id  INTEGER REFERENCES mailbox_messages(id),
+  last_delivered_at TEXT,
+  cancelled_at      TEXT,
+  cancelled_by      TEXT,
+  bounce_reason     TEXT
+);
+
+CREATE INDEX IF NOT EXISTS scheduled_mail_due
+  ON scheduled_mail(scheduled_for) WHERE status='pending';
+CREATE INDEX IF NOT EXISTS scheduled_mail_recipient
+  ON scheduled_mail(recipient, status);
+CREATE INDEX IF NOT EXISTS scheduled_mail_creator
+  ON scheduled_mail(created_by_agent, status);
+
+------------------------------------------------------------
+-- Local-hot, Artifacts, Skills
 ------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS local_hot (
   task_id      TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -141,19 +223,6 @@ CREATE TABLE IF NOT EXISTS local_hot (
   updated_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   PRIMARY KEY (task_id, key)
 );
-
-CREATE TABLE IF NOT EXISTS global_facts (
-  id              TEXT PRIMARY KEY,
-  kind            TEXT NOT NULL,
-  scope           TEXT,
-  body            TEXT NOT NULL,
-  cold_pointer    TEXT,
-  source_task_id  TEXT REFERENCES tasks(id),
-  metadata        TEXT,
-  created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-);
-
-CREATE INDEX IF NOT EXISTS global_facts_kind ON global_facts(kind, scope);
 
 CREATE TABLE IF NOT EXISTS artifacts (
   id             TEXT PRIMARY KEY,
@@ -190,7 +259,7 @@ CREATE INDEX IF NOT EXISTS skills_status ON skills(status);
 CREATE INDEX IF NOT EXISTS skills_scope ON skills(scope, status);
 
 ------------------------------------------------------------
--- Schema version table (for future migrations)
+-- Schema version (for future migrations)
 ------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS schema_migrations (
   version    INTEGER PRIMARY KEY,

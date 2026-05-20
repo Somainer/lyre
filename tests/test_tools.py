@@ -670,8 +670,8 @@ async def test_create_agent_pre_creates_notes_file(
 async def test_seed_default_agents_pre_creates_notes_files(
     tmp_path,
 ) -> None:
-    """`lyre init` path: owner + leader notes files materialize next to
-    the memory skeleton on first init."""
+    """`lyre onboard` path: owner + leader notes files materialize next to
+    the memory skeleton on first bootstrap."""
     from pathlib import Path
 
     from lyre.persistence.db import init_db

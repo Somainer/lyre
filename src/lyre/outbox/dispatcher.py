@@ -60,7 +60,7 @@ class OutboxDispatcher:
                         await asyncio.wait_for(
                             self._stop_event.wait(), timeout=self.poll_interval_s
                         )
-                    except asyncio.TimeoutError:
+                    except TimeoutError:
                         pass
             except Exception as exc:  # noqa: BLE001
                 log.exception("outbox_dispatcher_tick_error", error=str(exc))
@@ -68,7 +68,7 @@ class OutboxDispatcher:
                     await asyncio.wait_for(
                         self._stop_event.wait(), timeout=self.poll_interval_s
                     )
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     pass
         log.info("outbox_dispatcher_stopped")
 

@@ -144,6 +144,20 @@ def assemble_system_prompt(
             except OSError:
                 pass
 
+    # Owner identity / preferences — user-authored, agents never write here.
+    # `lyre onboard` creates the initial template at ~/.lyre/user.md.
+    if lyre_home is not None:
+        user_md_path = lyre_home / "user.md"
+        if user_md_path.is_file():
+            try:
+                user_body = user_md_path.read_text(encoding="utf-8").strip()
+                if user_body:
+                    parts.append("")
+                    parts.append("## Owner identity & preferences (set by owner in ~/.lyre/user.md)")
+                    parts.append(user_body)
+            except OSError:
+                pass
+
     # AGENTS.md walk — repo-specific, stable per worktree session.
     if worktree_cwd is not None:
         agents_files = _walk_agents_md(worktree_cwd)

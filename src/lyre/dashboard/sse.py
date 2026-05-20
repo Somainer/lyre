@@ -103,7 +103,7 @@ class MailboxBroadcaster:
                 await asyncio.wait_for(
                     self._stop_event.wait(), timeout=self.poll_interval_s
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
         log.info("broadcaster_stopped", recipient=self.recipient)
 

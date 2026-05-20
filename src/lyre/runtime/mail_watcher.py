@@ -135,7 +135,7 @@ class MailWatcher:
                 await asyncio.wait_for(
                     self._stop_event.wait(), timeout=self.poll_interval_s
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
         log.debug("mail_watcher_stopped", recipient=self.recipient)
 

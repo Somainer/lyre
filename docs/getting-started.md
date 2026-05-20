@@ -12,43 +12,38 @@ cd lyre
 uv sync
 ```
 
-This pulls Python 3.10+, the Anthropic / OpenAI SDKs, FastAPI for the
+This pulls Python 3.11+, the Anthropic / OpenAI SDKs, FastAPI for the
 dashboard, and SQLite-based persistence. No Docker required.
 
-## 2. Set an API key
-
-Lyre's default model registry ships entries for Anthropic, DeepSeek, and
-OpenAI. You need a key for **at least one** provider. DeepSeek is the
-cheapest path for trying things out:
+## 2. Run the onboard wizard
 
 ```bash
-# Pick one — set whichever you have access to:
-export ANTHROPIC_API_KEY=sk-ant-...
-export DEEPSEEK_API_KEY=sk-...
-export OPENAI_API_KEY=sk-...
+uv run lyre onboard
 ```
 
-You can also drop these into a `.env` file at the repo root; Lyre reads it
-automatically.
+The wizard asks for:
 
-## 3. Initialize state
+- Owner name + email (defaults from `git config`)
+- A starter provider (Anthropic / OpenAI / DeepSeek / OpenRouter / skip)
+- Where to put the API key — your shell env, or `~/.lyre/.env` (chmod 600)
 
-```bash
-uv run lyre init
-```
+Then it writes:
 
-This creates:
-
-- `~/.lyre/lyre.db` — SQLite database for tasks / wakeups / mailbox
-- `~/.lyre/memory/` — markdown filesystem the agents read and write
+- `~/.lyre/config.toml` — your identity + chosen provider/model defaults
+- `~/.lyre/user.md` — a starter template for your identity & preferences (agents read this every wakeup)
+- `~/.lyre/personas/<name>/identity.md` — shipped personas copied here as the SSOT (edit / rename / delete freely)
+- `~/.lyre/lyre.db` — SQLite for tasks / wakeups / mailbox
+- `~/.lyre/memory/` — markdown filesystem the agents write to
 - `~/.lyre/memory/facts/agent-owner-notes.md` + `agent-leader-notes.md`
-  — pre-created notebook files for the two bootstrap agents
+  — per-agent notebook files
 - Two seeded agents: `owner` (you, addressable but not LLM-driven) and
   `leader` (the dispatcher persona)
 
-You only need to run this once per machine.
+Re-running `lyre onboard` is safe — each overwrite is gated by a
+confirmation prompt. For scripted / headless setup, hand-edit
+`~/.lyre/config.toml` + `~/.lyre/.env` yourself and skip the wizard.
 
-## 4. Start the runtime
+## 3. Start the runtime
 
 ```bash
 uv run lyre serve
@@ -63,7 +58,7 @@ This boots three things in one process:
 
 Leave this running in a terminal. Press `Ctrl+C` to stop.
 
-## 5. Talk to your team
+## 4. Talk to your team
 
 In another terminal:
 
@@ -85,7 +80,7 @@ uv run lyre mailbox owner --unread-only
 
 You should see `leader`'s reply.
 
-## 6. See it in the dashboard
+## 5. See it in the dashboard
 
 Open <http://127.0.0.1:8765> in a browser. You'll see:
 

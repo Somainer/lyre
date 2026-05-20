@@ -16,7 +16,6 @@ from .models import (
     MailboxMessage,
     OutboxRow,
     Persona,
-    PersonaProfile,
     ScheduledMail,
     Skill,
     Task,
@@ -84,8 +83,6 @@ class PersonaRepository(Protocol):
         status: str,
         comment: str | None = None,
     ) -> None: ...
-    async def get_profile(self, persona_name: str) -> PersonaProfile | None: ...
-    async def upsert_profile(self, persona_name: str, profile: dict[str, Any]) -> None: ...
 
 
 class TaskRepository(Protocol):
@@ -389,13 +386,6 @@ class LocalHotRepository(Protocol):
     async def clear_task(self, task_id: str) -> None: ...
 
 
-class GlobalFactsRepository(Protocol):
-    async def insert(self, fact_kind: str, scope: str | None, body: str, **kwargs: Any) -> str: ...
-    async def search_by_kind(
-        self, kind: str, scope: str | None = None, limit: int = 10
-    ) -> list[dict[str, Any]]: ...
-
-
 class Repositories(Protocol):
     """Aggregate facade — what business code receives."""
 
@@ -409,4 +399,3 @@ class Repositories(Protocol):
     skills: SkillRepository
     artifacts: ArtifactRepository
     local_hot: LocalHotRepository
-    global_facts: GlobalFactsRepository
