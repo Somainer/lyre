@@ -168,6 +168,10 @@ async def agent_detail(
             "in_flight_count": in_flight.get(agent_id, 0),
             "in_flight_by_child": in_flight,
             "children": children_views,
+            # Per-agent SSE: scope the activity stream to this agent so
+            # the broadcaster pushes only events involving them.
+            "sse_agent_id": agent_id,
+            "sse_minutes": minutes,
         },
     )
 

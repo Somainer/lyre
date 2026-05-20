@@ -36,6 +36,10 @@ async def activity_page(
             "active_wakeups": active,
             "window_minutes": minutes,
             "compose_recipients": recipients,
+            # SSE stream URL params — global view, but honor the picked
+            # time window so the broadcaster renders the same fragment
+            # the page initially showed.
+            "sse_minutes": minutes,
         },
     )
 

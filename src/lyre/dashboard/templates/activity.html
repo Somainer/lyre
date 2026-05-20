@@ -13,17 +13,13 @@
       </div>
       <span style="font-size:var(--t-meta);color:var(--fg-4);margin-left:var(--s-3);">·</span>
       <div class="row" style="gap:var(--s-2);color:var(--fg-3);font-size:var(--t-meta);">
-        {{ live_dot() }}<span>live · polling every 2s</span>
+        {{ live_dot() }}<span>live · SSE push</span>
       </div>
     </div>
   </div>
 
-  <div class="activity-stream" id="activity-stream"
-       hx-get="/partials/activity?minutes={{ window_minutes }}"
-       hx-trigger="load, every 2s"
-       hx-target="#activity-stream-inner"
-       hx-swap="innerHTML">
-    <div class="activity-inner" id="activity-stream-inner">
+  <div class="activity-stream" id="activity-stream">
+    <div class="activity-inner" id="activity-stream-inner" sse-swap="activity">
       {% include "partials/activity_body.html" %}
     </div>
   </div>

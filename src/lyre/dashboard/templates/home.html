@@ -16,10 +16,7 @@
     </div>
   </div>
 
-  <div class="stats"
-       hx-get="/partials/home/cards"
-       hx-trigger="every 5s"
-       hx-swap="innerHTML">
+  <div class="stats" sse-swap="stats">
     {% include "partials/home_cards.html" %}
   </div>
 
