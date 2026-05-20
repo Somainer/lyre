@@ -1,0 +1,12 @@
+{% if active_wakeups %}
+  <span class="dot live"></span>
+  <small>
+    {{ active_wakeups|length }} agent{{ "s" if active_wakeups|length > 1 else "" }} working:
+    {% for w in active_wakeups %}
+      <a href="/tasks/{{ w.task_id }}"><b>{{ w.persona_name }}</b></a>{% if not loop.last %}, {% endif %}
+    {% endfor %}
+  </small>
+{% else %}
+  <span class="dot idle"></span>
+  <small>idle</small>
+{% endif %}

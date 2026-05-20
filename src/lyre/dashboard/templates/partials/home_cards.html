@@ -1,0 +1,16 @@
+<div class="card">
+  <div class="num">{{ in_progress }}</div>
+  <div class="label">in-progress</div>
+</div>
+<div class="card">
+  <div class="num">{{ completed_24h }}</div>
+  <div class="label">completed 24h</div>
+</div>
+<div class="card {{ 'alert' if blockers_unread else '' }}">
+  <div class="num">{{ blockers_unread }}</div>
+  <div class="label">blockers unread</div>
+</div>
+<div class="card">
+  <div class="num">{{ tokens_in_24h }} / {{ tokens_out_24h }}</div>
+  <div class="label">tokens in/out 24h</div>
+</div>

@@ -1,0 +1,174 @@
+{% if active_wakeups %}
+  <div class="active-strip">
+    <span class="dot live"></span>
+    <strong>{{ active_wakeups|length }} agent{{ "s" if active_wakeups|length > 1 else "" }} working now:</strong>
+    {% for w in active_wakeups %}
+      <a href="/tasks/{{ w.task_id }}" class="badge">
+        {{ w.persona_name }} · wakeup {{ w.id[:8] }}
+      </a>
+    {% endfor %}
+  </div>
+{% else %}
+  <div class="active-strip idle">
+    <span class="dot idle"></span> <em>no agents currently active</em>
+  </div>
+{% endif %}
+
+{% if events %}
+  <div class="feed">
+    {% for e in events %}
+
+      {% if e.kind == "mailbox" %}
+        {# Chat-bubble: ✉ sender → recipient, urgency-colored, body folds open #}
+        <div class="feed-row mail sev-{{ e.severity }} u-{{ e.detail.urgency }}">
+          <div class="feed-meta">
+            <time>{{ e.at[:19] }}</time>
+            <span class="badge mail-tag">✉ {{ e.detail.urgency }}</span>
+          </div>
+          <div class="feed-body">
+            <div class="mail-route">
+              <strong class="from">{{ e.detail.sender }}</strong>
+              <span class="arrow">→</span>
+              <strong class="to">{{ e.detail.recipient }}</strong>
+            </div>
+            <div class="mail-title">{{ e.detail.title or e.detail.body[:80] }}</div>
+            {% if e.detail.body %}
+              <details class="mail-body" data-fold-id="mail-{{ e.detail.msg_id }}">
+                <summary>show body ({{ e.detail.body|length }} chars)</summary>
+                <div class="md-body">{{ e.detail.body | markdown }}</div>
+              </details>
+            {% endif %}
+            {% if e.detail.task_id %}
+              <a class="task-link" href="/tasks/{{ e.detail.task_id }}">task:{{ e.detail.task_id[:8] }}</a>
+            {% endif %}
+          </div>
+        </div>
+
+      {% elif e.kind == "thinking" or e.kind == "assistant_text" %}
+        {# 'thinking' = model's private reasoning (DeepSeek-V4 reasoning,
+           Anthropic extended thinking). 'assistant_text' = plain text
+           the model wrote out-loud (still NOT delivered, but in a
+           different content channel). Same visual shape; thinking gets
+           a brain badge + slightly different styling. #}
+        <div class="feed-row thought sev-{{ e.severity }} {% if e.kind == 'thinking' %}is-thinking{% endif %}">
+          <div class="feed-meta">
+            <time>{{ e.at[:19] }}</time>
+            <span class="badge thought-tag">
+              {%- if e.kind == "thinking" %}🧠 thinking{% else %}💭 thought{% endif -%}
+            </span>
+          </div>
+          <div class="feed-body">
+            <div class="thought-who">{{ e.detail.persona }}</div>
+            {% if e.detail.text|length <= 400 %}
+              <pre class="thought-inline">{{ e.detail.text }}</pre>
+            {% else %}
+              <pre class="thought-inline">{{ e.detail.text[:400] }}…</pre>
+              <details class="thought-rest"
+                       data-fold-id="{{ e.kind }}-{{ e.detail.wakeup_id }}-{{ e.at }}">
+                <summary>show full ({{ e.detail.text|length }} chars)</summary>
+                <pre>{{ e.detail.text }}</pre>
+              </details>
+            {% endif %}
+            <a class="task-link" href="/tasks/{{ e.detail.task_id }}">task:{{ e.detail.task_id[:8] }}</a>
+          </div>
+        </div>
+
+      {% elif e.kind == "tool_use" %}
+        {# Tool call — monospace, show full args on expand. #}
+        <div class="feed-row tool sev-{{ e.severity }}">
+          <div class="feed-meta">
+            <time>{{ e.at[:19] }}</time>
+            <span class="badge tool-tag">
+              {%- if e.detail.tool == "shell_exec" %}⌨ shell
+              {%- elif e.detail.tool == "python_exec" %}🐍 python
+              {%- elif e.detail.tool == "mailbox_send" %}✉ send
+              {%- elif e.detail.tool == "mailbox_read" %}📥 read
+              {%- elif e.detail.tool == "mailbox_get_message" %}📖 get
+              {%- elif e.detail.tool == "dispatch_task" %}🚀 dispatch
+              {%- elif e.detail.tool == "await_subagents" %}⏸ await
+              {%- elif e.detail.tool == "report_progress" %}📋 progress
+              {%- elif e.detail.tool == "report_side_effect" %}🚨 effect
+              {%- elif e.detail.tool == "read_memory" %}📚 memory
+              {%- else %}🛠 {{ e.detail.tool }}
+              {%- endif %}
+            </span>
+          </div>
+          <div class="feed-body">
+            <code class="tool-call">{{ e.detail.persona }} → <strong>{{ e.detail.tool }}</strong>({{ e.detail.tool_input_preview }})</code>
+            {% if e.detail.tool_input_full and e.detail.tool_input_full != "{}" %}
+              <details class="tool-args"
+                       data-fold-id="tool-{{ e.detail.wakeup_id }}-{{ e.at }}-{{ e.detail.tool }}">
+                <summary>full args</summary>
+                <pre>{{ e.detail.tool_input_full }}</pre>
+              </details>
+            {% endif %}
+          </div>
+        </div>
+
+      {% elif e.kind == "wakeup_end" %}
+        <div class="feed-row wakeup sev-{{ e.severity }}">
+          <div class="feed-meta">
+            <time>{{ e.at[:19] }}</time>
+            <span class="badge wakeup-tag">
+              {%- if e.detail.end_status == "silent_close" %}⚠ silent-close
+              {%- elif e.detail.end_status == "failed" %}❌ failed
+              {%- elif e.detail.end_status == "completed" %}✅ done
+              {%- else %}🌀 {{ e.detail.end_status }}
+              {%- endif %}
+            </span>
+            {% if e.detail.context_peak_pct is not none %}
+              {% set pct = e.detail.context_peak_pct %}
+              <span class="badge ctx-tag {% if pct >= 80 %}ctx-hot{% elif pct >= 60 %}ctx-warm{% else %}ctx-cool{% endif %}">
+                ctx {{ "%.0f"|format(pct) }}%
+              </span>
+            {% endif %}
+            {% if e.detail.compaction_count and e.detail.compaction_count > 0 %}
+              <span class="badge compact-tag">compact ×{{ e.detail.compaction_count }}</span>
+            {% endif %}
+          </div>
+          <div class="feed-body">
+            <span class="headline">{{ e.headline }}</span>
+            <a class="task-link" href="/tasks/{{ e.detail.task_id }}">task:{{ e.detail.task_id[:8] }}</a>
+          </div>
+        </div>
+
+      {% elif e.kind == "task" %}
+        <div class="feed-row task sev-{{ e.severity }}">
+          <div class="feed-meta">
+            <time>{{ e.at[:19] }}</time>
+            <span class="badge task-tag">📌 task</span>
+          </div>
+          <div class="feed-body">
+            <span class="headline">{{ e.headline }}</span>
+            <a class="task-link" href="/tasks/{{ e.detail.task_id }}">task:{{ e.detail.task_id[:8] }}</a>
+          </div>
+        </div>
+
+      {% elif e.kind == "note" %}
+        <div class="feed-row note sev-{{ e.severity }}">
+          <div class="feed-meta">
+            <time>{{ e.at[:19] }}</time>
+            <span class="badge note-tag">📝 note</span>
+          </div>
+          <div class="feed-body">
+            <span class="headline">{{ e.headline }}</span>
+            {% if e.detail.text %}
+              <details class="note-detail"
+                       data-fold-id="note-{{ e.detail.wakeup_id }}-{{ e.at }}">
+                <summary>detail</summary>
+                <pre>{{ e.detail.text }}</pre>
+              </details>
+            {% endif %}
+            {% if e.detail.task_id %}
+              <a class="task-link" href="/tasks/{{ e.detail.task_id }}">task:{{ e.detail.task_id[:8] }}</a>
+            {% endif %}
+          </div>
+        </div>
+
+      {% endif %}
+
+    {% endfor %}
+  </div>
+{% else %}
+  <p class="empty">无事发生 — last {{ window_minutes }} min 内无任何 mail / task / 思考 / 工具调用</p>
+{% endif %}

@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block content %}
+<p><a href="/tasks">← back</a></p>
+<h2>Task <code>{{ task.id }}</code></h2>
+<dl class="kv">
+  <dt>persona</dt><dd>{{ task.persona_name }}</dd>
+  <dt>status</dt><dd><span class="status status-{{ task.status }}">{{ task.status }}</span></dd>
+  <dt>goal</dt><dd>{{ task.goal }}</dd>
+  <dt>acceptance</dt><dd>{{ task.acceptance }}</dd>
+  {% if task.parent_task_id %}
+    <dt>parent</dt>
+    <dd><a href="/tasks/{{ task.parent_task_id }}"><code>{{ task.parent_task_id }}</code></a></dd>
+  {% endif %}
+  {% if task.lease_holder %}
+    <dt>lease holder</dt><dd><code>{{ task.lease_holder }}</code></dd>
+  {% endif %}
+  {% if task.checkpoint %}
+    <dt>checkpoint</dt><dd><pre>{{ task.checkpoint }}</pre></dd>
+  {% endif %}
+</dl>
+
+<h3>Children ({{ children|length }})</h3>
+{% if children %}
+  <table class="taskgrid">
+    <thead><tr><th>id</th><th>persona</th><th>status</th><th>goal</th></tr></thead>
+    <tbody>
+      {% for c in children %}
+        <tr>
+          <td><a href="/tasks/{{ c.id }}"><code>{{ c.id[:8] }}</code></a></td>
+          <td>{{ c.persona_name }}</td>
+          <td><span class="status status-{{ c.status }}">{{ c.status }}</span></td>
+          <td>{{ c.goal[:80] }}</td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% else %}
+  <p class="empty">no subagent children</p>
+{% endif %}
+{% endblock %}

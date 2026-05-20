@@ -1,0 +1,412 @@
+"""Repository Protocols (DAO abstraction layer).
+
+These Protocols describe the surface used by Lyre business code. SQLite implementations
+live in sqlite_impl.py; future Postgres implementation would live in postgres_impl.py.
+
+See PERSISTENCE_SCHEMA.md §4 for design rationale.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Protocol
+
+from .models import (
+    Agent,
+    Artifact,
+    MailboxMessage,
+    OutboxRow,
+    Persona,
+    PersonaProfile,
+    ScheduledMail,
+    Skill,
+    Task,
+    TaskSpec,
+    Wakeup,
+)
+
+
+class AgentRepository(Protocol):
+    """Agent = running instance of a persona.
+
+    See models.Agent docstring for the persona/agent distinction.
+    """
+
+    async def create(
+        self,
+        agent_id: str,
+        persona_name: str,
+        created_by: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Insert a new agent. Errors if id already exists."""
+        ...
+
+    async def get(self, agent_id: str) -> Agent | None: ...
+
+    async def list_all(
+        self, include_archived: bool = False
+    ) -> list[Agent]: ...
+
+    async def list_by_persona(
+        self, persona_name: str, include_archived: bool = False
+    ) -> list[Agent]:
+        """Used by auto-naming (`<persona>-<n>`) and persona-broadcast."""
+        ...
+
+    async def archive(self, agent_id: str) -> bool:
+        """Soft delete. Returns True if the agent was active and got archived."""
+        ...
+
+    async def exists(self, agent_id: str) -> bool: ...
+
+    async def update_metadata(
+        self, agent_id: str, metadata: dict[str, Any]
+    ) -> None: ...
+
+
+class PersonaRepository(Protocol):
+    async def get(self, name: str) -> Persona | None: ...
+    async def list_active(self, status: str = "approved") -> list[Persona]: ...
+    async def upsert(self, persona: Persona) -> None: ...
+    async def propose(
+        self,
+        name: str,
+        role_description: str,
+        system_prompt: str,
+        allowed_lyre_tools: list[str],
+        source_task_id: str,
+        **kwargs: Any,
+    ) -> None: ...
+    async def approve(
+        self,
+        persona_name: str,
+        reviewer: str,
+        status: str,
+        comment: str | None = None,
+    ) -> None: ...
+    async def get_profile(self, persona_name: str) -> PersonaProfile | None: ...
+    async def upsert_profile(self, persona_name: str, profile: dict[str, Any]) -> None: ...
+
+
+class TaskRepository(Protocol):
+    async def create(self, spec: TaskSpec) -> str: ...
+    async def get(self, task_id: str) -> Task | None: ...
+    async def claim_lease(
+        self, task_id: str, holder_wakeup_id: str, duration_sec: int
+    ) -> bool: ...
+    async def renew_lease(
+        self, task_id: str, holder_wakeup_id: str, duration_sec: int
+    ) -> bool: ...
+    async def release_lease(self, task_id: str, holder_wakeup_id: str) -> None: ...
+    async def update_checkpoint(
+        self, task_id: str, checkpoint: dict[str, Any], holder_wakeup_id: str
+    ) -> None: ...
+    async def update_status(self, task_id: str, status: str) -> None: ...
+    async def find_pending(self, limit: int = 10) -> list[Task]: ...
+    async def find_expired_leases(self, limit: int = 10) -> list[Task]: ...
+    async def find_parents_ready_to_wake(self, limit: int = 10) -> list[Task]: ...
+    async def find_children(self, parent_task_id: str) -> list[Task]: ...
+    async def wake_parent(self, task_id: str) -> bool: ...
+
+    # Dashboard helpers (Sprint D1)
+    async def find_recent(
+        self, limit: int = 50, status_filter: str | None = None
+    ) -> list[Task]: ...
+    async def search(
+        self,
+        persona_name: str | None = None,
+        status: str | None = None,
+        limit: int = 20,
+    ) -> list[Task]:
+        """Filter tasks by persona and/or status, newest first.
+
+        Distinct from find_recent which only takes status. Used by the
+        list_tasks introspection tool so leader can see who's busy.
+        """
+        ...
+    async def count_in_progress(self) -> int: ...
+    async def count_completed_since(self, since_iso: str) -> int: ...
+    async def find_recently_changed(
+        self, since_iso: str, limit: int = 100
+    ) -> list[Task]:
+        """Tasks whose updated_at ≥ since_iso. Used to surface status
+        transitions in the audit timeline."""
+        ...
+
+    async def find_active_for_persona(self, persona_name: str) -> list[Task]:
+        """Tasks owned by this persona that are NOT in terminal state
+        (i.e. pending / in_progress / needs_input). Used by the auto-wake-
+        on-mail scheduler phase to avoid double-dispatching when the
+        persona is already busy."""
+        ...
+
+
+class WakeupRepository(Protocol):
+    async def start(self, task_id: str, persona_name: str) -> str: ...
+    async def end(
+        self,
+        wakeup_id: str,
+        end_status: str,
+        metering: dict[str, Any] | None = None,
+        failure_report: dict[str, Any] | None = None,
+    ) -> None: ...
+    async def set_transcript_uri(self, wakeup_id: str, uri: str) -> None: ...
+
+    # Dashboard helpers (Sprint D1)
+    async def list_recent(self, limit: int = 50) -> list[Wakeup]: ...
+    async def sum_tokens_since(self, since_iso: str) -> tuple[int, int]:
+        """Return (input_tokens, output_tokens) summed across wakeups with
+        started_at >= since_iso."""
+        ...
+
+    async def list_since(self, since_iso: str, limit: int = 100) -> list[Wakeup]:
+        """Wakeups whose started_at OR ended_at ≥ since_iso. Used to surface
+        agent wake/end events in the audit timeline."""
+        ...
+
+    async def list_active(self) -> list[Wakeup]:
+        """Wakeups still in flight (ended_at IS NULL)."""
+        ...
+
+
+class MailboxRepository(Protocol):
+    async def ensure_mailbox(self, recipient: str) -> None: ...
+
+    # --- Read flow (per-message read state) ------------------------------
+    async def read_unread(
+        self,
+        recipient: str,
+        *,
+        min_urgency: str | None = None,
+        limit: int = 50,
+    ) -> list[MailboxMessage]:
+        """Mail with `read_at IS NULL`, ordered by urgency
+        (blocker → high → normal → low) then id ascending. Used by the
+        `mailbox_read` tool to give the agent its current inbox."""
+        ...
+
+    async def read_all_by_recipient(
+        self,
+        recipient: str,
+        *,
+        limit: int = 50,
+    ) -> list[MailboxMessage]:
+        """Both read and unread, id ascending. Used by
+        `mailbox_read(include_read=True)` for archive browsing — does
+        NOT mark anything (read state is set by `mark_messages_read`)."""
+        ...
+
+    async def mark_messages_read(
+        self, recipient: str, msg_ids: list[int]
+    ) -> None:
+        """Set `read_at = now()` on every (recipient, id) in the list.
+        Idempotent — re-marking an already-read row is a no-op (we don't
+        overwrite the original read time). Called by the `mailbox_read`
+        tool after the rows are returned and by the explicit `mark_read`
+        tool."""
+        ...
+
+    async def count_unread(
+        self, recipient: str, *, min_urgency: str | None = None
+    ) -> int: ...
+
+    async def get_max_msg_id(self, recipient: str) -> int:
+        """Highest mailbox_messages.id for this recipient (0 if empty).
+        Used by MailWatcher as its 'before wakeup started' baseline so
+        it only fires on mail that arrives AFTER the agent started."""
+        ...
+
+    async def list_sent_by(
+        self,
+        sender: str,
+        *,
+        recipient: str | None = None,
+        limit: int = 50,
+    ) -> list[MailboxMessage]:
+        """Mail this agent sent, newest-first. Optional `recipient` filter
+        for "mail I sent to X". Powers `mailbox_read(box="sent")` so an
+        agent can self-recall its commitments across wakeups (Lyre is
+        stateless across wakeups; agents that promised "I'll look at X"
+        rely on this to remember what they said)."""
+        ...
+
+    # --- Internal listing helpers (system-side, not agent-facing) --------
+    async def read_messages(
+        self, recipient: str, since_id: int = 0, limit: int = 100
+    ) -> list[MailboxMessage]:
+        """ID-ascending range read. Used by tests and system helpers
+        that don't care about read state. Does NOT mark anything."""
+        ...
+
+    async def read_blockers(
+        self, recipient: str, since_id: int = 0
+    ) -> list[MailboxMessage]:
+        """Urgency='blocker' messages with id > since_id, ID-ascending.
+        Used by MailWatcher for blocker mid-stream interrupts. Does NOT
+        mark anything; the agent decides via mailbox_read."""
+        ...
+
+    async def insert_message(self, msg: MailboxMessage) -> int:
+        """Insert a delivered message (used by dispatcher; idempotent on external_id)."""
+        ...
+
+    async def get_message(self, msg_id: int) -> MailboxMessage | None:
+        """Fetch ANY mailbox message by primary id, regardless of recipient.
+        Used by `mailbox_get_message` for thread/reply/forward context."""
+        ...
+
+    async def get_last_auto_triggered_id(self, recipient: str) -> int:
+        """Scheduler-side cursor: highest msg_id we've already auto-dispatched
+        a 'check inbox' task for. Independent of per-message read_at
+        so the auto-wake loop doesn't pile on if the agent forgets to mark."""
+        ...
+
+    async def set_last_auto_triggered_id(
+        self, recipient: str, msg_id: int
+    ) -> None:
+        """Advance the auto-trigger cursor. Monotonic — never moves backward."""
+        ...
+
+    # Dashboard helpers (Sprint D1)
+    async def read_messages_paged(
+        self,
+        recipient: str,
+        before_id: int | None = None,
+        limit: int = 50,
+        min_urgency: str | None = None,
+    ) -> list[MailboxMessage]:
+        """Time-desc paging. `before_id=None` → latest. `min_urgency`
+        restricts to that urgency and "higher" (blocker > high > normal > low)."""
+        ...
+
+    async def count_unread_blockers(self, recipient: str) -> int: ...
+
+    async def read_recent_for_audit(
+        self, since_iso: str, limit: int = 200
+    ) -> list[MailboxMessage]:
+        """All mailbox messages (any recipient) delivered ≥ since_iso. Used by
+        the audit timeline to show inter-agent communication, not just
+        owner-facing inbox."""
+        ...
+
+
+class OutboxRepository(Protocol):
+    async def enqueue(self, rows: list[OutboxRow]) -> None: ...
+    async def dequeue_batch(self, limit: int = 100) -> list[OutboxRow]: ...
+    async def mark_dispatched(self, row_id: int) -> None: ...
+    async def mark_failed(self, row_id: int, error: str) -> None: ...
+
+
+class ScheduledMailRepository(Protocol):
+    """Future mail. See models.ScheduledMail."""
+
+    async def create(self, spec: ScheduledMail) -> int:
+        """Insert a new scheduled-mail row; return its id."""
+        ...
+
+    async def get(self, mail_id: int) -> ScheduledMail | None: ...
+
+    async def find_ready(
+        self, now_iso: str, limit: int = 50
+    ) -> list[ScheduledMail]:
+        """All pending rows with scheduled_for <= now_iso."""
+        ...
+
+    async def list_filtered(
+        self,
+        recipient: str | None = None,
+        sender: str | None = None,
+        status: str | None = "pending",
+        limit: int = 50,
+    ) -> list[ScheduledMail]: ...
+
+    async def mark_delivered(
+        self,
+        mail_id: int,
+        delivered_msg_id: int,
+        next_scheduled_for: str | None,
+        completed: bool,
+    ) -> None:
+        """One-shot: completed=True, next_scheduled_for=None.
+        Recurring with more occurrences: completed=False, next_scheduled_for=iso.
+        Recurring past recur_until: completed=True, next_scheduled_for=None.
+        """
+        ...
+
+    async def mark_cancelled(
+        self,
+        mail_id: int,
+        cancelled_by: str | None = None,
+        reason: str | None = None,
+    ) -> bool:
+        """Returns True if the row was pending and got cancelled."""
+        ...
+
+    async def mark_bounced(
+        self, mail_id: int, reason: str
+    ) -> None: ...
+
+
+class SkillRepository(Protocol):
+    async def get_by_name(self, name: str) -> Skill | None: ...
+    async def list_active(
+        self, scope: str | None = None, status: str = "approved"
+    ) -> list[Skill]: ...
+    async def propose(
+        self,
+        name: str,
+        frontmatter: dict[str, Any],
+        body: str,
+        source_task_id: str,
+        scope: str | None = None,
+    ) -> str: ...
+    async def approve(
+        self,
+        skill_id: str,
+        reviewer: str,
+        status: str,
+        comment: str | None = None,
+    ) -> None: ...
+
+
+class ArtifactRepository(Protocol):
+    async def insert(
+        self,
+        task_id: str,
+        wakeup_id: str,
+        kind: str,
+        content_hash: str,
+        blob_uri: str,
+        size_bytes: int | None = None,
+    ) -> str: ...
+    async def get_by_hash(self, content_hash: str) -> Artifact | None: ...
+    async def find_by_task(self, task_id: str) -> list[Artifact]: ...
+
+
+class LocalHotRepository(Protocol):
+    async def put(self, task_id: str, key: str, value: Any) -> None: ...
+    async def get(self, task_id: str, key: str) -> Any | None: ...
+    async def clear_task(self, task_id: str) -> None: ...
+
+
+class GlobalFactsRepository(Protocol):
+    async def insert(self, fact_kind: str, scope: str | None, body: str, **kwargs: Any) -> str: ...
+    async def search_by_kind(
+        self, kind: str, scope: str | None = None, limit: int = 10
+    ) -> list[dict[str, Any]]: ...
+
+
+class Repositories(Protocol):
+    """Aggregate facade — what business code receives."""
+
+    personas: PersonaRepository
+    agents: AgentRepository
+    tasks: TaskRepository
+    wakeups: WakeupRepository
+    mailbox: MailboxRepository
+    scheduled_mail: ScheduledMailRepository
+    outbox: OutboxRepository
+    skills: SkillRepository
+    artifacts: ArtifactRepository
+    local_hot: LocalHotRepository
+    global_facts: GlobalFactsRepository

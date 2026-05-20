@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="cards"
+         hx-get="/partials/home/cards"
+         hx-trigger="every 5s"
+         hx-swap="innerHTML">
+  {% include "partials/home_cards.html" %}
+</section>
+
+<section>
+  <h2>最近 5 条 blocker</h2>
+  {% if recent_blockers %}
+    <ul class="mailbox-list">
+      {% for m in recent_blockers %}
+        {% include "partials/mailbox_item.html" %}
+      {% endfor %}
+    </ul>
+  {% else %}
+    <p class="empty">没有 blocker 消息</p>
+  {% endif %}
+</section>
+
+<section>
+  <h2>Live mailbox</h2>
+  <ul id="live-feed" class="mailbox-list"></ul>
+  <script>
+    const es = new EventSource('/sse/mailbox?recipient=owner');
+    es.addEventListener('mailbox', (e) => {
+      const msg = JSON.parse(e.data);
+      const li = document.createElement('li');
+      li.className = 'msg msg-' + msg.urgency;
+      const safe = (s) => (s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;');
+      const display = msg.title || msg.body || '(empty)';
+      li.innerHTML =
+        '<span class="urgency">' + msg.urgency + '</span> ' +
+        '<span class="sender">' + safe(msg.sender) + ' →</span> ' +
+        '<span class="title">' + safe(display) + '</span>';
+      document.getElementById('live-feed').prepend(li);
+    });
+  </script>
+</section>
+{% endblock %}

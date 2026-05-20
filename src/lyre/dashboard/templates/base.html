@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Lyre — {{ tab|default("Dashboard") }}</title>
+  <link rel="stylesheet" href="{{ url_for('static', path='main.css') }}">
+  <script src="https://unpkg.com/htmx.org@1.9.10" defer></script>
+</head>
+<body>
+  <header>
+    <nav>
+      <a class="brand" href="/">⌁ Lyre</a>
+      <a href="/" class="{{ 'active' if tab=='home' else '' }}">Home</a>
+      <a href="/activity" class="{{ 'active' if tab=='activity' else '' }}">Activity</a>
+      <a href="/agents" class="{{ 'active' if tab=='agents' else '' }}">Agents</a>
+      <a href="/inbox" class="{{ 'active' if tab=='inbox' else '' }}">Inbox</a>
+      <a href="/feed" class="{{ 'active' if tab=='feed' else '' }}">Feed</a>
+      <a href="/tasks" class="{{ 'active' if tab=='tasks' else '' }}">Tasks</a>
+      <a href="/wakeups" class="{{ 'active' if tab=='wakeups' else '' }}">Wakeups</a>
+      <a href="/send" class="{{ 'active' if tab=='send' else '' }}">Send</a>
+      <span class="agent-status"
+            hx-get="/partials/agent-status"
+            hx-trigger="load, every 3s"
+            hx-swap="innerHTML">
+        <span class="dot dim"></span> <small>checking…</small>
+      </span>
+    </nav>
+  </header>
+  <main>
+    {% block content %}{% endblock %}
+  </main>
+  <footer>
+    <span>Lyre Dashboard v0.1 · {{ tab }}</span>
+  </footer>
+</body>
+</html>

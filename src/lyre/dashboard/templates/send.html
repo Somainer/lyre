@@ -1,0 +1,81 @@
+{% extends "base.html" %}
+{% block content %}
+<h2>Send a mailbox message</h2>
+
+{% if success %}
+  <div class="banner banner-ok">
+    <h3>✓ Sent</h3>
+    <p>{{ success }}</p>
+    <p class="banner-actions">
+      <a href="/activity">→ watch what happens in Activity</a>
+      &nbsp;·&nbsp;
+      <a href="/feed">→ view in Feed</a>
+      &nbsp;·&nbsp;
+      <a href="/send?to={{ preset_to }}">send another</a>
+    </p>
+  </div>
+{% endif %}
+{% if error %}
+  <div class="banner banner-err">
+    <h3>✕ Failed</h3>
+    <p>{{ error }}</p>
+  </div>
+{% endif %}
+
+{% if reply_ctx %}
+  <div class="banner banner-info">
+    <h3>↩ Replying to mailbox #{{ reply_ctx.id }}</h3>
+    <p>
+      <span class="urgency">{{ reply_ctx.urgency }}</span>
+      <strong>{{ reply_ctx.sender }} → {{ reply_ctx.recipient }}</strong>
+    </p>
+    <pre class="reply-preview">{{ reply_ctx.preview }}</pre>
+  </div>
+{% endif %}
+
+<form method="post" action="/send" class="send-form">
+  {% if reply_to %}
+    <input type="hidden" name="reply_to" value="{{ reply_to }}">
+  {% endif %}
+  <label>
+    <span>to (agent id)</span>
+    <input name="recipient" value="{{ preset_to }}" required>
+  </label>
+  <label>
+    <span>from (sender)</span>
+    <input name="sender" value="owner">
+  </label>
+  <label>
+    <span>urgency</span>
+    <select name="urgency">
+      <option value="blocker">blocker</option>
+      <option value="high">high</option>
+      <option value="normal" selected>normal</option>
+      <option value="low">low</option>
+    </select>
+  </label>
+  <label>
+    <span>title (subject line, ≤140)</span>
+    <input
+      name="title" maxlength="140"
+      placeholder="(optional — derived from first line of body if blank)"
+    >
+  </label>
+  <label>
+    <span>body</span>
+    <textarea name="body" rows="5" required autofocus></textarea>
+  </label>
+  <button type="submit">send</button>
+</form>
+
+<p class="hint">
+  Equivalent to the CLI:
+  <code>uv run lyre send &lt;to&gt; "&lt;body&gt;" --urgency &lt;u&gt; --from &lt;sender&gt;</code>
+</p>
+
+<p class="hint">
+  <strong>Right after sending</strong>, watch <a href="/activity">/activity</a> —
+  scheduler usually picks up the resulting task within 1s and you'll see the
+  agent's wakeup + tool calls in real time.
+</p>
+{% endblock %}

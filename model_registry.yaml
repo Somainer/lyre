@@ -1,0 +1,138 @@
+# Lyre Model Registry — ground truth for provider/model entries.
+#
+# Each entry describes one (provider, model) pairing Lyre can route to. The
+# Router picks among entries by Persona.model_preference (tier + requires +
+# optional prefer).
+#
+# Schema:
+#   id              unique. Convention: "<provider_namespace>.<model_id>".
+#   provider        which Adapter class to use (anthropic / openai / ...).
+#                   MVP only ships 'anthropic'; DeepSeek's anthropic-compat
+#                   endpoint also uses 'anthropic'.
+#   endpoint:
+#     base_url      null → adapter's default. Used to repoint at proxy / compat.
+#     auth_env      env var holding the API key for this endpoint.
+#   capabilities    free-form list of strings. Persona's `requires` is matched
+#                   as a subset of this list. No predefined vocabulary —
+#                   future-proof for LLM-driven self-selection.
+#   tier            flagship | workhorse | cheap
+#   cost_per_mtok   for telemetry / future budget routing (Q7). Not used in
+#                   MVP routing decisions.
+#   context_window  in tokens.
+#   status          enabled | disabled — disabled entries are filtered out.
+
+models:
+
+  # -------- Anthropic (real endpoint) --------
+  - id: anthropic.claude-opus-4-7
+    provider: anthropic
+    endpoint:
+      base_url: null
+      auth_env: ANTHROPIC_API_KEY
+    capabilities: [tool_use, streaming, long_context_1M, reasoning]
+    tier: flagship
+    cost_per_mtok: { input: 15.00, output: 75.00 }
+    context_window: 1000000
+    status: enabled
+
+  - id: anthropic.claude-sonnet-4-6
+    provider: anthropic
+    endpoint:
+      base_url: null
+      auth_env: ANTHROPIC_API_KEY
+    capabilities: [tool_use, streaming, long_context_1M]
+    tier: workhorse
+    cost_per_mtok: { input: 3.00, output: 15.00 }
+    context_window: 1000000
+    status: enabled
+
+  - id: anthropic.claude-haiku-4-5
+    provider: anthropic
+    endpoint:
+      base_url: null
+      auth_env: ANTHROPIC_API_KEY
+    capabilities: [tool_use, streaming]
+    tier: cheap
+    cost_per_mtok: { input: 1.00, output: 5.00 }
+    context_window: 200000
+    status: enabled
+
+  # -------- DeepSeek (Anthropic-compatible endpoint) --------
+  # https://api-docs.deepseek.com/zh-cn/guides/anthropic_api
+  - id: deepseek.deepseek-v4-pro
+    provider: anthropic
+    endpoint:
+      base_url: https://api.deepseek.com/anthropic
+      auth_env: DEEPSEEK_API_KEY
+    capabilities: [tool_use, streaming]
+    tier: workhorse
+    cost_per_mtok: { input: 0.27, output: 1.10 }
+    context_window: 128000
+    status: enabled
+
+  - id: deepseek.deepseek-v4-flash
+    provider: anthropic
+    endpoint:
+      base_url: https://api.deepseek.com/anthropic
+      auth_env: DEEPSEEK_API_KEY
+    capabilities: [tool_use, streaming]
+    tier: cheap
+    cost_per_mtok: { input: 0.07, output: 0.27 }
+    context_window: 128000
+    status: enabled
+
+  # -------- OpenAI (real endpoint) --------
+  # provider=openai routes through src/lyre/adapter/openai.py
+  # (chat completions API + function calling). Disabled by default —
+  # enable when you have OPENAI_API_KEY set.
+  - id: openai.gpt-5
+    provider: openai
+    endpoint:
+      base_url: null              # SDK default = api.openai.com/v1
+      auth_env: OPENAI_API_KEY
+    capabilities: [tool_use, streaming, reasoning]
+    tier: flagship
+    cost_per_mtok: { input: 5.00, output: 20.00 }
+    context_window: 400000
+    status: disabled
+
+  - id: openai.gpt-5-mini
+    provider: openai
+    endpoint:
+      base_url: null
+      auth_env: OPENAI_API_KEY
+    capabilities: [tool_use, streaming]
+    tier: workhorse
+    cost_per_mtok: { input: 0.25, output: 2.00 }
+    context_window: 400000
+    status: disabled
+
+  # -------- DeepSeek (OpenAI-compatible endpoint) --------
+  # Same models as the anthropic-compat block above, but via DeepSeek's
+  # native OAI-compat surface. Choice between this and the anthropic-
+  # compat entry is a deployment preference; both work with Lyre.
+  # https://api-docs.deepseek.com/quick_start/pricing
+  - id: deepseek-oai.deepseek-chat
+    provider: openai
+    endpoint:
+      base_url: https://api.deepseek.com/v1
+      auth_env: DEEPSEEK_API_KEY
+    capabilities: [tool_use, streaming]
+    tier: workhorse
+    cost_per_mtok: { input: 0.27, output: 1.10 }
+    context_window: 128000
+    status: disabled
+
+  # deepseek-reasoner exposes its CoT via streaming `reasoning_content`
+  # which OpenAIAdapter surfaces as Lyre ThinkingDelta blocks (same
+  # 🧠 dashboard treatment as Anthropic extended thinking).
+  - id: deepseek-oai.deepseek-reasoner
+    provider: openai
+    endpoint:
+      base_url: https://api.deepseek.com/v1
+      auth_env: DEEPSEEK_API_KEY
+    capabilities: [tool_use, streaming, reasoning]
+    tier: workhorse
+    cost_per_mtok: { input: 0.55, output: 2.19 }
+    context_window: 128000
+    status: disabled

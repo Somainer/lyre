@@ -1,0 +1,116 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="agent-header">
+  <h2>
+    <a href="/agents" class="back-link">← Agents</a>
+    /
+    <strong>{{ agent.id }}</strong>
+    <span class="dim">(persona={{ agent.persona_name }})</span>
+  </h2>
+  <div class="agent-meta">
+    <span class="status-tag {{ 'busy' if active_wakeups else 'idle' }}">
+      {{ 'running' if active_wakeups else agent.status }}
+    </span>
+    {% if agent.model_id %}
+      <span class="meta-pill">model: {{ agent.model_id }}</span>
+    {% endif %}
+    {% if agent.description %}
+      <span class="meta-pill">{{ agent.description }}</span>
+    {% endif %}
+    <a href="/send?to={{ agent.id }}" class="meta-pill action">✉ send mail</a>
+  </div>
+  {% if agent.id != "owner" and agent.id != "leader" %}
+    <p class="hint">
+      Bootstrap-pinned agents (<code>owner</code>, <code>leader</code>)
+      cannot be archived. Use <code>lyre agent archive {{ agent.id }}</code>
+      from the CLI if this agent is done.
+    </p>
+  {% endif %}
+</div>
+
+<section class="filter-bar">
+  <span>window:</span>
+  <a href="/agents/{{ agent.id }}?minutes=10">10m</a>
+  <a href="/agents/{{ agent.id }}?minutes=60">60m</a>
+  <a href="/agents/{{ agent.id }}?minutes=360">6h</a>
+  <a href="/agents/{{ agent.id }}?minutes=1440">24h</a>
+  <span class="dim">(current: {{ window_minutes }}m)</span>
+</section>
+
+<div id="timeline-feed"
+  hx-get="/partials/agents/{{ agent.id }}/timeline?minutes={{ window_minutes }}"
+  hx-trigger="every 3s"
+  hx-swap="innerHTML"
+>
+  {% include "partials/activity_body.html" %}
+</div>
+<script>
+  // Chat-style: sticky-bottom scroll + preserve <details> open/closed
+  // state across htmx polls. Without the second behavior, every 3s
+  // refresh slams every section closed — you click "show body", look
+  // for 2 seconds, then htmx swaps in fresh HTML and your details
+  // collapse mid-read.
+  (function () {
+    const STICKY_PX = 120;
+    let stickToBottom = true;
+
+    // Set of data-fold-id values that the user has expanded. Survives
+    // across swaps because we re-apply after each one.
+    const openFolds = new Set();
+
+    function isNearBottom() {
+      return window.innerHeight + window.scrollY
+        >= document.body.offsetHeight - STICKY_PX;
+    }
+    function scrollToBottom() {
+      window.scrollTo({ top: document.body.scrollHeight, behavior: "instant" });
+    }
+    function snapshotOpenFolds(root) {
+      root.querySelectorAll("details[data-fold-id][open]").forEach((d) => {
+        openFolds.add(d.getAttribute("data-fold-id"));
+      });
+      // Also drop any data-fold-id whose <details> is now CLOSED in the
+      // current DOM — user collapsed it intentionally.
+      root.querySelectorAll("details[data-fold-id]:not([open])").forEach((d) => {
+        openFolds.delete(d.getAttribute("data-fold-id"));
+      });
+    }
+    function restoreOpenFolds(root) {
+      root.querySelectorAll("details[data-fold-id]").forEach((d) => {
+        if (openFolds.has(d.getAttribute("data-fold-id"))) {
+          d.open = true;
+        }
+      });
+    }
+
+    // Each click on a summary toggles the parent details — update the
+    // set immediately so the next refresh-cycle doesn't undo us.
+    document.body.addEventListener("toggle", (e) => {
+      const d = e.target;
+      if (d.tagName !== "DETAILS" || !d.hasAttribute("data-fold-id")) return;
+      const id = d.getAttribute("data-fold-id");
+      if (d.open) openFolds.add(id);
+      else openFolds.delete(id);
+    }, true);
+
+    window.addEventListener("scroll", () => {
+      stickToBottom = isNearBottom();
+    });
+    window.addEventListener("load", () => {
+      snapshotOpenFolds(document);
+      scrollToBottom();
+    });
+    document.body.addEventListener("htmx:beforeSwap", (e) => {
+      if (e.detail.target.id === "timeline-feed") {
+        snapshotOpenFolds(e.detail.target);
+      }
+    });
+    document.body.addEventListener("htmx:afterSwap", (e) => {
+      if (e.detail.target.id === "timeline-feed") {
+        restoreOpenFolds(e.detail.target);
+        if (stickToBottom) scrollToBottom();
+      }
+    });
+  })();
+</script>
+{% endblock %}

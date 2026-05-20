@@ -1,0 +1,22 @@
+<li class="msg msg-{{ m.urgency }} {{ 'msg-read' if m.read_at else 'msg-unread' }}">
+  <span class="msg-id">[{{ m.id }}]</span>
+  <span class="urgency">{{ m.urgency }}</span>
+  <span class="sender">{{ m.sender }} → {{ m.recipient }}</span>
+  {% if not m.read_at %}
+    <span class="unread-dot" title="unread">●</span>
+  {% endif %}
+  {% if m.task_id %}
+    <a class="task-link" href="/tasks/{{ m.task_id }}">task:{{ m.task_id[:8] }}</a>
+  {% endif %}
+  {% if m.parent_msg_id %}
+    <span class="reply-marker" title="reply to msg #{{ m.parent_msg_id }}">
+      ↩ #{{ m.parent_msg_id }}
+    </span>
+  {% endif %}
+  <a class="reply-link" href="/send?reply_to={{ m.id }}">↩ Reply</a>
+  <div class="title">{{ m.title or "(no title)" }}</div>
+  <details class="msg-body-fold">
+    <summary>body ({{ (m.body or "")|length }} chars)</summary>
+    <div class="body md-body">{{ m.body | markdown }}</div>
+  </details>
+</li>

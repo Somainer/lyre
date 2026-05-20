@@ -1,0 +1,77 @@
+{% extends "base.html" %}
+{% block content %}
+<h2>Activity <small>(audit timeline · last {{ window_minutes }} min)</small></h2>
+
+<div class="filters">
+  <a href="/activity?minutes=5"   class="{{ 'active' if window_minutes==5  else '' }}">5m</a>
+  <a href="/activity?minutes=15"  class="{{ 'active' if window_minutes==15 else '' }}">15m</a>
+  <a href="/activity?minutes=30"  class="{{ 'active' if window_minutes==30 else '' }}">30m</a>
+  <a href="/activity?minutes=120" class="{{ 'active' if window_minutes==120 else '' }}">2h</a>
+  <a href="/activity?minutes=1440" class="{{ 'active' if window_minutes==1440 else '' }}">24h</a>
+</div>
+
+<div id="activity-body"
+     hx-get="/partials/activity?minutes={{ window_minutes }}"
+     hx-trigger="every 2s"
+     hx-swap="innerHTML">
+  {% include "partials/activity_body.html" %}
+</div>
+<script>
+  // Sticky-bottom + preserve <details> open state across htmx swaps.
+  // See agent_detail.html for rationale.
+  (function () {
+    const STICKY_PX = 120;
+    let stickToBottom = true;
+    const openFolds = new Set();
+
+    function isNearBottom() {
+      return window.innerHeight + window.scrollY
+        >= document.body.offsetHeight - STICKY_PX;
+    }
+    function scrollToBottom() {
+      window.scrollTo({ top: document.body.scrollHeight, behavior: "instant" });
+    }
+    function snapshotOpenFolds(root) {
+      root.querySelectorAll("details[data-fold-id][open]").forEach((d) => {
+        openFolds.add(d.getAttribute("data-fold-id"));
+      });
+      root.querySelectorAll("details[data-fold-id]:not([open])").forEach((d) => {
+        openFolds.delete(d.getAttribute("data-fold-id"));
+      });
+    }
+    function restoreOpenFolds(root) {
+      root.querySelectorAll("details[data-fold-id]").forEach((d) => {
+        if (openFolds.has(d.getAttribute("data-fold-id"))) {
+          d.open = true;
+        }
+      });
+    }
+    document.body.addEventListener("toggle", (e) => {
+      const d = e.target;
+      if (d.tagName !== "DETAILS" || !d.hasAttribute("data-fold-id")) return;
+      const id = d.getAttribute("data-fold-id");
+      if (d.open) openFolds.add(id);
+      else openFolds.delete(id);
+    }, true);
+
+    window.addEventListener("scroll", () => {
+      stickToBottom = isNearBottom();
+    });
+    window.addEventListener("load", () => {
+      snapshotOpenFolds(document);
+      scrollToBottom();
+    });
+    document.body.addEventListener("htmx:beforeSwap", (e) => {
+      if (e.detail.target.id === "activity-body") {
+        snapshotOpenFolds(e.detail.target);
+      }
+    });
+    document.body.addEventListener("htmx:afterSwap", (e) => {
+      if (e.detail.target.id === "activity-body") {
+        restoreOpenFolds(e.detail.target);
+        if (stickToBottom) scrollToBottom();
+      }
+    });
+  })();
+</script>
+{% endblock %}

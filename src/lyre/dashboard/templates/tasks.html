@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% block content %}
+<h2>Tasks <small id="task-pulse"></small></h2>
+<div class="filters">
+  <a href="/tasks" class="{{ '' if filter_status else 'active' }}">all</a>
+  {% for s in ["pending", "in_progress", "needs_input", "completed", "failed"] %}
+    <a href="/tasks?status={{ s }}"
+       class="{{ 'active' if filter_status==s else '' }}">{{ s }}</a>
+  {% endfor %}
+</div>
+
+<div hx-get="/tasks{% if filter_status %}?status={{ filter_status }}{% endif %}"
+     hx-trigger="every 3s"
+     hx-select="#tasks-table"
+     hx-target="#tasks-table"
+     hx-swap="outerHTML">
+{% if tasks %}
+  <table id="tasks-table" class="taskgrid">
+    <thead>
+      <tr>
+        <th>id</th><th>persona</th><th>status</th>
+        <th>parent</th><th>goal</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for t in tasks %}
+        <tr class="row-status-{{ t.status }}">
+          <td><a href="/tasks/{{ t.id }}"><code>{{ t.id[:8] }}</code></a></td>
+          <td>{{ t.persona_name }}</td>
+          <td>
+            <span class="status status-{{ t.status }}">{{ t.status }}</span>
+            {% if t.status == "in_progress" %}
+              <span class="dot live small" title="agent working"></span>
+            {% endif %}
+          </td>
+          <td>
+            {% if t.parent_task_id %}
+              <a href="/tasks/{{ t.parent_task_id }}"><code>{{ t.parent_task_id[:8] }}</code></a>
+            {% else %}—{% endif %}
+          </td>
+          <td>{{ t.goal[:80] }}</td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% else %}
+  <p id="tasks-table" class="empty">no tasks{% if filter_status %} with status={{ filter_status }}{% endif %}</p>
+{% endif %}
+</div>
+{% endblock %}

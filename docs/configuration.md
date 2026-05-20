@@ -1,0 +1,216 @@
+# Configuration
+
+What Lyre reads from env vars, config files, and the filesystem.
+
+## Environment variables
+
+All env vars are optional unless noted. Set them in your shell or a
+`.env` file at the repo root (Lyre auto-loads `.env` on startup).
+
+### Auth (set at least one)
+
+| Variable | Purpose |
+|---|---|
+| `ANTHROPIC_API_KEY` | Native Anthropic models (claude-opus / sonnet / haiku) |
+| `DEEPSEEK_API_KEY` | DeepSeek models — works for both DeepSeek's Anthropic-compat endpoint AND their OpenAI-compat endpoint |
+| `OPENAI_API_KEY` | OpenAI proper (gpt-5 / o-series); also accepted by OpenRouter etc. |
+
+### Routing
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `LYRE_MODEL_OVERRIDE` | Force every wakeup to this specific `model_id`, ignoring persona routing. Useful for testing one provider. | unset (per-persona routing) |
+| `LYRE_DEFAULT_MODEL` | Fallback if a persona doesn't specify a `model_preference`. | `claude-sonnet-4-6` |
+| `LYRE_COMPACT_THRESHOLD` | Fraction of context window above which auto-compaction fires. Must be `0 < x < 1`. | `0.7` |
+
+### Storage paths
+
+| Variable | What it controls | Default |
+|---|---|---|
+| `LYRE_DB_PATH` | SQLite file with tasks/wakeups/mailbox/etc. | `~/.lyre/lyre.db` |
+| `LYRE_OBJECT_STORE` | Append-only artifact store (transcripts) | `~/.lyre/object_store/` |
+| `LYRE_MEMORY_PATH` | Markdown filesystem the agents read/write | `~/.lyre/memory/` |
+
+You can point all of these at a temp directory for isolated experiments:
+
+```bash
+export LYRE_DB_PATH=/tmp/lyre-test/lyre.db
+export LYRE_OBJECT_STORE=/tmp/lyre-test/objects
+export LYRE_MEMORY_PATH=/tmp/lyre-test/memory
+uv run lyre init
+uv run lyre serve
+```
+
+## Model registry (`model_registry.yaml`)
+
+Located at the repository root. Declares every (provider, model) Lyre
+can route to.
+
+```yaml
+models:
+  - id: anthropic.claude-sonnet-4-6
+    provider: anthropic              # which adapter module to use
+    endpoint:
+      base_url: null                 # null = SDK default
+      auth_env: ANTHROPIC_API_KEY
+    capabilities: [tool_use, streaming, long_context_1M]
+    tier: workhorse                  # flagship | workhorse | cheap
+    cost_per_mtok: { input: 3.00, output: 15.00 }
+    context_window: 1000000
+    status: enabled                  # enabled | disabled
+
+  - id: deepseek-oai.deepseek-reasoner
+    provider: openai                 # OpenAI /v1/chat/completions shape
+    endpoint:
+      base_url: https://api.deepseek.com/v1
+      auth_env: DEEPSEEK_API_KEY
+    capabilities: [tool_use, streaming, reasoning]
+    tier: workhorse
+    cost_per_mtok: { input: 0.55, output: 2.19 }
+    context_window: 128000
+    status: disabled                 # set to enabled if you have the key
+```
+
+### Provider field
+
+| `provider` value | Adapter used | Endpoints it covers |
+|---|---|---|
+| `anthropic` | `src/lyre/adapter/anthropic.py` | Anthropic proper, DeepSeek's Anthropic-compat endpoint, Bedrock (with `base_url`) |
+| `openai` | `src/lyre/adapter/openai.py` | OpenAI proper, DeepSeek's OpenAI-compat endpoint, OpenRouter, Together, vLLM, anything that speaks `/v1/chat/completions` |
+
+### ID convention
+
+`id` follows `<namespace>.<provider-model-name>`. The part **after** the
+first dot is what gets sent to the API:
+
+- `anthropic.claude-opus-4-7` → API receives `claude-opus-4-7`
+- `deepseek-oai.deepseek-reasoner` → API receives `deepseek-reasoner`
+
+This lets you have multiple entries pointing at the same underlying
+model with different routing characteristics (e.g., `deepseek.deepseek-v4-pro`
+via Anthropic-compat AND `deepseek-oai.deepseek-chat` via OpenAI-compat).
+
+### Capabilities
+
+Free-form strings personas can match against in their `model_preference.requires`.
+Common ones used today: `tool_use`, `streaming`, `reasoning`,
+`long_context_1M`. There's no enforced vocabulary — add what you need.
+
+### Health and fallback
+
+When a model fails or rate-limits, the `HealthTracker` (in
+`src/lyre/runtime/health_tracker.py`) opens a circuit breaker on that
+model. The router falls back to the next acceptable candidate from the
+persona's preference list.
+
+`lyre model list` shows current auth + health state for every entry.
+
+## Persona files
+
+Located at `src/lyre/personas/<name>.md`. Each one is a markdown file
+with YAML frontmatter:
+
+```yaml
+---
+name: worker-maintainer
+role_description: "Lyre 团队的 worker——在 per-task tmpdir 改代码、跑测试、提 PR"
+allowed_lyre_tools:
+  - python_exec
+  - shell_exec
+  - mailbox_send
+  - mailbox_read
+  - mailbox_get_message
+  - mark_read
+  - report_progress
+  - report_side_effect
+  - query_task_status
+  - read_memory
+  - list_agents
+needs_worktree: true
+model_preference:
+  tier: workhorse
+  requires: [tool_use, streaming]
+  prefer: [anthropic.claude-sonnet-4-6]
+---
+<persona system prompt body here, free-form markdown>
+```
+
+Field details:
+
+| Field | What it does |
+|---|---|
+| `name` | Persona name. Must match filename stem. |
+| `role_description` | One-line summary; shown to other agents in `list_personas()`. |
+| `allowed_lyre_tools` | Subset of the runtime's tools this persona can call. Enforced at dispatch time — calling a non-allowlisted tool returns an error to the model. |
+| `needs_worktree` | If true, each task gets its own tmpdir + ephemeral SSH key (for working in isolation on code). |
+| `model_preference.tier` | `flagship` / `workhorse` / `cheap`. Router picks among entries with this tier. |
+| `model_preference.requires` | List of capability tags the chosen model must have. |
+| `model_preference.prefer` | Explicit `model_id`s to try first within the matching tier. |
+
+The body below the frontmatter is the persona's system prompt. It's
+appended after the runtime-generated **identity preamble** (which
+explains wakeups, mailbox protocol, ack-and-stop anti-pattern, etc.).
+
+Personas are read at process start via `lyre init` (or on `lyre serve`
+startup); they're upserted into the `personas` table. Edit the markdown
+file and restart `lyre serve` to apply changes.
+
+See [writing-personas.md](./writing-personas.md) for how to design new
+personas, including the skills system.
+
+## Memory directory layout
+
+Created by `lyre init`. The agents have constrained read access via
+`read_memory()` and arbitrary read/write via `shell_exec` / `python_exec`.
+
+```
+~/.lyre/memory/
+├── facts/
+│   ├── agent-owner-notes.md          # owner's notebook (mostly for you)
+│   ├── agent-leader-notes.md         # leader's cross-wakeup notebook
+│   ├── agent-<worker-id>-notes.md    # auto-created when each new agent is born
+│   └── <other facts>.md              # ad-hoc facts agents drop here
+├── personas/
+│   └── owner.md                       # owner's "Soul" — preferences profile
+└── skills/
+    ├── approved/                      # active skills (loaded into prompts)
+    │   ├── <skill-name>/SKILL.md      # PI-aligned: directory-per-skill
+    │   └── ...
+    └── proposed/                      # awaiting reviewer-skill approval
+        └── ...
+```
+
+Important defaults:
+
+- **Per-agent notes file.** When `create_agent` runs (or `seed_default_agents`
+  on `lyre init`), a notes file is pre-created at
+  `facts/agent-<id>-notes.md`. This is the **Codex-style "pre-create the
+  path, agent self-discovers"** pattern. The agent's identity preamble
+  tells it explicitly that this file exists; the agent then naturally
+  uses `read_memory()` / `shell_exec("cat >> ...")` to read and append.
+
+- **Skills directory.** Markdown files describing reusable procedures.
+  Each skill is a directory with a `SKILL.md` (frontmatter + body), per
+  the PI Agent Skills standard. Skills appear in the system prompt as a
+  collapsed XML menu (name + description only); the agent calls
+  `read_memory()` to load full body on demand. See
+  [writing-personas.md](./writing-personas.md#skills) for more.
+
+## Where to put what
+
+| Type of state | Lives in | Lifetime |
+|---|---|---|
+| In-flight task progress | `tasks.checkpoint` (JSON in DB) | Until task terminates |
+| Mail in-flight | `mailboxes` + `mailbox_messages` (DB) | Forever (audit) |
+| Wakeup transcripts | `~/.lyre/object_store/wakeups/<id>/transcript.jsonl` | Forever (audit) |
+| Cross-wakeup agent notes | `~/.lyre/memory/facts/agent-<id>-notes.md` | Forever (owner can prune) |
+| Owner preferences | `~/.lyre/memory/personas/owner.md` | Forever (curated) |
+| Cross-task facts | `~/.lyre/memory/facts/*.md` | Forever (curated) |
+| Reusable skills | `~/.lyre/memory/skills/approved/<name>/SKILL.md` | Forever (curated) |
+
+The transactional boundary: at the end of every wakeup, the DB writes
+(task status, outbox enqueue, etc.) commit atomically. The filesystem
+writes (memory, transcripts) are append-only and individually
+fsync'd — they're crash-safe but not transactionally consistent with
+the DB. This is intentional; see the design doc `TRANSACTION_BOUNDARIES.md`
+for why.

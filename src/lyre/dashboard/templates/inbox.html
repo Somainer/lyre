@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block content %}
+<h2>
+  Inbox
+  <small>
+    {% if urgency_filter %}filtered: urgency ≥ {{ urgency_filter }}
+    {% else %}all urgencies{% endif %}
+  </small>
+</h2>
+<div class="filters">
+  <a href="/inbox" class="{{ 'active' if not urgency_filter else '' }}">all</a>
+  <a href="/inbox?urgency=normal" class="{{ 'active' if urgency_filter=='normal' else '' }}">normal+</a>
+  <a href="/inbox?urgency=high" class="{{ 'active' if urgency_filter=='high' else '' }}">high+</a>
+  <a href="/inbox?urgency=blocker" class="{{ 'active' if urgency_filter=='blocker' else '' }}">blocker only</a>
+</div>
+{% if messages %}
+  <ul class="mailbox-list">
+    {% for m in messages %}
+      {% include "partials/mailbox_item.html" %}
+    {% endfor %}
+  </ul>
+{% else %}
+  <p class="empty">
+    {% if urgency_filter %}没有 {{ urgency_filter }}+ 消息
+    {% else %}邮箱空空{% endif %}
+  </p>
+{% endif %}
+{% endblock %}

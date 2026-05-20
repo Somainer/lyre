@@ -1,0 +1,1587 @@
+"""Lyre CLI entrypoint."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import signal
+import sys
+
+import click
+import structlog
+
+from .config import Config, load_dotenv_chain
+from .outbox.dispatcher import OutboxDispatcher
+from .persistence.db import init_db
+from .persistence.models import MailboxMessage, TaskSpec
+from .persistence.sqlite_impl import SqliteRepositories
+from .personas.seed import seed_default_agents, seed_personas
+from .runtime.memory import ensure_skeleton, write_default_owner_soul
+from .runtime.skills import ensure_skills_skeleton
+from .scheduler.scheduler import Scheduler
+
+log = structlog.get_logger()
+
+
+def _setup_logging() -> None:
+    structlog.configure(
+        processors=[
+            structlog.processors.TimeStamper(fmt="iso"),
+            structlog.processors.add_log_level,
+            structlog.dev.ConsoleRenderer(colors=sys.stderr.isatty()),
+        ]
+    )
+
+
+@click.group()
+def cli() -> None:
+    """Lyre — long-running personal multi-agent team."""
+    _setup_logging()
+    loaded = load_dotenv_chain()
+    for path in loaded:
+        click.echo(f"loaded .env from {path}", err=True)
+
+
+# ----------------------------------------------------------------------
+# lyre init
+# ----------------------------------------------------------------------
+
+@cli.command("init")
+def init_cmd() -> None:
+    """Initialize DB schema and seed default personas."""
+
+    async def _run() -> None:
+        cfg = Config.from_env()
+        click.echo(f"Initializing DB at {cfg.db_path}")
+        conn = await init_db(cfg.db_path)
+        try:
+            repos = SqliteRepositories(conn)
+            await repos.mailbox.ensure_mailbox("owner")
+            seeded = await seed_personas(repos.personas)
+            click.echo(f"Seeded {len(seeded)} personas: {', '.join(seeded)}")
+
+            click.echo(f"Setting up memory dir at {cfg.memory_path}")
+            created = ensure_skeleton(cfg.memory_path)
+            for p in created:
+                click.echo(f"  created {p.relative_to(cfg.memory_path)}")
+
+            # Seed agents AFTER memory skeleton exists so per-agent notes
+            # files land in <memory>/facts/ on the same `lyre init`.
+            created_agents = await seed_default_agents(
+                repos.agents, memory_root=cfg.memory_path,
+            )
+            if created_agents:
+                click.echo(
+                    f"Created {len(created_agents)} default agents: "
+                    + ", ".join(created_agents)
+                )
+            else:
+                click.echo("Default agents already exist (owner, leader).")
+            soul = write_default_owner_soul(cfg.memory_path)
+            click.echo(f"  owner Soul: {soul.relative_to(cfg.memory_path)}")
+
+            lyre_home = cfg.memory_path.parent  # ~/.lyre/
+            skills_created = ensure_skills_skeleton(lyre_home)
+            for p in skills_created:
+                click.echo(f"  created {p.relative_to(lyre_home)}")
+
+            click.echo("Done.")
+        finally:
+            await conn.close()
+
+    asyncio.run(_run())
+
+
+# ----------------------------------------------------------------------
+# lyre serve
+# ----------------------------------------------------------------------
+
+@cli.command("serve")
+@click.option("--poll-interval", default=1.0, type=float, help="Seconds between polls")
+@click.option(
+    "--dashboard/--no-dashboard", default=True,
+    help="Run the web dashboard alongside scheduler + dispatcher (default on)",
+)
+@click.option(
+    "--dashboard-host", default="127.0.0.1", show_default=True,
+)
+@click.option(
+    "--dashboard-port", default=8765, show_default=True, type=int,
+)
+@click.option(
+    "--subprocess/--no-subprocess", "use_subprocess", default=False,
+    help="Run each task in a fresh `lyre run-task` subprocess (OS-level "
+    "isolation per 铁律 2). Default off — opt-in until production-validated.",
+)
+def serve_cmd(
+    poll_interval: float,
+    dashboard: bool,
+    dashboard_host: str,
+    dashboard_port: int,
+    use_subprocess: bool,
+) -> None:
+    """Start scheduler + outbox dispatcher (+ dashboard) in one process."""
+
+    async def _run() -> None:
+        from .runtime.model_registry import default_registry_path, load_registry
+
+        cfg = Config.from_env()
+        # Q9: each model entry declares its own auth_env. Validate that at
+        # least one enabled entry (or the override entry, if set) is reachable
+        # before starting — gives a fast, actionable error instead of failing
+        # silently on the first dispatched task.
+        registry = load_registry(default_registry_path())
+        candidates = registry.enabled()
+        if cfg.model_override:
+            candidates = [e for e in candidates if e.id == cfg.model_override]
+            if not candidates:
+                click.echo(
+                    f"ERROR: LYRE_MODEL_OVERRIDE={cfg.model_override!r} "
+                    f"but no enabled entry with that id in model_registry.yaml.",
+                    err=True,
+                )
+                sys.exit(1)
+        reachable = [
+            e for e in candidates if os.getenv(e.endpoint.auth_env)
+        ]
+        if not reachable:
+            needed = sorted({e.endpoint.auth_env for e in candidates})
+            click.echo(
+                "ERROR: no LLM API key found in env for any enabled model "
+                "in model_registry.yaml.\n"
+                "Set ONE of: " + ", ".join(needed) + "\n"
+                "Or set LYRE_MODEL_OVERRIDE=<id> to a model whose auth_env "
+                "you have, e.g. deepseek.deepseek-v4-flash with DEEPSEEK_API_KEY.",
+                err=True,
+            )
+            sys.exit(1)
+        click.echo(
+            f"LLM reachable for {len(reachable)}/{len(candidates)} model "
+            f"entr{'y' if len(candidates) == 1 else 'ies'}: "
+            + ", ".join(e.id for e in reachable)
+        )
+
+        conn = await init_db(cfg.db_path)
+        try:
+            repos = SqliteRepositories(conn)
+            # Always make sure the well-known agents exist before scheduler
+            # starts — `lyre serve` straight after `lyre init` should work
+            # without a separate bootstrap step, and Phase 0 needs at least
+            # owner+leader to address mail to.
+            await seed_personas(repos.personas)
+            await seed_default_agents(
+                repos.agents, memory_root=cfg.memory_path,
+            )
+
+            scheduler = Scheduler(
+                repos, cfg,
+                poll_interval_s=poll_interval,
+                spawn_subprocess=use_subprocess,
+            )
+            dispatcher = OutboxDispatcher(repos, poll_interval_s=poll_interval)
+
+            # Shared stop_event so SIGINT halts all services together.
+            stop_event = asyncio.Event()
+            loop = asyncio.get_running_loop()
+
+            def _stop_all() -> None:
+                stop_event.set()
+                scheduler.request_stop()
+                dispatcher.request_stop()
+
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                loop.add_signal_handler(sig, _stop_all)
+
+            services: list[asyncio.Task] = [
+                asyncio.create_task(scheduler.run(), name="scheduler"),
+                asyncio.create_task(dispatcher.run(), name="outbox_dispatcher"),
+            ]
+            mode = "subprocess-isolated" if use_subprocess else "inline"
+            click.echo(
+                f"Lyre scheduler ({mode}) + outbox dispatcher started."
+            )
+            if dashboard:
+                from .dashboard.runner import run_dashboard as _run_dash
+
+                def _ready(url: str) -> None:
+                    click.echo(f"Lyre dashboard at {url}")
+
+                # Pass per-model context_window into the dashboard so the
+                # activity feed can show "peak / window" percentages on
+                # wakeup_end events.
+                ctx_windows = {
+                    e.id: e.context_window
+                    for e in registry.entries
+                    if e.context_window
+                }
+                services.append(
+                    asyncio.create_task(
+                        _run_dash(
+                            repos,
+                            host=dashboard_host,
+                            port=dashboard_port,
+                            stop_event=stop_event,
+                            on_ready=_ready,
+                            model_context_windows=ctx_windows,
+                        ),
+                        name="dashboard",
+                    )
+                )
+            else:
+                click.echo("  dashboard disabled (--no-dashboard)")
+            click.echo("Ctrl-C to stop.")
+
+            try:
+                await asyncio.gather(*services)
+            except asyncio.CancelledError:
+                pass
+        finally:
+            await conn.close()
+
+    asyncio.run(_run())
+
+
+# ----------------------------------------------------------------------
+# lyre dispatch
+# ----------------------------------------------------------------------
+
+@cli.command("dispatch")
+@click.argument("persona")
+@click.argument("goal")
+@click.option("--acceptance", default="任务跑通即可（Sprint 0 smoke test）", help="验收标准")
+def dispatch_cmd(persona: str, goal: str, acceptance: str) -> None:
+    """Write a task to the queue. Scheduler will pick it up."""
+
+    async def _run() -> None:
+        cfg = Config.from_env()
+        conn = await init_db(cfg.db_path)
+        try:
+            repos = SqliteRepositories(conn)
+            spec = TaskSpec(persona_name=persona, goal=goal, acceptance=acceptance)
+            task_id = await repos.tasks.create(spec)
+            click.echo(f"Task dispatched: {task_id} (persona={persona})")
+        finally:
+            await conn.close()
+
+    asyncio.run(_run())
+
+
+# ----------------------------------------------------------------------
+# lyre status <task_id>
+# ----------------------------------------------------------------------
+
+@cli.command("status")
+@click.argument("task_id")
+def status_cmd(task_id: str) -> None:
+    """Show a task's status + checkpoint + latest wakeup transcript URI."""
+
+    async def _run() -> None:
+        cfg = Config.from_env()
+        conn = await init_db(cfg.db_path)
+        try:
+            repos = SqliteRepositories(conn)
+            task = await repos.tasks.get(task_id)
+            if task is None:
+                click.echo(f"No such task: {task_id}", err=True)
+                sys.exit(1)
+            click.echo(json.dumps(task.model_dump(mode="json"), indent=2, ensure_ascii=False))
+        finally:
+            await conn.close()
+
+    asyncio.run(_run())
+
+
+# ----------------------------------------------------------------------
+# lyre run-task <task_id> — subprocess entry point
+# ----------------------------------------------------------------------
+
+@cli.command("run-task", hidden=True)
+@click.argument("task_id")
+def run_task_cmd(task_id: str) -> None:
+    """Run a single task to completion in THIS process. Intended to be
+    invoked as a subprocess by the Scheduler when `spawn_subprocess` is on
+    (per 铁律 2). Not normally invoked by hand.
+
+    Env variables it reads:
+      LYRE_DB_PATH / LYRE_OBJECT_STORE / LYRE_MEMORY_PATH (Config)
+      ANTHROPIC_API_KEY / DEEPSEEK_API_KEY (LLM)
+      LYRE_MOCK_ADAPTER_SCRIPT (testing only — path to a JSONL stream script)
+    """
+
+    async def _run() -> None:
+        cfg = Config.from_env()
+        conn = await init_db(cfg.db_path)
+        try:
+            repos = SqliteRepositories(conn)
+            adapter_for_test = None
+            mock_script = os.getenv("LYRE_MOCK_ADAPTER_SCRIPT")
+            if mock_script:
+                from pathlib import Path as _P
+
+                from .adapter.mock_jsonl import MockJsonlAdapter
+
+                # One adapter PER persona/wakeup is fine because the subprocess
+                # runs exactly one task. We reuse the same instance across
+                # turn calls — MockJsonlAdapter holds its turn queue inside.
+                _shared = MockJsonlAdapter(_P(mock_script))
+                adapter_for_test = lambda _entry: _shared  # noqa: E731
+
+            scheduler = Scheduler(
+                repos, cfg,
+                poll_interval_s=1.0,
+                spawn_subprocess=False,  # we ARE the subprocess
+                adapter_for_test=adapter_for_test,
+            )
+            await scheduler._run_task_inline(task_id)
+        finally:
+            await conn.close()
+
+    asyncio.run(_run())
+
+
+# ----------------------------------------------------------------------
+# lyre dashboard (Sprint D1) — standalone web UI; no scheduler
+# ----------------------------------------------------------------------
+
+@cli.command("dashboard")
+@click.option("--host", default="127.0.0.1", show_default=True)
+@click.option("--port", default=8765, show_default=True, type=int)
+def dashboard_cmd(host: str, port: int) -> None:
+    """Start the Lyre dashboard standalone (no scheduler / dispatcher).
+
+    For the all-in-one experience use `lyre serve` (default includes the
+    dashboard; pass `--no-dashboard` to opt out)."""
+    from .dashboard.runner import run_dashboard
+
+    async def _run() -> None:
+        from .runtime.model_registry import default_registry_path, load_registry
+
+        cfg = Config.from_env()
+        registry = load_registry(default_registry_path())
+        ctx_windows = {
+            e.id: e.context_window
+            for e in registry.entries
+            if e.context_window
+        }
+        conn = await init_db(cfg.db_path)
+        try:
+            repos = SqliteRepositories(conn)
+            stop_event = asyncio.Event()
+            loop = asyncio.get_running_loop()
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                loop.add_signal_handler(sig, stop_event.set)
+            await run_dashboard(
+                repos,
+                host=host,
+                port=port,
+                stop_event=stop_event,
+                on_ready=lambda url: click.echo(f"Lyre dashboard at {url}"),
+                model_context_windows=ctx_windows,
+            )
+        finally:
+            await conn.close()
+
+    asyncio.run(_run())
+
+
+# ----------------------------------------------------------------------
+# lyre send <to> <body>
+# ----------------------------------------------------------------------
+
+@cli.command("send")
+@click.argument("recipient")
+@click.argument("body")
+@click.option(
+    "--title",
+    default=None,
+    help="Subject line (≤140 char). Readers see only the title in their "
+         "inbox listing. Omitted → derived from body's first line.",
+)
+@click.option(
+    "--urgency",
+    type=click.Choice(["blocker", "high", "normal", "low"]),
+    default="normal",
+    help="urgency tier (default normal)",
+)
+@click.option(
+    "--from", "sender",
+    default="owner",
+    help="sender persona name (default owner)",
+)
+@click.option(
+    "--task-id", default=None,
+    help="optional task_id this message relates to",
+)
+@click.option(
+    "--at", "deliver_at", default=None,
+    help="ISO 8601 UTC. Future-mail: deliver at this absolute time (e.g. 2026-06-01T09:00:00Z).",
+)
+@click.option(
+    "--in", "deliver_in", default=None,
+    help="Future-mail: deliver in <N>m/h/d/w (e.g. 2h, 1d, 1w).",
+)
+@click.option(
+    "--recur-every", default=None,
+    help="Recurrence interval: <N>m/h/d/w. Mutually exclusive with --recur-cron.",
+)
+@click.option(
+    "--recur-cron", default=None,
+    help='5-field POSIX cron, e.g. "0 9 * * 1-5". Mutually exclusive with --recur-every.',
+)
+@click.option(
+    "--until", "recur_until", default=None,
+    help="ISO 8601 UTC. Stop recurrence after this. Default: first_fire + 1 year.",
+)
+def send_cmd(
+    recipient: str, body: str, title: str | None,
+    urgency: str, sender: str, task_id: str | None,
+    deliver_at: str | None, deliver_in: str | None,
+    recur_every: str | None, recur_cron: str | None, recur_until: str | None,
+) -> None:
+    """Send a mailbox message to an agent.
+
+    `recipient` is an AGENT ID (post-A3: agents are first-class). Use
+    `lyre agent list` to see live agent ids. Owner-originated messages
+    bypass the outbox.
+    """
+
+    async def _run() -> None:
+        cfg = Config.from_env()
+        conn = await init_db(cfg.db_path)
+        try:
+            import uuid as _uuid
+
+            repos = SqliteRepositories(conn)
+            # Validate recipient is a real agent (or special 'owner'
+            # mailbox). Catches typos / "I meant the persona" mistakes
+            # before they end up as silently-undeliverable mail.
+            if recipient != "owner" and not await repos.agents.exists(recipient):
+                live = sorted({a.id for a in await repos.agents.list_all()} | {"owner"})
+                click.echo(
+                    f"unknown agent {recipient!r}. Known: {live}. "
+                    f"`lyre agent list` for details or "
+                    f"`lyre agent create <persona>` to spawn a new one.",
+                    err=True,
+                )
+                sys.exit(1)
+            await repos.mailbox.ensure_mailbox(recipient)
+
+            # Future-mail branch — any of --at/--in/--recur-* flips this on.
+            if any(
+                v is not None
+                for v in (deliver_at, deliver_in, recur_every, recur_cron, recur_until)
+            ):
+                from datetime import datetime
+
+                from .persistence.models import ScheduledMail
+                from .runtime.future_mail import (
+                    PastDeliveryError,
+                    default_recur_until,
+                    iso,
+                    now_utc,
+                    parse_duration,
+                    resolve_first_fire,
+                    validate_cron,
+                )
+
+                if recur_every is not None and recur_cron is not None:
+                    click.echo("--recur-every and --recur-cron are mutually exclusive", err=True)
+                    sys.exit(2)
+                try:
+                    if recur_cron is not None:
+                        validate_cron(recur_cron)
+                    if recur_every is not None:
+                        parse_duration(recur_every)
+                    first_fire = resolve_first_fire(
+                        deliver_at=deliver_at,
+                        deliver_in=deliver_in,
+                        recur_cron=recur_cron,
+                        now=now_utc(),
+                    )
+                except PastDeliveryError as exc:
+                    click.echo(str(exc), err=True)
+                    sys.exit(1)
+                except ValueError as exc:
+                    click.echo(str(exc), err=True)
+                    sys.exit(1)
+
+                recur_kind: str | None = None
+                recur_value: str | None = None
+                if recur_every is not None:
+                    recur_kind, recur_value = "interval", recur_every
+                elif recur_cron is not None:
+                    recur_kind, recur_value = "cron", recur_cron
+
+                ru = None
+                if recur_kind is not None:
+                    if recur_until is not None:
+                        try:
+                            ru = datetime.fromisoformat(
+                                recur_until.replace("Z", "+00:00")
+                            )
+                        except ValueError:
+                            click.echo(
+                                f"--until must be ISO 8601 UTC; got {recur_until!r}",
+                                err=True,
+                            )
+                            sys.exit(1)
+                        if ru <= first_fire:
+                            click.echo(
+                                f"--until must be after first delivery "
+                                f"({iso(first_fire)})",
+                                err=True,
+                            )
+                            sys.exit(1)
+                    else:
+                        ru = default_recur_until(first_fire)
+
+                sid = await repos.scheduled_mail.create(
+                    ScheduledMail(
+                        recipient=recipient,
+                        sender=sender,
+                        urgency=urgency,  # type: ignore[arg-type]
+                        title=title,
+                        body=body,
+                        task_id=task_id,
+                        scheduled_for=first_fire,
+                        recur_kind=recur_kind,  # type: ignore[arg-type]
+                        recur_value=recur_value,
+                        recur_until=ru,
+                        created_by_agent=sender,
+                    )
+                )
+                click.echo(
+                    f"scheduled [{sid}] {urgency} {sender} → {recipient} at "
+                    f"{iso(first_fire)}"
+                )
+                if recur_kind:
+                    click.echo(
+                        f"  recurring: {recur_kind}={recur_value}"
+                        + (f" until {iso(ru)}" if ru else "")
+                    )
+                return
+
+            msg = MailboxMessage(
+                recipient=recipient,
+                external_id=f"cli:{_uuid.uuid4()}",
+                sender=sender,
+                urgency=urgency,  # type: ignore[arg-type]
+                title=title,
+                body=body,
+                task_id=task_id,
+            )
+            msg_id = await repos.mailbox.insert_message(msg)
+            if msg_id < 0:
+                click.echo("(duplicate external_id, no row written)", err=True)
+                sys.exit(1)
+            click.echo(
+                f"sent [{msg_id}] {urgency} from {sender} → {recipient}: "
+                f"{body[:80]}{'…' if len(body) > 80 else ''}"
+            )
+
+            # Visibility hint: how this delivery actually reaches the agent.
+            if recipient == "owner":
+                pass  # owner has no agent; mailbox is a passive human inbox
+            elif urgency == "low":
+                click.echo(
+                    f"  → urgency=low is pure archive; {recipient} is NOT "
+                    "auto-woken. Agent only sees it if it explicitly reads."
+                )
+            else:
+                # normal, high, blocker — all reach the agent
+                active = await repos.tasks.find_active_for_persona(recipient)
+                if active:
+                    if urgency == "blocker":
+                        click.echo(
+                            f"  → {recipient} has {len(active)} active task(s); "
+                            "MailWatcher will inject mid-stream + next turn "
+                            "boundary (blocker = system waiting)."
+                        )
+                    elif urgency == "high":
+                        click.echo(
+                            f"  → {recipient} has {len(active)} active task(s); "
+                            "MailWatcher will inject at next turn boundary "
+                            "(high = please reply, not mid-thought)."
+                        )
+                    else:  # normal
+                        click.echo(
+                            f"  → {recipient} has {len(active)} active task(s); "
+                            "FYI won't interrupt running work — picked up by "
+                            "Phase 0 once current tasks complete."
+                        )
+                else:
+                    click.echo(
+                        f"  → scheduler will auto-dispatch a 'check inbox' task "
+                        f"to {recipient} on its next tick "
+                        f"(typically <1s if `lyre serve` is running)."
+                    )
+        finally:
+            await conn.close()
+
+    asyncio.run(_run())
+
+
+# ----------------------------------------------------------------------
+# lyre mailbox <recipient>
+# ----------------------------------------------------------------------
+
+@cli.command("mailbox")
+@click.argument("recipient", default="owner")
+@click.option("--since", default=0, type=int, help="只显示 id > since 的消息")
+@click.option(
+    "--unread-only", is_flag=True,
+    help="Only show unread mail (read_at IS NULL).",
+)
+def mailbox_cmd(recipient: str, since: int, unread_only: bool) -> None:
+    """List messages in a mailbox."""
+
+    async def _run() -> None:
+        cfg = Config.from_env()
+        conn = await init_db(cfg.db_path)
+        try:
+            repos = SqliteRepositories(conn)
+            await repos.mailbox.ensure_mailbox(recipient)
+            if unread_only:
+                msgs = await repos.mailbox.read_unread(recipient, limit=200)
+            else:
+                msgs = await repos.mailbox.read_messages(
+                    recipient, since_id=since
+                )
+            for m in msgs:
+                state = " " if m.read_at else "•"  # bullet = unread
+                title = m.title or "(no title)"
+                click.echo(
+                    f"{state} [{m.id}] {m.urgency:>7} from {m.sender} → "
+                    f"{m.recipient}: {title}"
+                )
+            if not msgs:
+                kind = "unread " if unread_only else ""
+                click.echo(
+                    f"(no {kind}messages in {recipient}'s mailbox)"
+                )
+        finally:
+            await conn.close()
+
+    asyncio.run(_run())
+
+
+@cli.command("audit")
+@click.argument("target", required=False)
+@click.option(
+    "--persona", default=None, help="过滤 persona（与 --latest 配合使用）"
+)
+@click.option(
+    "--latest",
+    is_flag=True,
+    help="取最近一次 wakeup（可配合 --persona 过滤）",
+)
+@click.option("--system/--no-system", default=True, help="是否打印 system prompt")
+@click.option(
+    "--full-result",
+    is_flag=True,
+    help="完整打印 tool_result（默认只截前 400 char）",
+)
+@click.option(
+    "--json", "as_json", is_flag=True,
+    help="Emit raw transcript JSONL (one event per line, untouched) "
+         "so you can pipe to jq. Skips the pretty-printed summary.",
+)
+def audit_cmd(
+    target: str | None,
+    persona: str | None,
+    latest: bool,
+    system: bool,
+    full_result: bool,
+    as_json: bool,
+) -> None:
+    """Pretty-print one wakeup's transcript so you can see exactly what the LLM saw and did.
+
+    Examples:
+        lyre audit 019e36a9-e1f8-...          # specific wakeup by id (prefix ok)
+        lyre audit --latest                   # most-recent wakeup, any persona
+        lyre audit --latest --persona leader  # most-recent leader wakeup
+    """
+    import textwrap
+
+    async def _run() -> None:
+        cfg = Config.from_env()
+        conn = await init_db(cfg.db_path)
+        try:
+            wakeup_id: str | None = None
+            if latest:
+                if persona:
+                    sql = (
+                        "SELECT id FROM wakeups WHERE persona_name = ? "
+                        "ORDER BY started_at DESC LIMIT 1"
+                    )
+                    params: tuple = (persona,)
+                else:
+                    sql = "SELECT id FROM wakeups ORDER BY started_at DESC LIMIT 1"
+                    params = ()
+                async with conn.execute(sql, params) as cur:
+                    row = await cur.fetchone()
+                if row is None:
+                    click.echo("No wakeups found.", err=True)
+                    sys.exit(1)
+                wakeup_id = row["id"]
+            elif target:
+                async with conn.execute(
+                    "SELECT id FROM wakeups WHERE id LIKE ? LIMIT 2",
+                    (target + "%",),
+                ) as cur:
+                    rows = await cur.fetchall()
+                if not rows:
+                    click.echo(f"No wakeup matches '{target}'", err=True)
+                    sys.exit(1)
+                if len(rows) > 1:
+                    click.echo(f"Ambiguous prefix '{target}' (multiple matches)", err=True)
+                    sys.exit(1)
+                wakeup_id = rows[0]["id"]
+            else:
+                click.echo("Pass a wakeup id, or --latest [--persona X].", err=True)
+                sys.exit(2)
+
+            async with conn.execute(
+                "SELECT id, persona_name, task_id, started_at, ended_at, "
+                "end_status, provider, model, token_input, token_output, "
+                "tool_call_count, transcript_uri FROM wakeups WHERE id = ?",
+                (wakeup_id,),
+            ) as cur:
+                w = await cur.fetchone()
+            if w is None:
+                click.echo(f"Wakeup not found: {wakeup_id}", err=True)
+                sys.exit(1)
+
+            uri = w["transcript_uri"]
+            if not uri:
+                click.echo("(transcript_uri empty)", err=True)
+                return
+            from pathlib import Path as _P
+
+            path = uri.removeprefix("file://")
+
+            # --json: dump raw JSONL untouched. The wakeup metadata row
+            # comes first so a consumer with `jq` has both the wakeup
+            # context and the transcript events in one stream.
+            if as_json:
+                # aiosqlite.Row supports dict() conversion via keys() — use
+                # an explicit comprehension over its keys() since the row
+                # isn't a real dict.
+                meta = {"type": "_meta"}
+                for k in w.keys():  # noqa: SIM118 — aiosqlite.Row API
+                    meta[k] = w[k]
+                click.echo(json.dumps(meta, default=str))
+                content = await asyncio.to_thread(
+                    _P(path).read_text, encoding="utf-8"
+                )
+                for line in content.splitlines():
+                    if line.strip():
+                        click.echo(line)
+                return
+
+            click.echo("=" * 72)
+            click.echo(f"WAKEUP   {w['id']}")
+            click.echo(f"persona  {w['persona_name']}    task {w['task_id']}")
+            click.echo(f"model    {w['provider']} / {w['model']}")
+            click.echo(
+                f"tokens   in={w['token_input']}  out={w['token_output']}    "
+                f"tool_calls={w['tool_call_count']}    end={w['end_status']}"
+            )
+            click.echo(f"time     {w['started_at']}  →  {w['ended_at']}")
+            click.echo(f"file     {w['transcript_uri']}")
+            click.echo("=" * 72)
+
+            text_chars = 0
+            tool_calls = 0
+            text_buf: list[str] = []
+            content = await asyncio.to_thread(
+                _P(path).read_text, encoding="utf-8"
+            )
+            for line in content.splitlines():
+                if not line.strip():
+                    continue
+                evt = json.loads(line)
+                t = evt.get("type")
+                if t == "system":
+                    if system:
+                        click.echo("\n--- SYSTEM PROMPT ---")
+                        click.echo(evt["system_prompt"])
+                        click.echo(
+                            f"\ntools advertised ({len(evt['tool_names'])}): "
+                            + ", ".join(evt["tool_names"])
+                        )
+                        click.echo(f"persona allowlist: {evt['allowed_tools']}")
+                        click.echo("--- END SYSTEM ---\n")
+                elif t == "note":
+                    click.echo(f"[NOTE] {evt['text']}")
+                elif t == "content_delta":
+                    text_buf.append(evt["text"])
+                    text_chars += len(evt["text"])
+                elif t == "tool_use":
+                    if text_buf:
+                        click.echo("[TEXT] " + "".join(text_buf).strip())
+                        text_buf = []
+                    tool_calls += 1
+                    inp_preview = json.dumps(evt["input"], ensure_ascii=False)
+                    if len(inp_preview) > 200:
+                        inp_preview = inp_preview[:200] + "…"
+                    click.echo(
+                        f"[TOOL_USE] {evt['name']}  id={evt['id'][:18]}  "
+                        f"input={inp_preview}"
+                    )
+                elif t == "tool_result":
+                    res = evt.get("result")
+                    if not isinstance(res, str):
+                        res = json.dumps(res, ensure_ascii=False)
+                    if not full_result and len(res) > 400:
+                        res = res[:400] + f"… (+{len(res) - 400} chars)"
+                    marker = "ERR" if evt.get("is_error") else "OK "
+                    click.echo(
+                        f"[TOOL_RES {marker}] id={evt['id'][:18]}\n"
+                        + textwrap.indent(res, "    ")
+                    )
+                elif t == "turn_end":
+                    if text_buf:
+                        click.echo("[TEXT] " + "".join(text_buf).strip())
+                        text_buf = []
+                    silent = evt["text_len"] == 0 and evt["tool_count"] == 0
+                    marker = "  SILENT TURN ← no text, no tool" if silent else ""
+                    click.echo(
+                        f"[TURN_END] #{evt['turn']}  stop={evt['stop_reason']}  "
+                        f"text={evt['text_len']}  tools={evt['tool_count']}{marker}"
+                    )
+            if text_buf:
+                click.echo("[TEXT] " + "".join(text_buf).strip())
+            click.echo("=" * 72)
+            click.echo(
+                f"SUMMARY  text_chars={text_chars}  tool_calls={tool_calls}"
+            )
+            if text_chars == 0 and tool_calls == 0:
+                click.echo(
+                    "⚠  Model produced no text and no tool calls — likely "
+                    "prompt-compliance or model-quality issue."
+                )
+            elif text_chars == 0:
+                click.echo(
+                    "⚠  Model produced no text — called tools but never spoke "
+                    "(no mailbox_send / no user-facing reply)."
+                )
+        finally:
+            await conn.close()
+
+    asyncio.run(_run())
+
+
+@cli.command("tail")
+@click.option(
+    "--persona", default=None, help="只跟 persona 名匹配的 wakeup"
+)
+@click.option(
+    "--active-only/--include-completed",
+    default=True,
+    help="--active-only：只在有正在跑的 wakeup 时才接；否则后退到最近一次结束的（默认 --active-only）",
+)
+@click.option(
+    "--poll", default=0.5, type=float, help="文件轮询间隔（秒）"
+)
+@click.option(
+    "--system/--no-system",
+    default=False,
+    help="也打 system prompt（默认不打，跑起来太长）",
+)
+@click.option(
+    "--follow/--no-follow",
+    default=True,
+    help="end_status 写入后是否继续监听后续 wakeup（默认 follow）",
+)
+@click.option(
+    "--json", "as_json", is_flag=True,
+    help="Emit raw transcript JSONL (every event as one JSON line) instead "
+         "of the pretty-printed form. Pipe to jq for filtering.",
+)
+def tail_cmd(
+    persona: str | None,
+    active_only: bool,
+    poll: float,
+    system: bool,
+    follow: bool,
+    as_json: bool,
+) -> None:
+    """Live monitor: follow agent transcript events as they're written.
+
+    类似 `tail -F` 但是是结构化输出。看到 tool_use/tool_result/turn_end 都会实时
+    打出来，每个 turn 末尾会标 SILENT TURN（如果模型没说话也没派活）。
+    Ctrl-C 退出。
+    """
+    import textwrap
+    import time as _time
+    from pathlib import Path as _P
+
+    async def _find_target(conn) -> tuple[str, str, bool] | None:
+        """Return (wakeup_id, transcript_path, is_active) or None."""
+        clauses = []
+        params: list = []
+        if active_only:
+            clauses.append("ended_at IS NULL")
+        if persona:
+            clauses.append("persona_name = ?")
+            params.append(persona)
+        where = "WHERE " + " AND ".join(clauses) if clauses else ""
+        sql = (
+            f"SELECT id, transcript_uri, ended_at FROM wakeups {where} "
+            "ORDER BY started_at DESC LIMIT 1"
+        )
+        async with conn.execute(sql, tuple(params)) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            if active_only:
+                # fall back: report no-active
+                clauses2 = ["persona_name = ?"] if persona else []
+                params2 = [persona] if persona else []
+                where2 = "WHERE " + " AND ".join(clauses2) if clauses2 else ""
+                sql2 = (
+                    f"SELECT id, transcript_uri, ended_at FROM wakeups "
+                    f"{where2} ORDER BY started_at DESC LIMIT 1"
+                )
+                async with conn.execute(sql2, tuple(params2)) as cur:
+                    row = await cur.fetchone()
+                if row is None:
+                    return None
+            else:
+                return None
+        uri = row["transcript_uri"] or ""
+        path = uri.removeprefix("file://")
+        is_active = row["ended_at"] is None
+        return row["id"], path, is_active
+
+    def _render(evt: dict) -> str | None:
+        t = evt.get("type")
+        ts = _time.strftime("%H:%M:%S", _time.localtime(evt.get("ts", 0) / 1000))
+        if t == "system":
+            if not system:
+                return f"[{ts}] [SYSTEM] tools={evt['tool_names']}"
+            return (
+                f"[{ts}] [SYSTEM]\n"
+                + textwrap.indent(evt["system_prompt"], "  | ")
+                + f"\n  tools={evt['tool_names']}"
+            )
+        if t == "note":
+            return f"[{ts}] [NOTE] {evt['text']}"
+        if t == "content_delta":
+            return f"[{ts}] [TEXT] {evt['text'].rstrip()}"
+        if t == "tool_use":
+            inp = json.dumps(evt["input"], ensure_ascii=False)
+            if len(inp) > 200:
+                inp = inp[:200] + "…"
+            return f"[{ts}] [TOOL_USE] {evt['name']}  input={inp}"
+        if t == "tool_result":
+            res = evt.get("result")
+            if not isinstance(res, str):
+                res = json.dumps(res, ensure_ascii=False)
+            if len(res) > 400:
+                res = res[:400] + f"… (+{len(res) - 400} chars)"
+            tag = "ERR" if evt.get("is_error") else "OK "
+            return f"[{ts}] [TOOL_RES {tag}]\n" + textwrap.indent(res, "  | ")
+        if t == "turn_end":
+            silent = evt["text_len"] == 0 and evt["tool_count"] == 0
+            warn = "  ⚠ SILENT TURN" if silent else ""
+            return (
+                f"[{ts}] [TURN_END #{evt['turn']}] stop={evt['stop_reason']}  "
+                f"text={evt['text_len']}  tools={evt['tool_count']}{warn}"
+            )
+        return None
+
+    async def _run() -> None:
+        cfg = Config.from_env()
+        conn = await init_db(cfg.db_path)
+        try:
+            current_id: str | None = None
+            offset = 0
+            buffer = ""
+            click.echo(
+                "lyre tail — Ctrl-C to stop. "
+                f"persona={persona or 'any'} active_only={active_only}"
+            )
+            while True:
+                target = await _find_target(conn)
+                if target is None:
+                    click.echo("(no matching wakeup yet, waiting…)", err=True)
+                    await asyncio.sleep(poll * 4)
+                    continue
+                wid, path, is_active = target
+                if wid != current_id:
+                    if current_id is not None:
+                        click.echo(
+                            f"\n--- switched to new wakeup {wid[:18]} "
+                            f"(active={is_active}) ---\n"
+                        )
+                    else:
+                        click.echo(
+                            f"--- following wakeup {wid[:18]} "
+                            f"(active={is_active}) ---"
+                        )
+                    current_id = wid
+                    offset = 0
+                    buffer = ""
+                p = _P(path)
+                if p.exists():
+                    size = p.stat().st_size
+                    if size > offset:
+                        chunk = await asyncio.to_thread(
+                            _read_slice, p, offset, size
+                        )
+                        offset = size
+                        buffer += chunk
+                        while "\n" in buffer:
+                            line, buffer = buffer.split("\n", 1)
+                            line = line.strip()
+                            if not line:
+                                continue
+                            if as_json:
+                                # Verbatim pass-through. Operator can
+                                # jq it / save / replay. We still validate
+                                # JSON parses to skip corrupted lines.
+                                try:
+                                    json.loads(line)
+                                except json.JSONDecodeError:
+                                    continue
+                                click.echo(line)
+                                continue
+                            try:
+                                evt = json.loads(line)
+                            except json.JSONDecodeError:
+                                continue
+                            rendered = _render(evt)
+                            if rendered:
+                                click.echo(rendered)
+                if not is_active and not follow:
+                    click.echo("--- wakeup ended, --no-follow specified, exiting ---")
+                    break
+                await asyncio.sleep(poll)
+        finally:
+            await conn.close()
+
+    try:
+        asyncio.run(_run())
+    except KeyboardInterrupt:
+        click.echo("\n(stopped)", err=True)
+
+
+def _read_slice(path, start: int, end: int) -> str:
+    """Read [start, end) bytes of path; for tail file polling."""
+    with path.open("rb") as fp:
+        fp.seek(start)
+        return fp.read(end - start).decode("utf-8", errors="replace")
+
+
+# ----------------------------------------------------------------------
+# lyre agent — create / list / archive
+# ----------------------------------------------------------------------
+
+
+@cli.group("agent")
+def agent_group() -> None:
+    """Manage agent instances (each is one running entity of a persona)."""
+
+
+@agent_group.command("create")
+@click.argument("persona")
+@click.option("--name", default=None, help="Optional agent id; auto-generated as <persona>-<n> if omitted.")
+@click.option("--model", default=None, help="Optional model_id override (see `lyre model list`).")
+@click.option("--description", default=None, help="Optional purpose note.")
+def agent_create_cmd(
+    persona: str, name: str | None, model: str | None, description: str | None
+) -> None:
+    """Register a new agent instance of an existing persona."""
+
+    async def _run() -> None:
+        cfg = Config.from_env()
+        conn = await init_db(cfg.db_path)
+        try:
+            repos = SqliteRepositories(conn)
+            p = await repos.personas.get(persona)
+            if p is None or p.status != "approved":
+                click.echo(
+                    f"persona {persona!r} not found or not approved", err=True
+                )
+                sys.exit(1)
+
+            if name is None:
+                from .runtime.tools.introspect import _next_auto_name  # type: ignore[attr-defined]
+
+                class _Stub:
+                    repos = None
+                _stub = _Stub()
+                _stub.repos = repos  # type: ignore[assignment]
+                agent_id = await _next_auto_name(_stub, persona)  # type: ignore[arg-type]
+            else:
+                agent_id = name
+
+            metadata: dict = {}
+            if description:
+                metadata["description"] = description
+            if model:
+                metadata["model_id"] = model
+
+            await repos.agents.create(
+                agent_id=agent_id,
+                persona_name=persona,
+                created_by="owner",
+                metadata=metadata or None,
+            )
+            click.echo(f"created agent {agent_id} (persona={persona})")
+        finally:
+            await conn.close()
+
+    asyncio.run(_run())
+
+
+@agent_group.command("list")
+@click.option("--all", "include_archived", is_flag=True, help="Include archived agents.")
+def agent_list_cmd(include_archived: bool) -> None:
+    """List agents."""
+
+    async def _run() -> None:
+        cfg = Config.from_env()
+        conn = await init_db(cfg.db_path)
+        try:
+            repos = SqliteRepositories(conn)
+            agents = await repos.agents.list_all(include_archived=include_archived)
+            if not agents:
+                click.echo("(no agents)")
+                return
+            for a in agents:
+                model = a.model_id or "(persona default)"
+                desc = f"  — {a.description}" if a.description else ""
+                click.echo(
+                    f"{a.id:30s} persona={a.persona_name:20s} "
+                    f"status={a.status:8s} model={model}{desc}"
+                )
+        finally:
+            await conn.close()
+
+    asyncio.run(_run())
+
+
+@agent_group.command("archive")
+@click.argument("agent_id")
+def agent_archive_cmd(agent_id: str) -> None:
+    """Soft-archive an agent. In-flight tasks finish."""
+
+    async def _run() -> None:
+        cfg = Config.from_env()
+        conn = await init_db(cfg.db_path)
+        try:
+            repos = SqliteRepositories(conn)
+            if agent_id in ("owner", "leader"):
+                click.echo(
+                    f"refusing to archive bootstrap agent {agent_id!r}",
+                    err=True,
+                )
+                sys.exit(1)
+            ok = await repos.agents.archive(agent_id)
+            if not ok:
+                click.echo(f"no active agent {agent_id!r} to archive", err=True)
+                sys.exit(1)
+            click.echo(f"archived {agent_id}")
+        finally:
+            await conn.close()
+
+    asyncio.run(_run())
+
+
+# ----------------------------------------------------------------------
+# lyre model list
+# ----------------------------------------------------------------------
+
+
+@cli.group("model")
+def model_group() -> None:
+    """Inspect the model registry."""
+
+
+@model_group.command("list")
+def model_list_cmd() -> None:
+    """Show every model + auth/health status."""
+
+    from .runtime.model_registry import default_registry_path, load_registry
+
+    registry = load_registry(default_registry_path())
+    click.echo(
+        f"{'ID':40s} {'TIER':10s} {'PROVIDER':12s} {'AUTH':6s} {'CAPS'}"
+    )
+    for e in registry.entries:
+        auth = "✓" if os.environ.get(e.endpoint.auth_env) else "✗"
+        click.echo(
+            f"{e.id:40s} {e.tier:10s} {e.provider:12s} {auth:6s} "
+            f"{','.join(e.capabilities)}"
+        )
+
+
+# ----------------------------------------------------------------------
+# `lyre wakeups list` / `lyre tasks list` — debug entry points
+# ----------------------------------------------------------------------
+
+_SINCE_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+
+
+def _parse_since_to_iso(since: str | None) -> str | None:
+    """Parse `1h` / `30m` / `2d` / `1w` into an ISO-8601 UTC cutoff.
+    Returns None if `since` is None. Raises click.BadParameter on bad input.
+    """
+    if not since:
+        return None
+    import re
+    from datetime import datetime, timedelta, timezone
+
+    m = re.match(r"^(\d+)([smhdw])$", since.strip())
+    if not m:
+        raise click.BadParameter(
+            f"--since {since!r}: expected like '1h' / '30m' / '2d' / '1w'"
+        )
+    n = int(m.group(1))
+    unit = m.group(2)
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=n * _SINCE_UNITS[unit])
+    return cutoff.strftime("%Y-%m-%dT%H:%M:%S.%fZ")[:-4] + "Z"
+
+
+def _fmt_tokens_short(n: int | None) -> str:
+    """12345 → 12.3K, 1234567 → 1.2M (CLI table-friendly)."""
+    if not n:
+        return "0"
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}K"
+    return str(n)
+
+
+def _fmt_ts_short(ts: str | None) -> str:
+    """ISO ts → 'YYYY-MM-DD HH:MM:SS' (drop sub-second + Z for CLI table)."""
+    if not ts:
+        return "-"
+    return ts[:19].replace("T", " ")
+
+
+@cli.group("wakeups")
+def wakeups_group() -> None:
+    """Inspect wakeups."""
+
+
+@wakeups_group.command("list")
+@click.option("--limit", default=20, type=int, show_default=True)
+@click.option("--persona", default=None, help="Filter by persona_name.")
+@click.option(
+    "--status", default=None,
+    help="Filter by end_status (completed / failed / silent_close / "
+         "needs_continuation / etc.).",
+)
+@click.option(
+    "--since", default=None,
+    help="Recency window: '1h' / '30m' / '2d' / '1w'. Omit for "
+         "no time filter (just the most recent N by --limit).",
+)
+@click.option(
+    "--has-compaction", is_flag=True,
+    help="Only wakeups that auto-compacted at least once.",
+)
+@click.option(
+    "--json", "as_json", is_flag=True,
+    help="Emit JSON Lines (one object per wakeup) for piping to jq.",
+)
+def wakeups_list_cmd(
+    limit: int,
+    persona: str | None,
+    status: str | None,
+    since: str | None,
+    has_compaction: bool,
+    as_json: bool,
+) -> None:
+    """List recent wakeups with status / tokens / context-usage / compactions.
+
+    Examples:
+        lyre wakeups list                                  # last 20
+        lyre wakeups list --since 1h --status silent_close
+        lyre wakeups list --persona leader --json | jq '.id'
+    """
+    from .runtime.model_registry import default_registry_path, load_registry
+
+    cutoff = _parse_since_to_iso(since)
+
+    async def _run() -> None:
+        cfg = Config.from_env()
+        # context_window per model — for ctx_peak_pct column.
+        try:
+            registry = load_registry(default_registry_path())
+            ctx_windows = {
+                e.id: e.context_window for e in registry.entries if e.context_window
+            }
+        except Exception:  # noqa: BLE001 — debug command must be tolerant
+            ctx_windows = {}
+
+        clauses: list[str] = []
+        params: list = []
+        if persona:
+            clauses.append("persona_name = ?")
+            params.append(persona)
+        if status:
+            clauses.append("end_status = ?")
+            params.append(status)
+        if cutoff:
+            clauses.append("started_at >= ?")
+            params.append(cutoff)
+        if has_compaction:
+            clauses.append("compaction_count > 0")
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        sql = (
+            f"SELECT id, persona_name, agent_id, task_id, started_at, "
+            f"ended_at, end_status, token_input, token_output, "
+            f"wall_clock_ms, tool_call_count, model, "
+            f"context_peak_tokens, compaction_count "
+            f"FROM wakeups {where} "
+            f"ORDER BY started_at DESC LIMIT ?"
+        )
+        params.append(limit)
+        conn = await init_db(cfg.db_path)
+        try:
+            async with conn.execute(sql, tuple(params)) as cur:
+                rows = await cur.fetchall()
+        finally:
+            await conn.close()
+
+        if as_json:
+            for r in rows:
+                d = dict(r)
+                window = ctx_windows.get(d.get("model"))
+                peak = d.get("context_peak_tokens") or 0
+                d["context_window"] = window
+                d["context_peak_pct"] = (
+                    round(peak / window * 100, 1) if (peak and window) else None
+                )
+                click.echo(json.dumps(d, default=str))
+            return
+
+        if not rows:
+            click.echo("(no wakeups match)")
+            return
+
+        click.echo(
+            f"{'ID':10s} {'PERSONA':18s} {'STARTED':19s} {'WALL':>7s} "
+            f"{'IN':>7s} {'OUT':>7s} {'CTX%':>5s} {'CMPCT':>5s} "
+            f"{'TOOLS':>5s} {'STATUS':12s} MODEL"
+        )
+        for r in rows:
+            wall = r["wall_clock_ms"]
+            wall_s = f"{wall / 1000:.1f}s" if wall else "-"
+            peak = r["context_peak_tokens"] or 0
+            window = ctx_windows.get(r["model"])
+            ctx_pct = (
+                f"{peak / window * 100:.0f}%"
+                if (peak and window) else "-"
+            )
+            click.echo(
+                f"{(r['id'] or '')[:10]:10s} "
+                f"{(r['persona_name'] or '')[:18]:18s} "
+                f"{_fmt_ts_short(r['started_at']):19s} "
+                f"{wall_s:>7s} "
+                f"{_fmt_tokens_short(r['token_input']):>7s} "
+                f"{_fmt_tokens_short(r['token_output']):>7s} "
+                f"{ctx_pct:>5s} "
+                f"{r['compaction_count'] or 0:>5d} "
+                f"{r['tool_call_count'] or 0:>5d} "
+                f"{(r['end_status'] or '-')[:12]:12s} "
+                f"{r['model'] or '-'}"
+            )
+
+    asyncio.run(_run())
+
+
+@cli.group("tasks")
+def tasks_group() -> None:
+    """Inspect tasks."""
+
+
+@tasks_group.command("list")
+@click.option("--limit", default=20, type=int, show_default=True)
+@click.option("--persona", default=None, help="Filter by persona_name.")
+@click.option(
+    "--agent", "agent_id", default=None,
+    help="Filter by agent_id (post-A3).",
+)
+@click.option(
+    "--status", default=None,
+    help="Filter by task status "
+         "(pending / in_progress / needs_input / completed / failed / cancelled).",
+)
+@click.option(
+    "--since", default=None,
+    help="Recency window: '1h' / '30m' / '2d' / '1w'.",
+)
+@click.option(
+    "--json", "as_json", is_flag=True,
+    help="Emit JSON Lines for piping to jq.",
+)
+def tasks_list_cmd(
+    limit: int,
+    persona: str | None,
+    agent_id: str | None,
+    status: str | None,
+    since: str | None,
+    as_json: bool,
+) -> None:
+    """List recent tasks with status + goal preview.
+
+    Examples:
+        lyre tasks list --since 1h
+        lyre tasks list --status in_progress --json | jq '.id'
+    """
+    cutoff = _parse_since_to_iso(since)
+
+    async def _run() -> None:
+        cfg = Config.from_env()
+        clauses: list[str] = []
+        params: list = []
+        if persona:
+            clauses.append("persona_name = ?")
+            params.append(persona)
+        if agent_id:
+            clauses.append("agent_id = ?")
+            params.append(agent_id)
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        if cutoff:
+            clauses.append("updated_at >= ?")
+            params.append(cutoff)
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        sql = (
+            f"SELECT id, persona_name, agent_id, status, updated_at, "
+            f"goal, parent_task_id "
+            f"FROM tasks {where} "
+            f"ORDER BY updated_at DESC LIMIT ?"
+        )
+        params.append(limit)
+        conn = await init_db(cfg.db_path)
+        try:
+            async with conn.execute(sql, tuple(params)) as cur:
+                rows = await cur.fetchall()
+        finally:
+            await conn.close()
+
+        if as_json:
+            for r in rows:
+                click.echo(json.dumps(dict(r), default=str))
+            return
+
+        if not rows:
+            click.echo("(no tasks match)")
+            return
+
+        click.echo(
+            f"{'ID':10s} {'PERSONA':18s} {'AGENT':18s} {'STATUS':14s} "
+            f"{'UPDATED':19s} GOAL"
+        )
+        for r in rows:
+            goal = (r["goal"] or "").replace("\n", " ")[:80]
+            click.echo(
+                f"{(r['id'] or '')[:10]:10s} "
+                f"{(r['persona_name'] or '')[:18]:18s} "
+                f"{(r['agent_id'] or '-')[:18]:18s} "
+                f"{(r['status'] or '-')[:14]:14s} "
+                f"{_fmt_ts_short(r['updated_at']):19s} "
+                f"{goal}"
+            )
+
+    asyncio.run(_run())
+
+
+@cli.group("mail")
+def mail_group() -> None:
+    """Manage scheduled (future / recurring) mail."""
+
+
+@mail_group.command("list-scheduled")
+@click.option("--recipient", default=None, help="Filter by recipient agent.")
+@click.option("--sender", default=None, help="Filter by sender.")
+@click.option(
+    "--status",
+    type=click.Choice(["pending", "completed", "cancelled", "bounced", "all"]),
+    default="pending",
+)
+@click.option("--limit", default=50, type=int)
+def mail_list_scheduled_cmd(
+    recipient: str | None, sender: str | None, status: str, limit: int
+) -> None:
+    """List scheduled mail entries."""
+
+    async def _run() -> None:
+        cfg = Config.from_env()
+        conn = await init_db(cfg.db_path)
+        try:
+            repos = SqliteRepositories(conn)
+            rows = await repos.scheduled_mail.list_filtered(
+                recipient=recipient, sender=sender, status=status, limit=limit
+            )
+            if not rows:
+                click.echo("(no scheduled mail matching filters)")
+                return
+            click.echo(
+                f"{'ID':>5} {'STATUS':10s} {'NEXT FIRE':22s} {'RECIPIENT':20s} "
+                f"{'RECUR':14s} OCC  PREVIEW"
+            )
+            for r in rows:
+                recur = ""
+                if r.recur_kind == "interval":
+                    recur = f"every {r.recur_value}"
+                elif r.recur_kind == "cron":
+                    recur = f"cron {r.recur_value}"[:14]
+                preview = (r.body or "").replace("\n", " ")[:50]
+                click.echo(
+                    f"{r.id!s:>5} {r.status:10s} "
+                    f"{str(r.scheduled_for)[:22]:22s} "
+                    f"{r.recipient:20s} {recur:14s} "
+                    f"{r.occurrence_count!s:3s}  {preview}"
+                )
+        finally:
+            await conn.close()
+
+    asyncio.run(_run())
+
+
+@mail_group.command("cancel")
+@click.argument("mail_id", type=int)
+@click.option("--reason", default=None)
+def mail_cancel_cmd(mail_id: int, reason: str | None) -> None:
+    """Cancel a pending scheduled mail (stops recurrence for recurring ones)."""
+
+    async def _run() -> None:
+        cfg = Config.from_env()
+        conn = await init_db(cfg.db_path)
+        try:
+            repos = SqliteRepositories(conn)
+            existing = await repos.scheduled_mail.get(mail_id)
+            if existing is None:
+                click.echo(f"scheduled_mail id={mail_id} not found", err=True)
+                sys.exit(1)
+            if existing.status != "pending":
+                click.echo(
+                    f"scheduled_mail id={mail_id} is already {existing.status}",
+                    err=True,
+                )
+                sys.exit(1)
+            ok = await repos.scheduled_mail.mark_cancelled(
+                mail_id=mail_id, cancelled_by="owner", reason=reason
+            )
+            if not ok:
+                click.echo("(cancel raced; nothing changed)", err=True)
+                sys.exit(1)
+            click.echo(f"cancelled scheduled_mail {mail_id}")
+        finally:
+            await conn.close()
+
+    asyncio.run(_run())
+
+
+if __name__ == "__main__":
+    cli()

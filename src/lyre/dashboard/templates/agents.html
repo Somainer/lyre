@@ -1,0 +1,71 @@
+{% extends "base.html" %}
+{% block content %}
+<h2>Agents</h2>
+
+<p class="hint">
+  Each row is a running <em>instance</em> of a persona. Click an agent
+  to see its full activity (incl. transcript-level tool calls and
+  assistant text). The <a href="/activity">Activity</a> tab is the
+  cross-agent overview; this drill-down is where you troubleshoot a
+  specific agent.
+</p>
+
+{% if agents %}
+<table class="agent-table">
+  <thead>
+    <tr>
+      <th>ID</th>
+      <th>Persona</th>
+      <th>Status</th>
+      <th>Model</th>
+      <th>Description</th>
+      <th>Created</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for a in agents %}
+      {% set is_busy = a.id in busy_agents %}
+      <tr class="{{ 'busy' if is_busy else '' }}">
+        <td>
+          <a class="agent-link" href="/agents/{{ a.id }}">
+            <strong>{{ a.id }}</strong>
+            {% if is_busy %}
+              <span class="dot live" title="wakeup in flight"></span>
+            {% endif %}
+          </a>
+        </td>
+        <td>{{ a.persona_name }}</td>
+        <td>
+          {% if is_busy %}
+            <span class="status-tag busy">running</span>
+          {% else %}
+            <span class="status-tag idle">{{ a.status }}</span>
+          {% endif %}
+        </td>
+        <td class="dim">{{ a.model_id or "(persona default)" }}</td>
+        <td class="dim">{{ a.description or "" }}</td>
+        <td class="dim">
+          {{ a.created_at.isoformat()[:19] if a.created_at else "" }}
+        </td>
+      </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+  <p class="empty">No live agents. Use <code>lyre agent create &lt;persona&gt;</code> to spawn one.</p>
+{% endif %}
+
+{% if archived_agents %}
+  <details class="archived-fold">
+    <summary>Archived agents ({{ archived_agents|length }})</summary>
+    <ul class="archived-list">
+      {% for a in archived_agents %}
+        <li>
+          <a href="/agents/{{ a.id }}">{{ a.id }}</a>
+          <span class="dim">(persona={{ a.persona_name }})</span>
+        </li>
+      {% endfor %}
+    </ul>
+  </details>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same ref — avoids burning minutes on
+# branches that get pushed rapidly.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test + lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          # Pin uv across runs so CI is reproducible. Bump deliberately.
+          version: "0.5.x"
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install project (with dev extras)
+        run: uv sync --extra dev --frozen --no-progress
+
+      - name: Lint
+        run: uv run ruff check
+
+      - name: Tests
+        # No LLM provider keys are set, so adapter integration tests
+        # that hit real APIs are expected to be skipped or mocked.
+        # The repo's tests are designed to run fully offline.
+        run: uv run pytest -q
