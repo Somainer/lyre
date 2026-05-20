@@ -53,20 +53,36 @@
     <div class="field-block">
       <div class="row between" style="margin-bottom:0;">
         <label class="field-label">Recipient</label>
-        <span class="dim mono" style="font-size:var(--t-micro);">agent id</span>
+        <span class="dim mono" style="font-size:var(--t-micro);">persona<span style="color:var(--fg-4);">/</span>name</span>
       </div>
       <div class="recipient-row">
         <div class="recipient-fields">
-          <input class="rec-name" name="recipient" value="{{ preset_to }}" required
-                 placeholder="agent id (e.g. leader, worker-maintainer)"
-                 style="flex:1;"/>
+          <div class="rec-persona">
+            <select name="persona" id="rec-persona">
+              {% for p in personas %}
+                <option value="{{ p }}"{% if p == preset_persona %} selected{% endif %}>{{ p }}</option>
+              {% endfor %}
+            </select>
+          </div>
+          <span class="rec-slash">/</span>
+          <input class="rec-name" name="name" id="rec-name"
+                 placeholder="name (e.g. refactor-auth) — leave blank for bootstrap or unique"
+                 value="{{ preset_name or '' }}"/>
         </div>
         <div class="recipient-meta">
           <div class="rec-resolved">
             <span class="dim mono" style="font-size:var(--t-micro);">
-              {% if known_agents %}known: {{ known_agents|join(", ") }}{% else %}—{% endif %}
+              {% if known_agents %}
+                resolves against {{ known_agents|length }} live agent{{ "s" if known_agents|length != 1 else "" }}
+              {% else %}
+                no live agents yet
+              {% endif %}
             </span>
           </div>
+          <label class="rec-spawn-toggle">
+            <input type="checkbox" name="spawn_if_missing" value="1" checked/>
+            <span>Spawn if missing</span>
+          </label>
         </div>
       </div>
     </div>
@@ -107,7 +123,7 @@
     <div class="row between">
       <div class="dim" style="font-size:var(--t-micro);">
         <span class="kbd">⌘</span> <span class="kbd">↵</span> to send · equivalent CLI:
-        <code class="mono">uv run lyre send &lt;to&gt; "…" --urgency &lt;u&gt;</code>
+        <code class="mono">uv run lyre send &lt;persona&gt;[/&lt;name&gt;] "…" --urgency &lt;u&gt;</code>
       </div>
       <div class="row">
         <button type="submit" class="btn primary">{{ glyph("send", 12) }} Deliver</button>
@@ -124,5 +140,19 @@
       opt.classList.add('is-active');
     });
   });
+  // Bootstrap personas (owner, leader) take no name — disable the name field
+  // when the model can't grow extra instances. List comes from the data block.
+  (function () {
+    const BOOTSTRAP = new Set({{ bootstrap_personas | tojson }});
+    const sel = document.getElementById('rec-persona');
+    const nameInput = document.getElementById('rec-name');
+    function sync() {
+      const isBoot = BOOTSTRAP.has(sel.value);
+      nameInput.disabled = isBoot;
+      if (isBoot) nameInput.value = '';
+    }
+    sel.addEventListener('change', sync);
+    sync();
+  })();
 </script>
 {% endblock %}

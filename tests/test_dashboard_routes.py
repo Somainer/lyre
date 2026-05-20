@@ -607,6 +607,59 @@ def test_send_post_rejects_bad_urgency(
     assert "banner-err" in r.text or "banner error" in r.text
 
 
+def test_send_post_persona_name_auto_spawns_new_agent(
+    seeded_dashboard: tuple[TestClient, SqliteRepositories, dict],
+) -> None:
+    """POST with persona=worker-maintainer + name=<new> + spawn_if_missing
+    creates the agent on the fly (mirrors the design's `Spawn if missing`
+    toggle) and delivers the mail."""
+    client, repos, _ = seeded_dashboard
+    r = client.post(
+        "/send",
+        data={
+            "persona": "worker-maintainer",
+            "name": "refactor-auth",
+            "body": "kick off",
+            "urgency": "normal",
+            "sender": "owner",
+            "spawn_if_missing": "1",
+        },
+    )
+    assert r.status_code == 200
+    assert "banner success" in r.text
+
+    import asyncio
+    async def _check():
+        agent = await repos.agents.get("worker-maintainer/refactor-auth")
+        msgs = await repos.mailbox.read_messages("worker-maintainer/refactor-auth")
+        return agent, msgs
+    agent, msgs = asyncio.get_event_loop().run_until_complete(_check())
+    assert agent is not None
+    assert agent.parent_agent_id == "owner"
+    assert any(m.body == "kick off" for m in msgs)
+
+
+def test_send_post_persona_name_without_spawn_flag_errors(
+    seeded_dashboard: tuple[TestClient, SqliteRepositories, dict],
+) -> None:
+    """Unchecking `Spawn if missing` makes the form strict — unknown
+    persona/name combinations error instead of materializing an agent."""
+    client, *_ = seeded_dashboard
+    r = client.post(
+        "/send",
+        data={
+            "persona": "worker-maintainer",
+            "name": "never-existed",
+            "body": "x",
+            "urgency": "normal",
+            "sender": "owner",
+            # spawn_if_missing intentionally omitted (unchecked)
+        },
+    )
+    assert r.status_code == 400
+    assert "spawn disabled" in r.text.lower() or "unknown" in r.text.lower()
+
+
 # ---------------------------------------------------------------------------
 # Broadcaster pub-sub
 # ---------------------------------------------------------------------------
