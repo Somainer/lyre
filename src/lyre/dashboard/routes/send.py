@@ -28,19 +28,18 @@ router = APIRouter()
 
 def _personas_for_form() -> list[str]:
     """Persona choices shown in the dropdown. Bootstrap personas
-    (`owner`, `leader`) appear so the owner can send to them; the rest
+    (`owner`, `dispatcher`) appear so the owner can send to them; the rest
     cover the shipped persona set."""
     return [
         "owner",
-        "leader",
+        "dispatcher",
+        "analyst",
+        "reviewer",
         "worker-maintainer",
-        "reviewer-skill",
-        "reviewer-pr",
-        "summary-agent",
     ]
 
 
-_BOOTSTRAP = ("owner", "leader")
+_BOOTSTRAP = ("owner", "dispatcher")
 
 
 async def _ensure_agent(
@@ -111,9 +110,9 @@ async def _known_agent_ids(repos) -> list[str]:
 def _split_preset(preset_to: str) -> tuple[str, str | None]:
     """Initial values for the persona+name pair when the form is opened
     with ?to=<existing-agent-id>. Bootstrap stays bare; spawned splits
-    on /. Unknown shapes fall back to leader."""
+    on /. Unknown shapes fall back to dispatcher."""
     if not preset_to:
-        return "leader", None
+        return "dispatcher", None
     if is_bootstrap(preset_to):
         return preset_to, None
     persona, name = split_id(preset_to)
@@ -123,7 +122,7 @@ def _split_preset(preset_to: str) -> tuple[str, str | None]:
 @router.get("/send", response_class=HTMLResponse)
 async def send_form(
     request: Request,
-    to: str = "leader",
+    to: str = "dispatcher",
     reply_to: int | None = None,
 ) -> HTMLResponse:
     repos = request.app.state.repos
@@ -177,8 +176,8 @@ async def send_post(
             request, "send.html",
             {
                 "tab": "send",
-                "preset_to": recipient or compose_id(persona or "leader", name or ""),
-                "preset_persona": persona or "leader",
+                "preset_to": recipient or compose_id(persona or "dispatcher", name or ""),
+                "preset_persona": persona or "dispatcher",
                 "preset_name": name,
                 "reply_to": reply_to,
                 "error": msg,

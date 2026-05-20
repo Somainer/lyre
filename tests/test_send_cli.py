@@ -55,18 +55,18 @@ def _rows(db_path: Path, sql: str, *params) -> list[sqlite3.Row]:
 
 def test_send_writes_message_with_defaults(cli_env: tuple[CliRunner, Path]) -> None:
     runner, db_path = cli_env
-    result = runner.invoke(cli, ["send", "leader", "hello leader"])
+    result = runner.invoke(cli, ["send", "dispatcher", "hello dispatcher"])
     assert result.exit_code == 0, result.output
     assert "sent" in result.output
     assert "normal" in result.output
-    assert "owner → leader" in result.output
+    assert "owner → dispatcher" in result.output
 
     rows = _rows(
         db_path,
-        "SELECT * FROM mailbox_messages WHERE recipient='leader'",
+        "SELECT * FROM mailbox_messages WHERE recipient='dispatcher'",
     )
     assert len(rows) == 1
-    assert rows[0]["body"] == "hello leader"
+    assert rows[0]["body"] == "hello dispatcher"
     assert rows[0]["urgency"] == "normal"
     assert rows[0]["sender"] == "owner"
 
@@ -83,7 +83,7 @@ def test_send_with_urgency_and_sender(cli_env: tuple[CliRunner, Path]) -> None:
         cli,
         [
             "send", "worker-1", "STOP, recheck constraints",
-            "--urgency", "blocker", "--from", "leader",
+            "--urgency", "blocker", "--from", "dispatcher",
         ],
     )
     assert result.exit_code == 0, result.output
@@ -94,14 +94,14 @@ def test_send_with_urgency_and_sender(cli_env: tuple[CliRunner, Path]) -> None:
         "worker-1",
     )
     assert len(rows) == 1
-    assert rows[0]["sender"] == "leader"
+    assert rows[0]["sender"] == "dispatcher"
     assert "STOP" in rows[0]["body"]
 
 
 def test_send_rejects_unknown_agent(cli_env: tuple[CliRunner, Path]) -> None:
     """Mail to an agent id that doesn't exist must error cleanly, not
     silently create a phantom mailbox (matches the in-tool validation
-    that closes the 'leader-scheduler' hallucination bug)."""
+    that closes the 'dispatcher-scheduler' hallucination bug)."""
     runner, _ = cli_env
     result = runner.invoke(cli, ["send", "ghost-agent", "hi"])
     assert result.exit_code != 0
@@ -110,7 +110,7 @@ def test_send_rejects_unknown_agent(cli_env: tuple[CliRunner, Path]) -> None:
 
 def test_send_rejects_invalid_urgency(cli_env: tuple[CliRunner, Path]) -> None:
     runner, _ = cli_env
-    result = runner.invoke(cli, ["send", "leader", "x", "--urgency", "panic"])
+    result = runner.invoke(cli, ["send", "dispatcher", "x", "--urgency", "panic"])
     assert result.exit_code != 0
     assert "panic" in result.output.lower() or "invalid" in result.output.lower()
 
@@ -123,20 +123,20 @@ def test_send_attaches_task_id(cli_env: tuple[CliRunner, Path]) -> None:
     try:
         conn.execute(
             "INSERT INTO tasks (id, persona_name, goal, acceptance, status) "
-            "VALUES ('task-fk-1', 'leader', 'g', 'a', 'pending')"
+            "VALUES ('task-fk-1', 'dispatcher', 'g', 'a', 'pending')"
         )
         conn.commit()
     finally:
         conn.close()
 
     result = runner.invoke(
-        cli, ["send", "leader", "fyi", "--task-id", "task-fk-1"],
+        cli, ["send", "dispatcher", "fyi", "--task-id", "task-fk-1"],
     )
     assert result.exit_code == 0, result.output
 
     rows = _rows(
         db_path,
-        "SELECT task_id FROM mailbox_messages WHERE recipient='leader'",
+        "SELECT task_id FROM mailbox_messages WHERE recipient='dispatcher'",
     )
     assert any(r["task_id"] == "task-fk-1" for r in rows)
 
@@ -148,10 +148,10 @@ def test_send_external_id_is_unique_per_invocation(
     uuid-based external_ids); we deliberately do not dedupe at the CLI layer
     since the caller is a human typing the same thing on purpose."""
     runner, db_path = cli_env
-    runner.invoke(cli, ["send", "leader", "ping"])
-    runner.invoke(cli, ["send", "leader", "ping"])
+    runner.invoke(cli, ["send", "dispatcher", "ping"])
+    runner.invoke(cli, ["send", "dispatcher", "ping"])
     rows = _rows(
-        db_path, "SELECT external_id FROM mailbox_messages WHERE recipient='leader'"
+        db_path, "SELECT external_id FROM mailbox_messages WHERE recipient='dispatcher'"
     )
     assert len(rows) == 2
     assert rows[0]["external_id"] != rows[1]["external_id"]

@@ -76,12 +76,12 @@
 {%- endmacro %}
 
 {# ---- Agent id pill — persona/name w/ dim slash ----------------------- #}
-{# Bootstrap ids (owner, leader) render bare; agents with persona/name
+{# Bootstrap ids (owner, dispatcher) render bare; agents with persona/name
    format render two segments with a dim slash. Long names get max-width
    ellipsis via CSS. #}
 {% macro agent_id_pill(agent_id, dim=False, size="md", show_persona=True) -%}
   {%- if not agent_id -%}{%- set agent_id = "" -%}{%- endif -%}
-  {%- set is_boot = agent_id in ("owner", "leader") -%}
+  {%- set is_boot = agent_id in ("owner", "dispatcher") -%}
   {%- if "/" in agent_id -%}
     {%- set parts = agent_id.split("/", 1) -%}
     {%- set persona = parts[0] -%}

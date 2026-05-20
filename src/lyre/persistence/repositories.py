@@ -123,7 +123,7 @@ class TaskRepository(Protocol):
         """Filter tasks by persona and/or status, newest first.
 
         Distinct from find_recent which only takes status. Used by the
-        list_tasks introspection tool so leader can see who's busy.
+        list_tasks introspection tool so dispatcher can see who's busy.
         """
         ...
     async def count_in_progress(self) -> int: ...

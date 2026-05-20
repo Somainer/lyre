@@ -29,11 +29,13 @@ from lyre.runtime.identity import (
     "agent_id",
     [
         "owner",
-        "leader",
+        "dispatcher",
+        "analyst-1",
+        "reviewer-1",
         "worker-maintainer",
         "worker-maintainer/refactor-auth",
-        "reviewer-pr/pr-142",
-        "summary-agent/digest",
+        "reviewer/pr-142",
+        "analyst/research-x",
         "a",
         "a/1",
         "worker/1",  # numeric short name (auto-naming fallback)
@@ -89,10 +91,10 @@ def test_validate_agent_id_accepts_good_id() -> None:
     "agent_id,persona,name",
     [
         ("owner", "owner", None),
-        ("leader", "leader", None),
+        ("dispatcher", "dispatcher", None),
         ("worker", "worker", None),
         ("worker/scout", "worker", "scout"),
-        ("reviewer-pr/pr-142", "reviewer-pr", "pr-142"),
+        ("reviewer/pr-142", "reviewer", "pr-142"),
     ],
 )
 def test_split_id(agent_id: str, persona: str, name: str | None) -> None:
@@ -112,7 +114,11 @@ def test_compose_id_roundtrip() -> None:
 
 def test_bootstrap_ids_are_well_known() -> None:
     assert is_bootstrap("owner")
-    assert is_bootstrap("leader")
+    assert is_bootstrap("dispatcher")
+    # analyst & reviewer are NOT bootstrap personas — they can spawn for
+    # parallelism. Only the owner-facing singleton is locked.
+    assert not is_bootstrap("analyst")
+    assert not is_bootstrap("reviewer")
     assert not is_bootstrap("worker")
     assert not is_bootstrap("worker/scout")
 

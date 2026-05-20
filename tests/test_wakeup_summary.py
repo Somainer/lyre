@@ -77,8 +77,8 @@ async def test_summary_appended_to_notes_when_cheap_model_available(
 
     out = await summarize_and_append(
         wakeup_id="0190abcdef00",
-        agent_id="leader",
-        persona_name="leader",
+        agent_id="dispatcher",
+        persona_name="dispatcher",
         result=_result_with_mailbox_send(),
         memory_path=memory,
         router=router,
@@ -86,7 +86,7 @@ async def test_summary_appended_to_notes_when_cheap_model_available(
     )
 
     assert out is not None and "replied to owner" in out
-    notes = (memory / "facts" / "agent-leader-notes.md").read_text(
+    notes = (memory / "facts" / "agent-dispatcher-notes.md").read_text(
         encoding="utf-8"
     )
     assert SUMMARY_SECTION_HEADER in notes
@@ -117,8 +117,8 @@ async def test_summary_skipped_when_no_cheap_model_registered(
 
     out = await summarize_and_append(
         wakeup_id="0190deadbeef",
-        agent_id="leader",
-        persona_name="leader",
+        agent_id="dispatcher",
+        persona_name="dispatcher",
         result=_result_with_mailbox_send(),
         memory_path=memory,
         router=router,
@@ -127,7 +127,7 @@ async def test_summary_skipped_when_no_cheap_model_registered(
 
     assert out is None
     assert calls == []  # never invoked adapter
-    assert not (memory / "facts" / "agent-leader-notes.md").exists()
+    assert not (memory / "facts" / "agent-dispatcher-notes.md").exists()
 
 
 @pytest.mark.asyncio
@@ -138,15 +138,15 @@ async def test_summary_skipped_for_noop_wakeup(tmp_path: Path) -> None:
 
     out = await summarize_and_append(
         wakeup_id="0190noopnoop",
-        agent_id="leader",
-        persona_name="leader",
+        agent_id="dispatcher",
+        persona_name="dispatcher",
         result=_noop_result(),
         memory_path=memory,
         router=router,
         adapter_for_entry=lambda _e: adapter,
     )
     assert out is None
-    assert not (memory / "facts" / "agent-leader-notes.md").exists()
+    assert not (memory / "facts" / "agent-dispatcher-notes.md").exists()
 
 
 @pytest.mark.asyncio
@@ -169,15 +169,15 @@ async def test_summary_failure_is_swallowed(tmp_path: Path) -> None:
 
     out = await summarize_and_append(
         wakeup_id="0190boomboom",
-        agent_id="leader",
-        persona_name="leader",
+        agent_id="dispatcher",
+        persona_name="dispatcher",
         result=_result_with_mailbox_send(),
         memory_path=memory,
         router=router,
         adapter_for_entry=lambda _e: _BoomAdapter(),
     )
     assert out is None  # never raised
-    assert not (memory / "facts" / "agent-leader-notes.md").exists()
+    assert not (memory / "facts" / "agent-dispatcher-notes.md").exists()
 
 
 @pytest.mark.asyncio
@@ -186,7 +186,7 @@ async def test_summary_inserts_newest_first_in_existing_section(
 ) -> None:
     memory = tmp_path / "memory"
     (memory / "facts").mkdir(parents=True)
-    notes = memory / "facts" / "agent-leader-notes.md"
+    notes = memory / "facts" / "agent-dispatcher-notes.md"
     notes.write_text(
         "# Leader notes\n\nSome content.\n\n"
         f"{SUMMARY_SECTION_HEADER}\n"
@@ -197,8 +197,8 @@ async def test_summary_inserts_newest_first_in_existing_section(
     router, adapter = _router_with_cheap()
     out = await summarize_and_append(
         wakeup_id="0190newer000",
-        agent_id="leader",
-        persona_name="leader",
+        agent_id="dispatcher",
+        persona_name="dispatcher",
         result=_result_with_mailbox_send(),
         memory_path=memory,
         router=router,

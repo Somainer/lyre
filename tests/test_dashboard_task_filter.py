@@ -2,7 +2,7 @@
 
 Scheduler-injected auto-wake tasks (the "Check your inbox: …" boilerplate
 created when mail arrives for an idle agent) used to produce a `task
-<id> (leader) → completed` activity row right next to the wakeup_end row
+<id> (dispatcher) → completed` activity row right next to the wakeup_end row
 that already conveys the same info. The dashboard now suppresses these
 auto-wake task events so the operator sees one row per wakeup, not two.
 
@@ -21,8 +21,8 @@ from lyre.persistence.models import Task
 def _make_task(goal: str, status: str = "completed") -> Task:
     return Task(
         id="01957c9a-aaaa-bbbb-cccc-dddd00000001",
-        persona_name="leader",
-        agent_id="leader",
+        persona_name="dispatcher",
+        agent_id="dispatcher",
         status=status,
         goal=goal,
         acceptance="ok",
@@ -49,7 +49,7 @@ def test_auto_wake_task_events_are_suppressed() -> None:
 def test_dispatched_task_events_still_emit() -> None:
     """A real dispatched task (substantive goal) MUST still appear.
     Delegation is a meaningful audit signal — the operator wants to
-    see leader hand off work to a worker."""
+    see dispatcher hand off work to a worker."""
     events = _build_task_events([
         _make_task("Fix the typo in README.md per spec at /tmp/spec.md")
     ])

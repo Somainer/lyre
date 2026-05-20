@@ -6,7 +6,7 @@ agent to use specific tools — `mailbox_send`, `mailbox_read`,
 persona's `allowed_lyre_tools` is missing one, the model will follow the
 preamble's advice, call the tool, and hit ToolError "not in allowlist".
 
-That happened in the wild: leader's allowlist was missing
+That happened in the wild: dispatcher's allowlist was missing
 `mailbox_get_message`, and a real wakeup spent 11 minutes trying to read
 prior mail before silent-closing (see troubleshoot transcript
 019e40c5-6da5-…). This test codifies the invariant so the next gap is

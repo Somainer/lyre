@@ -140,7 +140,7 @@
       opt.classList.add('is-active');
     });
   });
-  // Bootstrap personas (owner, leader) take no name — disable the name field
+  // Bootstrap personas (owner, dispatcher) take no name — disable the name field
   // when the model can't grow extra instances. List comes from the data block.
   (function () {
     const BOOTSTRAP = new Set({{ bootstrap_personas | tojson }});

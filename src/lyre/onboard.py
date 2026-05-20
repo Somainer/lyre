@@ -175,6 +175,9 @@ def write_config_toml(
     owner_email: str | None,
     models: list[ModelSpec] | None = None,
     default_model: str | None = None,
+    dispatcher_id: str = "dispatcher",
+    analyst_id: str = "analyst-1",
+    reviewer_id: str = "reviewer-1",
 ) -> None:
     """Write ``~/.lyre/config.toml`` with the minimum fields onboard sets.
 
@@ -202,6 +205,22 @@ def write_config_toml(
     if default_model:
         lines.append("[runtime]")
         lines.append(f'default_model = "{_toml_escape(default_model)}"')
+        lines.append("")
+
+    # Owner-facing names for the three role agents (persona names — dispatcher
+    # / analyst / reviewer — stay fixed as they're system identifiers). Edit
+    # to taste; the names are what `lyre send <name>` and mailbox addressing
+    # use.
+    needs_bootstrap = (
+        dispatcher_id != "dispatcher"
+        or analyst_id != "analyst-1"
+        or reviewer_id != "reviewer-1"
+    )
+    if needs_bootstrap:
+        lines.append("[bootstrap]")
+        lines.append(f'dispatcher_id = "{_toml_escape(dispatcher_id)}"')
+        lines.append(f'analyst_id = "{_toml_escape(analyst_id)}"')
+        lines.append(f'reviewer_id = "{_toml_escape(reviewer_id)}"')
         lines.append("")
 
     for model in models or []:
@@ -278,7 +297,7 @@ def write_config_toml(
         "",
         "# Per-persona single-field overrides (whole-file override = edit",
         "# ~/.lyre/personas/<name>/identity.md directly instead):",
-        "#   [personas.leader]",
+        "#   [personas.dispatcher]",
         "#   model_preference = { prefer = [\"anthropic.claude-opus-4-7\"] }",
         "",
     ])
@@ -362,6 +381,16 @@ class OnboardPlan:
     default_model: str | None             # router fallback
     api_keys_in_env: list[str]            # env vars already present in shell
     api_keys_written_to_env_file: list[str]  # env vars pasted into ~/.lyre/.env
+    # Owner-facing names for the seeded bootstrap role agents. Defaults are
+    # the persona name itself ("dispatcher" etc.); owner can override here
+    # to give them personality ("luna" / "scribe" / "cassandra").
+    dispatcher_id: str = "dispatcher"
+    analyst_id: str = "analyst-1"
+    reviewer_id: str = "reviewer-1"
+    # If non-empty, written to ~/.lyre/personas/dispatcher/APPEND.md and
+    # injected at the bottom of dispatcher's system prompt every wakeup.
+    # This is where the owner gives the dispatcher its voice / style.
+    dispatcher_soul: str = ""
 
 
 async def bootstrap_runtime(cfg: Any) -> list[str]:  # noqa: ANN401 — Config
@@ -387,8 +416,15 @@ async def bootstrap_runtime(cfg: Any) -> list[str]:  # noqa: ANN401 — Config
         )
         ensure_skeleton(cfg.memory_path)
         ensure_shipped_facts(cfg.memory_path)
+        from .personas.seed import _resolved_default_agents
+        bootstrap_pairs = _resolved_default_agents(
+            dispatcher_id=cfg.bootstrap.dispatcher_id,
+            analyst_id=cfg.bootstrap.analyst_id,
+            reviewer_id=cfg.bootstrap.reviewer_id,
+        )
         created_agents = await seed_default_agents(
             repos.agents, memory_root=cfg.memory_path,
+            agents=bootstrap_pairs,
         )
         ensure_skills_skeleton(cfg.lyre_home)
         return created_agents
@@ -497,6 +533,47 @@ def run_wizard(*, lyre_home: Path) -> OnboardPlan:
         write_user_md_template(user_md_path)
         click.echo(f"  ✓ wrote {user_md_path}")
 
+    # ---- bootstrap agent names + soul ----
+    # The persona names (dispatcher / analyst / reviewer) are system
+    # identifiers — they stay. The AGENT ids are what the owner sees and
+    # addresses, so they're free to personalize: "luna" for the dispatcher,
+    # whatever. The soul question writes to APPEND.md, which the runtime
+    # injects at the bottom of the persona's system prompt every wakeup.
+    click.echo("")
+    click.echo(click.style("Bootstrap agents", bold=True))
+    click.echo(
+        "Lyre seeds three role agents. Persona roles are fixed (dispatcher /\n"
+        "analyst / reviewer) but the owner-facing AGENT names are yours to pick."
+    )
+    dispatcher_id = click.prompt(
+        "Dispatcher name (the agent you'll mostly talk to)",
+        default="dispatcher",
+    ).strip() or "dispatcher"
+    analyst_id = click.prompt(
+        "Analyst name (does research, writes specs)",
+        default="analyst-1",
+    ).strip() or "analyst-1"
+    reviewer_id = click.prompt(
+        "Reviewer name (reviews PRs and skill proposals)",
+        default="reviewer-1",
+    ).strip() or "reviewer-1"
+
+    click.echo("")
+    click.echo(
+        f"Optional: describe {dispatcher_id}'s voice / style / quirks. This goes"
+    )
+    click.echo(
+        "into ~/.lyre/personas/dispatcher/APPEND.md and is appended to its"
+    )
+    click.echo(
+        "system prompt every wakeup. Examples: 'Concise. British understatement.'"
+    )
+    click.echo("Press Enter to skip.")
+    dispatcher_soul = click.prompt(
+        f"{dispatcher_id}'s soul (one line)",
+        default="", show_default=False,
+    ).strip()
+
     # ---- config.toml ----
     if config_path.is_file():
         if not click.confirm(
@@ -511,6 +588,9 @@ def run_wizard(*, lyre_home: Path) -> OnboardPlan:
                 owner_email=owner_email,
                 models=models,
                 default_model=default_model,
+                dispatcher_id=dispatcher_id,
+                analyst_id=analyst_id,
+                reviewer_id=reviewer_id,
             )
             click.echo(f"  ✓ wrote {config_path}")
     else:
@@ -520,8 +600,28 @@ def run_wizard(*, lyre_home: Path) -> OnboardPlan:
             owner_email=owner_email,
             models=models,
             default_model=default_model,
+            dispatcher_id=dispatcher_id,
+            analyst_id=analyst_id,
+            reviewer_id=reviewer_id,
         )
         click.echo(f"  ✓ wrote {config_path}")
+
+    # Write dispatcher soul to APPEND.md if provided. We do this AFTER
+    # config.toml + skeleton dirs so the personas/ dir is guaranteed to exist.
+    if dispatcher_soul:
+        dispatcher_dir = user_personas_dir / "dispatcher"
+        dispatcher_dir.mkdir(parents=True, exist_ok=True)
+        append_path = dispatcher_dir / "APPEND.md"
+        # Preserve existing APPEND.md content if any — owner may have hand-
+        # crafted it across re-runs.
+        existing = append_path.read_text(encoding="utf-8") if append_path.exists() else ""
+        if dispatcher_soul not in existing:
+            sep = "\n" if existing and not existing.endswith("\n") else ""
+            append_path.write_text(
+                existing + sep + f"\n# Voice & style\n{dispatcher_soul}\n",
+                encoding="utf-8",
+            )
+            click.echo(f"  ✓ wrote {append_path}")
 
     # ---- skeleton dirs ----
     memory_path.mkdir(parents=True, exist_ok=True)
@@ -542,6 +642,10 @@ def run_wizard(*, lyre_home: Path) -> OnboardPlan:
         default_model=default_model,
         api_keys_in_env=api_keys_in_env,
         api_keys_written_to_env_file=api_keys_written,
+        dispatcher_id=dispatcher_id,
+        analyst_id=analyst_id,
+        reviewer_id=reviewer_id,
+        dispatcher_soul=dispatcher_soul,
     )
 
 

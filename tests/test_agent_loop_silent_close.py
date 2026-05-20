@@ -1,6 +1,6 @@
 """Silent-close fallback tests.
 
-Background: in production we saw a leader wakeup spend 11 minutes calling
+Background: in production we saw a dispatcher wakeup spend 11 minutes calling
 `mailbox_read` three times, never composing a reply, then exit
 status=completed — leaving the user staring at silence (transcript
 019e40c5-…). The AgentLoop now detects this pattern (nudge budget
@@ -179,7 +179,7 @@ async def test_reply_in_same_wakeup_skips_silent_close(silent_setup) -> None:
 def test_askers_helper_extracts_from_inbox_read() -> None:
     """The parser correctly pulls senders from a mailbox_read inbox listing."""
     result = (
-        '{"box": "inbox", "recipient": "leader", "auto_marked_read": true, '
+        '{"box": "inbox", "recipient": "dispatcher", "auto_marked_read": true, '
         '"messages": [{"id": 1, "sender": "owner", "title": "x"}, '
         '{"id": 2, "sender": "worker-1", "title": "y"}]}'
     )
@@ -189,7 +189,7 @@ def test_askers_helper_extracts_from_inbox_read() -> None:
 def test_askers_helper_ignores_sent_box() -> None:
     """A sent-box listing has the agent's OWN sends; those aren't askers."""
     result = (
-        '{"box": "sent", "sender": "leader", "auto_marked_read": false, '
+        '{"box": "sent", "sender": "dispatcher", "auto_marked_read": false, '
         '"messages": [{"id": 1, "recipient": "owner", "title": "x"}]}'
     )
     assert _askers_from_mailbox_read(result) == set()
@@ -199,7 +199,7 @@ def test_askers_helper_ignores_non_auto_marked() -> None:
     """If we didn't auto-mark, the model already knew about those messages
     from a prior wakeup; not necessarily 'this wakeup's' askers."""
     result = (
-        '{"box": "inbox", "recipient": "leader", "auto_marked_read": false, '
+        '{"box": "inbox", "recipient": "dispatcher", "auto_marked_read": false, '
         '"messages": [{"id": 1, "sender": "owner"}]}'
     )
     assert _askers_from_mailbox_read(result) == set()

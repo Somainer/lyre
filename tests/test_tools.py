@@ -19,9 +19,9 @@ async def ctx(repos: SqliteRepositories) -> ToolContext:
 
     After A3 mailbox/dispatch validation goes against the agents table,
     so we seed one agent per persona with id == persona name (matches the
-    bootstrap behaviour for owner/leader).
+    bootstrap behaviour for owner/dispatcher).
     """
-    for name in ("worker", "leader", "owner"):
+    for name in ("worker", "dispatcher", "owner"):
         await repos.personas.upsert(
             Persona(name=name, role_description=name, system_prompt=name)
         )
@@ -79,7 +79,7 @@ async def test_mailbox_send_rejects_unknown_recipient(ctx: ToolContext) -> None:
         await MAILBOX_SEND.handler(
             ctx,
             {
-                "to": "leader-scheduler",
+                "to": "dispatcher-scheduler",
                 "body": "x",
                 "_tool_use_id": "tu_hallucinated",
             },
@@ -112,13 +112,13 @@ async def test_mailbox_send_validates_args(ctx: ToolContext) -> None:
 async def test_mailbox_read_rejects_hallucinated_recipient(
     ctx: ToolContext,
 ) -> None:
-    """Regression: DeepSeek invented `recipient='leader-scheduler'`, and
+    """Regression: DeepSeek invented `recipient='dispatcher-scheduler'`, and
     because we auto-ensured the mailbox, it read 0 messages and silently
     ended the turn. The tool must error so the model is forced to recover
     instead of swallowing the bug."""
     with pytest.raises(ToolError, match="unknown recipient"):
         await MAILBOX_READ.handler(
-            ctx, {"recipient": "leader-scheduler"}
+            ctx, {"recipient": "dispatcher-scheduler"}
         )
 
 
@@ -131,8 +131,8 @@ async def test_mailbox_read_allows_self_and_owner(ctx: ToolContext) -> None:
     out_owner = await MAILBOX_READ.handler(ctx, {"recipient": "owner"})
     assert out_owner["recipient"] == "owner"
     # Known persona — fine
-    out_leader = await MAILBOX_READ.handler(ctx, {"recipient": "leader"})
-    assert out_leader["recipient"] == "leader"
+    out_dispatcher = await MAILBOX_READ.handler(ctx, {"recipient": "dispatcher"})
+    assert out_dispatcher["recipient"] == "dispatcher"
 
 
 @pytest.mark.asyncio
@@ -361,9 +361,9 @@ async def test_mailbox_read_box_sent_filters_by_recipient(
     )
     await ctx.repos.mailbox.insert_message(
         MailboxMessage(
-            recipient="leader", external_id="s-b",
+            recipient="dispatcher", external_id="s-b",
             sender=ctx.self_mailbox, urgency="normal",
-            title="to leader", body="b",
+            title="to dispatcher", body="b",
         )
     )
     out = await MAILBOX_READ.handler(
@@ -555,8 +555,8 @@ async def test_list_personas_returns_active_role_definitions(
 
     out = await LIST_PERSONAS.handler(ctx, {})
     names = {p["name"] for p in out["personas"]}
-    # fixture seeds worker, leader, owner
-    assert {"worker", "leader", "owner"} <= names
+    # fixture seeds worker, dispatcher, owner
+    assert {"worker", "dispatcher", "owner"} <= names
     assert out["count"] == len(out["personas"])
     # The note must make it explicit that personas ≠ live agents
     assert "agent" in out["note"].lower()
@@ -569,17 +569,17 @@ async def test_list_tasks_filters_by_persona_and_status(
     from lyre.runtime.tools.introspect import LIST_TASKS
 
     # ctx fixture already created one task for "worker" in_progress.
-    # Seed a second task for "leader", pending.
+    # Seed a second task for "dispatcher", pending.
     await ctx.repos.tasks.create(
-        TaskSpec(persona_name="leader", goal="lead", acceptance="ok")
+        TaskSpec(persona_name="dispatcher", goal="lead", acceptance="ok")
     )
 
     out_all = await LIST_TASKS.handler(ctx, {})
     assert out_all["count"] >= 2
 
-    out_leader = await LIST_TASKS.handler(ctx, {"persona": "leader"})
-    assert out_leader["count"] == 1
-    assert out_leader["tasks"][0]["persona"] == "leader"
+    out_dispatcher = await LIST_TASKS.handler(ctx, {"persona": "dispatcher"})
+    assert out_dispatcher["count"] == 1
+    assert out_dispatcher["tasks"][0]["persona"] == "dispatcher"
 
     out_progress = await LIST_TASKS.handler(ctx, {"status": "in_progress"})
     assert all(t["status"] == "in_progress" for t in out_progress["tasks"])
@@ -645,7 +645,7 @@ async def test_create_agent_validates_inputs(ctx: ToolContext) -> None:
         )
     # Bootstrap personas can't be respawned with this tool.
     with pytest.raises(ToolError, match="reserved for bootstrap"):
-        await CREATE_AGENT.handler(ctx, {"persona": "leader", "name": "x"})
+        await CREATE_AGENT.handler(ctx, {"persona": "dispatcher", "name": "x"})
 
 
 @pytest.mark.asyncio
@@ -702,7 +702,7 @@ async def test_create_agent_pre_creates_notes_file(
 async def test_seed_default_agents_pre_creates_notes_files(
     tmp_path,
 ) -> None:
-    """`lyre onboard` path: owner + leader notes files materialize next to
+    """`lyre onboard` path: owner + dispatcher notes files materialize next to
     the memory skeleton on first bootstrap."""
     from pathlib import Path
 
@@ -715,17 +715,17 @@ async def test_seed_default_agents_pre_creates_notes_files(
     conn = await init_db(":memory:")
     try:
         repos = SqliteRepositories(conn)
-        # Personas must exist before agents (FK). The DEFAULT_AGENTS tuple
-        # ships owner/leader/reviewer; each needs its persona row first.
-        for name in ("owner", "leader", "reviewer"):
+        # Personas must exist before agents (FK). DEFAULT_AGENTS ships
+        # owner/dispatcher/analyst/reviewer; each needs its persona row.
+        for name in ("owner", "dispatcher", "analyst", "reviewer"):
             await repos.personas.upsert(
                 Persona(name=name, role_description=name, system_prompt=name)
             )
         created = await seed_default_agents(
             repos.agents, memory_root=memory_root,
         )
-        assert {"owner", "leader", "reviewer-1"} <= set(created)
-        for aid in ("owner", "leader", "reviewer-1"):
+        assert {"owner", "dispatcher", "analyst-1", "reviewer-1"} <= set(created)
+        for aid in ("owner", "dispatcher", "analyst-1", "reviewer-1"):
             p = memory_root / "facts" / f"agent-{aid}-notes.md"
             assert p.exists(), f"missing notes file for {aid}"
             assert f"agent_id: {aid}" in p.read_text(encoding="utf-8")
@@ -749,7 +749,7 @@ async def test_archive_agent_refuses_bootstrap(ctx: ToolContext) -> None:
     assert out["archived"] is True
 
     with pytest.raises(ToolError, match="well-known agent"):
-        await ARCHIVE_AGENT.handler(ctx, {"agent_id": "leader"})
+        await ARCHIVE_AGENT.handler(ctx, {"agent_id": "dispatcher"})
     with pytest.raises(ToolError, match="not found"):
         await ARCHIVE_AGENT.handler(ctx, {"agent_id": "no-such-agent"})
 

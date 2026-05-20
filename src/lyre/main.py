@@ -83,7 +83,7 @@ def onboard_cmd() -> None:
     click.echo("")
     click.echo("Next:")
     click.echo("  lyre serve                 # start the runtime + dashboard")
-    click.echo('  lyre send leader "hi"      # send a test message')
+    click.echo('  lyre send dispatcher "hi"  # send a test message')
 
 
 # ----------------------------------------------------------------------
@@ -208,7 +208,7 @@ def serve_cmd(
         )
 
         # Bootstrap the runtime if needed — `lyre serve` after `lyre onboard`
-        # works in one step. Phase 0 needs at least owner+leader present.
+        # works in one step. Phase 0 needs at least owner+dispatcher present.
         from .onboard import bootstrap_runtime
         await bootstrap_runtime(cfg)
 
@@ -493,7 +493,8 @@ def send_cmd(
     """Send a mailbox message to an agent.
 
     `recipient` is an AGENT ID (post-A3: agents are first-class). Bare
-    ids (`owner`, `leader`) reach bootstrap agents directly. Spawned
+    ids (`owner`, `dispatcher`, `analyst-1`, `reviewer-1`) reach bootstrap
+    agents directly. Spawned
     agents use `persona/name` (e.g. `worker-maintainer/refactor-auth`);
     if that id doesn't exist yet the CLI auto-creates it (use
     `--no-spawn` to disable). `lyre agent list` shows live agent ids.
@@ -520,8 +521,9 @@ def send_cmd(
                 pass
             elif not is_valid_agent_id(recipient):
                 click.echo(
-                    f"invalid agent id {recipient!r}: must be a bootstrap "
-                    f"id (owner / leader) or `persona/name`. See "
+                    f"invalid agent id {recipient!r}: must be a bare id "
+                    f"(owner / dispatcher / analyst-1 / reviewer-1, or your "
+                    f"custom equivalents) or `<persona>/<name>`. See "
                     f"`lyre agent list` for live agents.",
                     err=True,
                 )
@@ -796,7 +798,7 @@ def audit_cmd(
     Examples:
         lyre audit 019e36a9-e1f8-...          # specific wakeup by id (prefix ok)
         lyre audit --latest                   # most-recent wakeup, any persona
-        lyre audit --latest --persona leader  # most-recent leader wakeup
+        lyre audit --latest --persona dispatcher  # most-recent dispatcher wakeup
     """
     import textwrap
 
@@ -1270,7 +1272,13 @@ def agent_archive_cmd(agent_id: str) -> None:
         conn = await init_db(cfg.db_path)
         try:
             repos = SqliteRepositories(conn)
-            if agent_id in ("owner", "leader"):
+            bootstrap_ids = {
+                "owner",
+                cfg.bootstrap.dispatcher_id,
+                cfg.bootstrap.analyst_id,
+                cfg.bootstrap.reviewer_id,
+            }
+            if agent_id in bootstrap_ids:
                 click.echo(
                     f"refusing to archive bootstrap agent {agent_id!r}",
                     err=True,
@@ -1409,7 +1417,7 @@ def wakeups_list_cmd(
     Examples:
         lyre wakeups list                                  # last 20
         lyre wakeups list --since 1h --status silent_close
-        lyre wakeups list --persona leader --json | jq '.id'
+        lyre wakeups list --persona dispatcher --json | jq '.id'
     """
     from .runtime.model_registry import load_registry_for_config
 

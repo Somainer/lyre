@@ -112,17 +112,17 @@ async def test_subprocess_runs_scripted_task_to_completion(
         # Override worker-maintainer's worktree to off so we don't need
         # ssh-keygen in this minimal smoke. The persona is already seeded;
         # update its model_preference path is fine — we use a flagship-
-        # tier wrap via the leader path instead. Simpler: use the leader.
+        # tier wrap via the dispatcher path instead. Simpler: use the dispatcher.
         task_id = await repos.tasks.create(
             TaskSpec(
-                persona_name="leader",
+                persona_name="dispatcher",
                 goal="say hi to owner",
                 acceptance="message sent",
             )
         )
 
         # Script: one turn = mailbox_send + tool_use_complete; then end.
-        # leader is allowed mailbox_send.
+        # dispatcher is allowed mailbox_send.
         script_path = sandbox["tmp"] / "script.jsonl"
         _write_jsonl_script(script_path, [
             [
@@ -294,7 +294,7 @@ async def test_scheduler_subprocess_mode_dispatches_and_completes(
         await _seed(repos)
 
         task_id = await repos.tasks.create(
-            TaskSpec(persona_name="leader", goal="g", acceptance="a")
+            TaskSpec(persona_name="dispatcher", goal="g", acceptance="a")
         )
 
         script_path = sandbox["tmp"] / "s.jsonl"

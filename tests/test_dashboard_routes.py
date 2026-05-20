@@ -37,7 +37,7 @@ async def seeded_dashboard(
     await seed_personas(repos.personas)
     # Post-A3: dashboard send-form validates recipient against agents.
     # Seed an agent for each persona (id == persona name) so existing
-    # CLI/dashboard usage like `send leader "..."` keeps working.
+    # CLI/dashboard usage like `send dispatcher "..."` keeps working.
     for persona in await repos.personas.list_active():
         await repos.agents.create(
             agent_id=persona.name, persona_name=persona.name
@@ -64,10 +64,10 @@ async def seeded_dashboard(
     await repos.wakeups.set_transcript_uri(running_wid, f"file://{tp}")
 
     done_tid = await repos.tasks.create(
-        TaskSpec(persona_name="leader", goal="prior task", acceptance="ok")
+        TaskSpec(persona_name="dispatcher", goal="prior task", acceptance="ok")
     )
     await repos.tasks.update_status(done_tid, "completed")
-    done_wid = await repos.wakeups.start(done_tid, "leader")
+    done_wid = await repos.wakeups.start(done_tid, "dispatcher")
     await repos.wakeups.end(done_wid, end_status="completed", metering={
         "token_input": 500, "token_output": 120, "wall_clock_ms": 3200,
         "tool_call_count": 2, "provider": "anthropic", "model": "claude-sonnet-4-6",
@@ -76,7 +76,7 @@ async def seeded_dashboard(
     # Seed mailbox: a normal + a blocker
     await repos.mailbox.insert_message(
         MailboxMessage(recipient="owner", external_id="m-normal",
-                       sender="leader", urgency="normal", body="status update")
+                       sender="dispatcher", urgency="normal", body="status update")
     )
     await repos.mailbox.insert_message(
         MailboxMessage(recipient="owner", external_id="m-block",
@@ -166,7 +166,7 @@ def test_agents_list_renders_all_live_agents(
     r = client.get("/agents")
     assert r.status_code == 200
     body = r.text
-    assert "leader" in body
+    assert "dispatcher" in body
     assert "worker-maintainer" in body
     # busy indicator on the agent that's currently running a wakeup
     assert "running" in body or "busy" in body
@@ -178,15 +178,15 @@ def test_agent_detail_filters_to_only_that_agent(
     """The per-agent timeline must not bleed in events from other
     agents — that's the whole point of the drill-down."""
     client, *_ = seeded_dashboard
-    # The seeded mailbox has messages: leader→owner and
-    # worker-maintainer→owner. The /agents/leader page must show
-    # leader's mail and NOT worker-maintainer's.
-    r = client.get("/agents/leader")
+    # The seeded mailbox has messages: dispatcher→owner and
+    # worker-maintainer→owner. The /agents/dispatcher page must show
+    # dispatcher's mail and NOT worker-maintainer's.
+    r = client.get("/agents/dispatcher")
     assert r.status_code == 200
     body = r.text
     # Cross-agent send by worker-maintainer must be filtered out.
     assert "STOP, awaiting decision" not in body
-    # Leader-originated mail must still show (it involves leader).
+    # Leader-originated mail must still show (it involves dispatcher).
     assert "status update" in body
 
 
@@ -334,9 +334,9 @@ def test_agent_detail_surfaces_assistant_text_from_completed_wakeup(
         # A completed wakeup with a transcript containing content_delta
         # chunks the model emitted before mailbox_send.
         tid = await repos.tasks.create(
-            TaskSpec(agent_id="leader", goal="g", acceptance="a")
+            TaskSpec(agent_id="dispatcher", goal="g", acceptance="a")
         )
-        wid = await repos.wakeups.start(tid, "leader")
+        wid = await repos.wakeups.start(tid, "dispatcher")
         await repos.wakeups.end(wid, end_status="completed", metering={
             "token_input": 100, "token_output": 30, "wall_clock_ms": 800,
             "tool_call_count": 1, "provider": "anthropic", "model": "x",
@@ -367,7 +367,7 @@ def test_agent_detail_surfaces_assistant_text_from_completed_wakeup(
     try:
         client = TestClient(app)
         # Per-agent drill-down — that's where transcripts live now.
-        r = client.get("/agents/leader?minutes=60")
+        r = client.get("/agents/dispatcher?minutes=60")
         assert r.status_code == 200
         body = r.text
         # Assistant text rendered as a chat-style "assistant" bubble in
@@ -502,18 +502,18 @@ def test_send_post_writes_message_and_shows_banner(
     client, repos, _ = seeded_dashboard
     r = client.post(
         "/send",
-        data={"recipient": "leader", "body": "from dashboard",
+        data={"recipient": "dispatcher", "body": "from dashboard",
               "urgency": "high", "sender": "owner"},
     )
     assert r.status_code == 200
     body = r.text
     assert "banner success" in body
-    assert "leader" in body
+    assert "dispatcher" in body
     assert "watch what happens in Activity" in body
 
     # Side effect: mailbox row exists
     async def _check() -> bool:
-        msgs = await repos.mailbox.read_messages("leader")
+        msgs = await repos.mailbox.read_messages("dispatcher")
         return any(m.body == "from dashboard" and m.urgency == "high" for m in msgs)
     assert asyncio.get_event_loop().run_until_complete(_check())
 
@@ -554,7 +554,7 @@ def test_send_form_with_reply_to_shows_original_message(
     assert "Replying to mailbox" in body
     assert f"#{msg_id}" in body
     # Original sender pre-filled as recipient (so reply goes back to them)
-    assert 'value="leader"' in body or 'value="worker-maintainer"' in body
+    assert 'value="dispatcher"' in body or 'value="worker-maintainer"' in body
     # Hidden reply_to field round-trips
     assert f'name="reply_to" value="{msg_id}"' in body
 
@@ -573,7 +573,7 @@ def test_send_post_with_reply_to_threads_parent_msg_id(
     r = client.post(
         "/send",
         data={
-            "recipient": "leader",
+            "recipient": "dispatcher",
             "body": "thanks for the update",
             "urgency": "normal",
             "sender": "owner",
@@ -585,7 +585,7 @@ def test_send_post_with_reply_to_threads_parent_msg_id(
     assert f"in reply to #{parent_id}" in r.text
 
     async def _last_reply() -> object:
-        msgs = await repos.mailbox.read_messages("leader")
+        msgs = await repos.mailbox.read_messages("dispatcher")
         return next(
             (m for m in msgs if m.body == "thanks for the update"), None
         )
@@ -600,7 +600,7 @@ def test_send_post_rejects_bad_urgency(
     client, *_ = seeded_dashboard
     r = client.post(
         "/send",
-        data={"recipient": "leader", "body": "x",
+        data={"recipient": "dispatcher", "body": "x",
               "urgency": "panic", "sender": "owner"},
     )
     assert r.status_code == 400
@@ -687,7 +687,7 @@ async def test_broadcaster_publishes_new_owner_messages(
             await repos.mailbox.insert_message(
                 MailboxMessage(
                     recipient="owner", external_id="live-1",
-                    sender="leader", urgency="normal",
+                    sender="dispatcher", urgency="normal",
                     body="live update",
                 )
             )
@@ -743,7 +743,7 @@ async def test_broadcaster_filters_by_recipient(
     try:
         repos = SqliteRepositories(conn)
         await repos.mailbox.ensure_mailbox("owner")
-        await repos.mailbox.ensure_mailbox("leader")
+        await repos.mailbox.ensure_mailbox("dispatcher")
         bc = MailboxBroadcaster(
             repos=repos, recipient="owner", poll_interval_s=0.05,
         )
@@ -754,8 +754,8 @@ async def test_broadcaster_filters_by_recipient(
             # Insert a non-owner message
             await repos.mailbox.insert_message(
                 MailboxMessage(
-                    recipient="leader", external_id="not-mine",
-                    sender="owner", urgency="normal", body="for leader",
+                    recipient="dispatcher", external_id="not-mine",
+                    sender="owner", urgency="normal", body="for dispatcher",
                 )
             )
             with pytest.raises(asyncio.TimeoutError):

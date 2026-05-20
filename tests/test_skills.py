@@ -79,7 +79,7 @@ def test_scope_applies_to() -> None:
     assert g.applies_to(agent_id="alice", persona_name="worker") is True
     assert g.applies_to(agent_id=None, persona_name=None) is True
     assert p.applies_to(agent_id="alice", persona_name="worker") is True
-    assert p.applies_to(agent_id="alice", persona_name="leader") is False
+    assert p.applies_to(agent_id="alice", persona_name="dispatcher") is False
     assert a.applies_to(agent_id="alice", persona_name="worker") is True
     assert a.applies_to(agent_id="bob", persona_name="worker") is False
 

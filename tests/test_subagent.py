@@ -3,8 +3,8 @@
 Three concerns:
   - DAO (find_children, find_parents_ready_to_wake, wake_parent)
   - Tool (await_subagents)
-  - End-to-end via Scheduler: leader dispatches worker, awaits, worker
-    completes, leader auto-wakes and sees the result.
+  - End-to-end via Scheduler: dispatcher dispatches worker, awaits, worker
+    completes, dispatcher auto-wakes and sees the result.
 """
 
 from __future__ import annotations
@@ -162,18 +162,18 @@ async def test_wake_parent_refuses_when_child_still_in_progress(
 @pytest.fixture
 async def parent_ctx(repos: SqliteRepositories) -> ToolContext:
     await repos.personas.upsert(
-        Persona(name="leader", role_description="l", system_prompt="l")
+        Persona(name="dispatcher", role_description="l", system_prompt="l")
     )
     await repos.personas.upsert(
         Persona(name="worker", role_description="w", system_prompt="w")
     )
     parent = await repos.tasks.create(
-        TaskSpec(persona_name="leader", goal="g", acceptance="a")
+        TaskSpec(persona_name="dispatcher", goal="g", acceptance="a")
     )
-    wakeup = await repos.wakeups.start(parent, "leader")
+    wakeup = await repos.wakeups.start(parent, "dispatcher")
     await repos.tasks.claim_lease(parent, wakeup, duration_sec=600)
     return ToolContext(
-        repos=repos, task_id=parent, wakeup_id=wakeup, persona_name="leader",
+        repos=repos, task_id=parent, wakeup_id=wakeup, persona_name="dispatcher",
     )
 
 
@@ -239,13 +239,13 @@ async def test_user_message_includes_children_status(
     repos: SqliteRepositories,
 ) -> None:
     await repos.personas.upsert(
-        Persona(name="leader", role_description="l", system_prompt="l")
+        Persona(name="dispatcher", role_description="l", system_prompt="l")
     )
     await repos.personas.upsert(
         Persona(name="worker", role_description="w", system_prompt="w")
     )
     parent_id = await repos.tasks.create(
-        TaskSpec(persona_name="leader", goal="parent goal", acceptance="parent ok")
+        TaskSpec(persona_name="dispatcher", goal="parent goal", acceptance="parent ok")
     )
     child_id = await repos.tasks.create(
         TaskSpec(
@@ -269,10 +269,10 @@ async def test_user_message_without_repo_omits_children_section(
     repos: SqliteRepositories,
 ) -> None:
     await repos.personas.upsert(
-        Persona(name="leader", role_description="l", system_prompt="l")
+        Persona(name="dispatcher", role_description="l", system_prompt="l")
     )
     parent_id = await repos.tasks.create(
-        TaskSpec(persona_name="leader", goal="g", acceptance="a")
+        TaskSpec(persona_name="dispatcher", goal="g", acceptance="a")
     )
     parent = await repos.tasks.get(parent_id)
     assert parent is not None
@@ -301,18 +301,18 @@ def _config(tmp_path: Path) -> Config:
 
 
 @pytest.mark.asyncio
-async def test_leader_dispatches_worker_awaits_and_wakes(
+async def test_dispatcher_dispatches_worker_awaits_and_wakes(
     repos: SqliteRepositories, tmp_path: Path,
 ) -> None:
-    """Full control-chain: leader dispatch_task → await_subagents → end_turn
-    → worker runs and completes → scheduler auto-wakes leader → leader sees
+    """Full control-chain: dispatcher dispatch_task → await_subagents → end_turn
+    → worker runs and completes → scheduler auto-wakes dispatcher → dispatcher sees
     child status in its new wakeup."""
     cfg = _config(tmp_path)
     cfg.object_store_path.mkdir(parents=True, exist_ok=True)
 
     await repos.personas.upsert(
         Persona(
-            name="leader", role_description="leader", system_prompt="lead",
+            name="dispatcher", role_description="dispatcher", system_prompt="lead",
             allowed_lyre_tools=["dispatch_task", "await_subagents", "mailbox_send"],
             model_preference={
                 "tier": "flagship", "requires": ["tool_use"], "prefer": [],
@@ -333,14 +333,14 @@ async def test_leader_dispatches_worker_awaits_and_wakes(
     # Post-A3: dispatch_task / mailbox routing needs real agents. Seed an
     # agent for each persona (id == persona name keeps the scripted
     # FakeAdapter inputs unchanged).
-    await repos.agents.create(agent_id="leader", persona_name="leader")
+    await repos.agents.create(agent_id="dispatcher", persona_name="dispatcher")
     await repos.agents.create(agent_id="worker", persona_name="worker")
-    await repos.agents.create(agent_id="owner", persona_name="leader")
+    await repos.agents.create(agent_id="owner", persona_name="dispatcher")
     await repos.mailbox.ensure_mailbox("owner")
 
     parent_task = await repos.tasks.create(
         TaskSpec(
-            agent_id="leader", goal="get worker to ping owner",
+            agent_id="dispatcher", goal="get worker to ping owner",
             acceptance="owner mailbox has the ping",
         )
     )
@@ -349,9 +349,9 @@ async def test_leader_dispatches_worker_awaits_and_wakes(
     # multiple stream_turn calls. Leader's queue has its 2 wakeups
     # concatenated (the queue persists across wakeups since we keep the same
     # adapter instance).
-    leader_adapter = FakeAdapter()
+    dispatcher_adapter = FakeAdapter()
     # Wakeup 1: dispatch + await + end_turn
-    leader_adapter.push_turn([
+    dispatcher_adapter.push_turn([
         ToolUseComplete(
             id="t1", name="dispatch_task",
             input={
@@ -362,23 +362,23 @@ async def test_leader_dispatches_worker_awaits_and_wakes(
         ),
         TurnComplete(stop_reason="tool_use"),
     ])
-    leader_adapter.push_turn([
+    dispatcher_adapter.push_turn([
         ToolUseComplete(id="t2", name="await_subagents", input={}),
         TurnComplete(stop_reason="tool_use"),
     ])
-    leader_adapter.push_turn([
-        ContentDelta(text="leader yields"),
+    dispatcher_adapter.push_turn([
+        ContentDelta(text="dispatcher yields"),
         TurnComplete(stop_reason="end_turn"),
     ])
     # Wakeup 2 (resume): report + end_turn
-    leader_adapter.push_turn([
+    dispatcher_adapter.push_turn([
         ToolUseComplete(
             id="r1", name="mailbox_send",
             input={"to": "owner", "body": "all tasks complete"},
         ),
         TurnComplete(stop_reason="tool_use"),
     ])
-    leader_adapter.push_turn([
+    dispatcher_adapter.push_turn([
         ContentDelta(text="reported"),
         TurnComplete(stop_reason="end_turn"),
     ])
@@ -396,10 +396,10 @@ async def test_leader_dispatches_worker_awaits_and_wakes(
         TurnComplete(stop_reason="end_turn"),
     ])
 
-    # Route by ModelEntry.tier: leader prefers flagship, worker workhorse.
+    # Route by ModelEntry.tier: dispatcher prefers flagship, worker workhorse.
     def adapter_for(entry):
         if entry.tier == "flagship":
-            return leader_adapter
+            return dispatcher_adapter
         return worker_adapter
 
     scheduler = Scheduler(
@@ -411,8 +411,8 @@ async def test_leader_dispatches_worker_awaits_and_wakes(
         adapter_for_test=adapter_for,
     )
 
-    # Tick 1: scheduler picks up pending parent (leader). Leader dispatches
-    # worker, awaits, end_turn → leader is needs_input.
+    # Tick 1: scheduler picks up pending parent (dispatcher). Leader dispatches
+    # worker, awaits, end_turn → dispatcher is needs_input.
     await scheduler._tick()
     p = await repos.tasks.get(parent_task)
     assert p is not None
@@ -439,7 +439,7 @@ async def test_leader_dispatches_worker_awaits_and_wakes(
         f"expected pending/completed, got {p.status}"
     )
 
-    # Tick 4 (or already done): leader's resume wakeup runs and reports.
+    # Tick 4 (or already done): dispatcher's resume wakeup runs and reports.
     if p.status == "pending":
         await scheduler._tick()
         p = await repos.tasks.get(parent_task)
@@ -447,7 +447,7 @@ async def test_leader_dispatches_worker_awaits_and_wakes(
     assert p is not None
     assert p.status == "completed"
 
-    # Owner mailbox got BOTH messages (worker's ping + leader's report — both
+    # Owner mailbox got BOTH messages (worker's ping + dispatcher's report — both
     # via outbox, but we haven't run the dispatcher; they should be in the
     # outbox rows).
     rows = await repos.outbox.dequeue_batch(limit=10)
@@ -455,14 +455,14 @@ async def test_leader_dispatches_worker_awaits_and_wakes(
     assert "ping from worker" in bodies
     assert "all tasks complete" in bodies
 
-    # Wake-resumed leader wakeup's user message must include the child status.
-    # leader_adapter.calls accumulates messages from each stream_turn; the
+    # Wake-resumed dispatcher wakeup's user message must include the child status.
+    # dispatcher_adapter.calls accumulates messages from each stream_turn; the
     # first call of the SECOND wakeup is the one we want — after the initial
     # 3 turns of wakeup 1.
-    assert len(leader_adapter.calls) >= 4, (
-        f"expected ≥4 leader stream_turn calls, got {len(leader_adapter.calls)}"
+    assert len(dispatcher_adapter.calls) >= 4, (
+        f"expected ≥4 dispatcher stream_turn calls, got {len(dispatcher_adapter.calls)}"
     )
-    resume_call = leader_adapter.calls[3]  # first turn of wakeup 2
+    resume_call = dispatcher_adapter.calls[3]  # first turn of wakeup 2
     text_blocks = [
         blk.text or ""
         for m in resume_call["messages"]

@@ -161,12 +161,12 @@ async def _seed_worker(repos: SqliteRepositories) -> None:
     await repos.mailbox.ensure_mailbox("worker")
 
 
-async def _seed_leader(repos: SqliteRepositories) -> None:
+async def _seed_dispatcher(repos: SqliteRepositories) -> None:
     """Lightweight persona for tests that don't need a worktree."""
     await repos.personas.upsert(
         Persona(
-            name="leader",
-            role_description="leader",
+            name="dispatcher",
+            role_description="dispatcher",
             system_prompt="you lead",
             allowed_lyre_tools=["mailbox_send"],
             model_preference={
@@ -176,7 +176,7 @@ async def _seed_leader(repos: SqliteRepositories) -> None:
         )
     )
     await repos.mailbox.ensure_mailbox("owner")
-    await repos.mailbox.ensure_mailbox("leader")
+    await repos.mailbox.ensure_mailbox("dispatcher")
 
 
 # ---------------------------------------------------------------------------
@@ -193,10 +193,10 @@ async def test_kill_1_before_action_recovers_via_expired_lease(
     wakeup completes the task. No duplicate side effects (none happened)."""
     cfg = _config(tmp_path)
     cfg.object_store_path.mkdir(parents=True, exist_ok=True)
-    await _seed_leader(repos)
+    await _seed_dispatcher(repos)
     task_id = await repos.tasks.create(
         TaskSpec(
-            persona_name="leader", goal="say hi", acceptance="msg sent",
+            persona_name="dispatcher", goal="say hi", acceptance="msg sent",
             lease_duration_s=0,  # 0s lease → immediately expired on next poll
         )
     )
@@ -502,10 +502,10 @@ async def test_kill_4_outbox_dispatcher_resumes_after_restart(
     completes, owner mailbox gets exactly one message."""
     cfg = _config(tmp_path)
     cfg.object_store_path.mkdir(parents=True, exist_ok=True)
-    await _seed_leader(repos)
+    await _seed_dispatcher(repos)
     task_id = await repos.tasks.create(
         TaskSpec(
-            persona_name="leader", goal="ping owner",
+            persona_name="dispatcher", goal="ping owner",
             acceptance="owner got the msg", lease_duration_s=600,
         )
     )

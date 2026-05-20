@@ -192,6 +192,27 @@ class PersonaOverride:
     allowed_lyre_tools: list[str] | None = None
 
 
+@dataclass(frozen=True)
+class BootstrapConfig:
+    """Customizable agent identities for the bootstrap-seeded agents.
+
+    The PERSONA is always one of the shipped roles (dispatcher / analyst /
+    reviewer) — this is a system identifier the runtime keys off. The
+    AGENT id, however, is what the owner sees and addresses — `lyre send
+    luna "..."`, dashboard column "Luna's mailbox", etc. Owner-personal,
+    purely cosmetic from runtime's perspective.
+
+    Soul / style customization goes through the existing APPEND.md
+    mechanism on the persona directory — see runtime.context system-prompt
+    assembly. There's no field here for it because it's a file-content
+    affair, not a config affair.
+    """
+
+    dispatcher_id: str = "dispatcher"
+    analyst_id: str = "analyst-1"
+    reviewer_id: str = "reviewer-1"
+
+
 def _default_home() -> Path:
     return lyre_home()
 
@@ -222,6 +243,7 @@ class Config:
     owner: OwnerConfig = field(default_factory=lambda: OwnerConfig(name="owner"))
     models: list[ModelEntry] = field(default_factory=list)
     persona_overrides: dict[str, PersonaOverride] = field(default_factory=dict)
+    bootstrap: BootstrapConfig = field(default_factory=BootstrapConfig)
 
     # ---- defaults: runtime knobs added with config.toml ----
     default_dashboard_port: int = 8765
@@ -337,6 +359,14 @@ class Config:
         if env_auto is not None:
             auto_wake = env_auto.lower() in ("1", "true", "yes", "on")
 
+        # ---- bootstrap agent id overrides ----
+        bootstrap_raw = raw.get("bootstrap") or {}
+        bootstrap = BootstrapConfig(
+            dispatcher_id=str(bootstrap_raw.get("dispatcher_id", "dispatcher")),
+            analyst_id=str(bootstrap_raw.get("analyst_id", "analyst-1")),
+            reviewer_id=str(bootstrap_raw.get("reviewer_id", "reviewer-1")),
+        )
+
         return cls(
             db_path=db_path,
             object_store_path=object_store_path,
@@ -353,6 +383,7 @@ class Config:
             owner=owner,
             models=models,
             persona_overrides=persona_overrides,
+            bootstrap=bootstrap,
             default_dashboard_port=dashboard_port,
             auto_wake_on_mail=bool(auto_wake),
         )

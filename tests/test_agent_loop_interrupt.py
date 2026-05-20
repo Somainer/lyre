@@ -62,11 +62,11 @@ async def test_turn_boundary_interrupt_injects_notice(
     """Blocker arrives between turns. The pre-turn check should inject a user
     notice before the next stream call."""
     await repos.personas.upsert(
-        Persona(name="leader", role_description="l", system_prompt="l")
+        Persona(name="dispatcher", role_description="l", system_prompt="l")
     )
-    await repos.mailbox.ensure_mailbox("leader")
+    await repos.mailbox.ensure_mailbox("dispatcher")
     watcher = BlockerWatcher(
-        repos=repos, recipient="leader", baseline_msg_id=0, poll_interval_s=0.02
+        repos=repos, recipient="dispatcher", baseline_msg_id=0, poll_interval_s=0.02
     )
     await watcher.start()
 
@@ -92,7 +92,7 @@ async def test_turn_boundary_interrupt_injects_notice(
     # picks it up (we do this AFTER seeding the persona/mailbox above).
     await repos.mailbox.insert_message(
         MailboxMessage(
-            recipient="leader", external_id="b1", sender="owner",
+            recipient="dispatcher", external_id="b1", sender="owner",
             urgency="blocker", body="STOP, check X",
         )
     )
@@ -133,11 +133,11 @@ async def test_mid_stream_interrupt_breaks_and_continues(
     current stream, persists the partial assistant turn, injects the notice,
     and runs another turn."""
     await repos.personas.upsert(
-        Persona(name="leader", role_description="l", system_prompt="l")
+        Persona(name="dispatcher", role_description="l", system_prompt="l")
     )
-    await repos.mailbox.ensure_mailbox("leader")
+    await repos.mailbox.ensure_mailbox("dispatcher")
     watcher = BlockerWatcher(
-        repos=repos, recipient="leader", baseline_msg_id=0, poll_interval_s=0.02
+        repos=repos, recipient="dispatcher", baseline_msg_id=0, poll_interval_s=0.02
     )
     await watcher.start()
 
@@ -174,7 +174,7 @@ async def test_mid_stream_interrupt_breaks_and_continues(
         await asyncio.sleep(0.12)  # ~2-3 deltas in
         await repos.mailbox.insert_message(
             MailboxMessage(
-                recipient="leader", external_id="b-mid", sender="owner",
+                recipient="dispatcher", external_id="b-mid", sender="owner",
                 urgency="blocker", body="STOP NOW",
             )
         )
@@ -204,11 +204,11 @@ async def test_no_interrupt_when_no_blockers(
     """Sanity: with no blockers in the mailbox, the watcher never fires and
     the agent loop runs normally."""
     await repos.personas.upsert(
-        Persona(name="leader", role_description="l", system_prompt="l")
+        Persona(name="dispatcher", role_description="l", system_prompt="l")
     )
-    await repos.mailbox.ensure_mailbox("leader")
+    await repos.mailbox.ensure_mailbox("dispatcher")
     watcher = BlockerWatcher(
-        repos=repos, recipient="leader", baseline_msg_id=0, poll_interval_s=0.02
+        repos=repos, recipient="dispatcher", baseline_msg_id=0, poll_interval_s=0.02
     )
     await watcher.start()
     try:
@@ -245,11 +245,11 @@ async def test_high_urgency_mail_injects_at_boundary_not_midstream(
     TURN BOUNDARY, never mid-stream. Mid-stream interrupts are reserved
     for urgency=blocker ('system is waiting')."""
     await repos.personas.upsert(
-        Persona(name="leader", role_description="l", system_prompt="l")
+        Persona(name="dispatcher", role_description="l", system_prompt="l")
     )
-    await repos.mailbox.ensure_mailbox("leader")
+    await repos.mailbox.ensure_mailbox("dispatcher")
     watcher = BlockerWatcher(
-        repos=repos, recipient="leader", baseline_msg_id=0,
+        repos=repos, recipient="dispatcher", baseline_msg_id=0,
         min_urgency="high", poll_interval_s=0.02,
     )
     await watcher.start()
@@ -284,7 +284,7 @@ async def test_high_urgency_mail_injects_at_boundary_not_midstream(
         await asyncio.sleep(0.12)
         await repos.mailbox.insert_message(
             MailboxMessage(
-                recipient="leader", external_id="h-mid", sender="owner",
+                recipient="dispatcher", external_id="h-mid", sender="owner",
                 urgency="high", body="please reply on this thread",
             )
         )
@@ -317,11 +317,11 @@ async def test_blocker_still_does_midstream_when_high_also_present(
     mid-stream interrupt fires. Verifies has_blocker_pending guards
     the mid-stream path."""
     await repos.personas.upsert(
-        Persona(name="leader", role_description="l", system_prompt="l")
+        Persona(name="dispatcher", role_description="l", system_prompt="l")
     )
-    await repos.mailbox.ensure_mailbox("leader")
+    await repos.mailbox.ensure_mailbox("dispatcher")
     watcher = BlockerWatcher(
-        repos=repos, recipient="leader", baseline_msg_id=0,
+        repos=repos, recipient="dispatcher", baseline_msg_id=0,
         min_urgency="high", poll_interval_s=0.02,
     )
     await watcher.start()
@@ -354,7 +354,7 @@ async def test_blocker_still_does_midstream_when_high_also_present(
         await asyncio.sleep(0.10)
         await repos.mailbox.insert_message(
             MailboxMessage(
-                recipient="leader", external_id="h-mix", sender="owner",
+                recipient="dispatcher", external_id="h-mix", sender="owner",
                 urgency="high", body="optional follow up",
             )
         )
@@ -362,7 +362,7 @@ async def test_blocker_still_does_midstream_when_high_also_present(
         await asyncio.sleep(0.02)
         await repos.mailbox.insert_message(
             MailboxMessage(
-                recipient="leader", external_id="b-mix", sender="owner",
+                recipient="dispatcher", external_id="b-mix", sender="owner",
                 urgency="blocker", body="STOP, change of plan",
             )
         )
