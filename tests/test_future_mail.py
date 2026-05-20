@@ -11,7 +11,7 @@ Covers:
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -125,14 +125,14 @@ def test_validate_cron_rejects_invalid() -> None:
 
 
 def test_resolve_first_fire_relative() -> None:
-    now = datetime(2026, 5, 17, 12, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 5, 17, 12, 0, tzinfo=UTC)
     fire = resolve_first_fire(None, "1h", None, now=now)
-    assert fire == datetime(2026, 5, 17, 13, 0, tzinfo=timezone.utc)
+    assert fire == datetime(2026, 5, 17, 13, 0, tzinfo=UTC)
 
 
 def test_resolve_first_fire_rejects_past_absolute() -> None:
     """S3: past deliver_at must error so the agent recomputes."""
-    now = datetime(2026, 5, 17, 12, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 5, 17, 12, 0, tzinfo=UTC)
     with pytest.raises(PastDeliveryError) as exc_info:
         resolve_first_fire("2025-01-01T00:00:00Z", None, None, now=now)
     # The error includes current UTC so the agent can correct.
@@ -140,21 +140,21 @@ def test_resolve_first_fire_rejects_past_absolute() -> None:
 
 
 def test_resolve_first_fire_rejects_beyond_horizon() -> None:
-    now = datetime(2026, 5, 17, 12, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 5, 17, 12, 0, tzinfo=UTC)
     with pytest.raises(ValueError, match="1 year"):
         resolve_first_fire("2028-01-01T00:00:00Z", None, None, now=now)
 
 
 def test_resolve_first_fire_cron_only() -> None:
     """recur_cron without deliver_at = first fire is next cron match."""
-    now = datetime(2026, 5, 17, 12, 0, tzinfo=timezone.utc)  # Sunday
+    now = datetime(2026, 5, 17, 12, 0, tzinfo=UTC)  # Sunday
     fire = resolve_first_fire(None, None, "0 9 * * 1-5", now=now)
     # Next workday 9am from Sunday noon = Monday 9am
-    assert fire == datetime(2026, 5, 18, 9, 0, tzinfo=timezone.utc)
+    assert fire == datetime(2026, 5, 18, 9, 0, tzinfo=UTC)
 
 
 def test_compute_next_fire_interval() -> None:
-    now = datetime(2026, 5, 17, 12, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 5, 17, 12, 0, tzinfo=UTC)
     nxt = compute_next_fire("interval", "1h", after=now)
     assert nxt == now + timedelta(hours=1)
 
@@ -162,13 +162,13 @@ def test_compute_next_fire_interval() -> None:
 def test_compute_next_fire_returns_none_past_until() -> None:
     """When the would-be next fire exceeds recur_until, returns None
     (caller marks the schedule completed)."""
-    now = datetime(2026, 5, 17, 12, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 5, 17, 12, 0, tzinfo=UTC)
     end = now + timedelta(minutes=30)  # before next 1h fire
     assert compute_next_fire("interval", "1h", after=now, recur_until=end) is None
 
 
 def test_default_recur_until_is_one_year() -> None:
-    now = datetime(2026, 5, 17, 12, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 5, 17, 12, 0, tzinfo=UTC)
     until = default_recur_until(now)
     assert until == now + timedelta(days=365)
 
@@ -327,7 +327,7 @@ async def test_phase_minus_one_delivers_one_shot(
     """A due one-shot row produces a mailbox_message and marks completed."""
     cfg = _config(tmp_path)
     await _seed(repos)
-    past = datetime.now(timezone.utc) - timedelta(minutes=5)
+    past = datetime.now(UTC) - timedelta(minutes=5)
     sid = await repos.scheduled_mail.create(
         ScheduledMail(
             recipient="leader", sender="owner", urgency="normal",
@@ -354,13 +354,13 @@ async def test_phase_minus_one_recurring_advances_scheduled_for(
     pending; occurrence_count increments."""
     cfg = _config(tmp_path)
     await _seed(repos)
-    past = datetime.now(timezone.utc) - timedelta(minutes=5)
+    past = datetime.now(UTC) - timedelta(minutes=5)
     sid = await repos.scheduled_mail.create(
         ScheduledMail(
             recipient="leader", sender="owner", urgency="normal",
             body="recur", scheduled_for=past,
             recur_kind="interval", recur_value="1h",
-            recur_until=datetime.now(timezone.utc) + timedelta(days=7),
+            recur_until=datetime.now(UTC) + timedelta(days=7),
             created_by_agent="owner",
         )
     )
@@ -376,7 +376,7 @@ async def test_phase_minus_one_recurring_advances_scheduled_for(
     new_str = (
         new_ts.isoformat() if hasattr(new_ts, "isoformat") else str(new_ts)
     )
-    assert new_str > iso(datetime.now(timezone.utc))
+    assert new_str > iso(datetime.now(UTC))
 
 
 @pytest.mark.asyncio
@@ -386,14 +386,14 @@ async def test_phase_minus_one_completes_past_recur_until(
     """Last occurrence (next fire > recur_until) → status='completed'."""
     cfg = _config(tmp_path)
     await _seed(repos)
-    past = datetime.now(timezone.utc) - timedelta(minutes=5)
+    past = datetime.now(UTC) - timedelta(minutes=5)
     # recur_until is BEFORE the next-would-be-fire (1h ahead).
     sid = await repos.scheduled_mail.create(
         ScheduledMail(
             recipient="leader", sender="owner", urgency="normal",
             body="last", scheduled_for=past,
             recur_kind="interval", recur_value="1h",
-            recur_until=datetime.now(timezone.utc) - timedelta(minutes=1),
+            recur_until=datetime.now(UTC) - timedelta(minutes=1),
             created_by_agent="owner",
         )
     )
@@ -413,7 +413,7 @@ async def test_phase_minus_one_bounces_archived_recipient(
     cfg = _config(tmp_path)
     await _seed(repos)
     await repos.agents.archive("worker-1")
-    past = datetime.now(timezone.utc) - timedelta(minutes=5)
+    past = datetime.now(UTC) - timedelta(minutes=5)
     sid = await repos.scheduled_mail.create(
         ScheduledMail(
             recipient="worker-1", sender="leader", urgency="normal",
@@ -442,7 +442,7 @@ async def test_phase_minus_one_skips_not_yet_due(
 ) -> None:
     cfg = _config(tmp_path)
     await _seed(repos)
-    future = datetime.now(timezone.utc) + timedelta(hours=1)
+    future = datetime.now(UTC) + timedelta(hours=1)
     sid = await repos.scheduled_mail.create(
         ScheduledMail(
             recipient="leader", sender="owner", urgency="normal",
@@ -499,13 +499,13 @@ async def test_cancel_stops_recurring(
     """After cancel, a re-tick must NOT deliver."""
     cfg = _config(tmp_path)
     await _seed(repos)
-    past = datetime.now(timezone.utc) - timedelta(minutes=5)
+    past = datetime.now(UTC) - timedelta(minutes=5)
     sid = await repos.scheduled_mail.create(
         ScheduledMail(
             recipient="leader", sender="owner", urgency="normal",
             body="r", scheduled_for=past,
             recur_kind="interval", recur_value="1h",
-            recur_until=datetime.now(timezone.utc) + timedelta(days=7),
+            recur_until=datetime.now(UTC) + timedelta(days=7),
             created_by_agent="owner",
         )
     )
@@ -552,7 +552,7 @@ async def test_double_tick_does_not_double_deliver_oneshot(
     row exists."""
     cfg = _config(tmp_path)
     await _seed(repos)
-    past = datetime.now(timezone.utc) - timedelta(minutes=5)
+    past = datetime.now(UTC) - timedelta(minutes=5)
     sid = await repos.scheduled_mail.create(
         ScheduledMail(
             recipient="leader", sender="owner", urgency="normal",

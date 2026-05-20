@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -38,7 +38,7 @@ class ActivityEvent:
 
 
 def iso_minutes_ago(minutes: int) -> str:
-    dt = datetime.now(timezone.utc) - timedelta(minutes=minutes)
+    dt = datetime.now(UTC) - timedelta(minutes=minutes)
     return dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")[:-4] + "Z"
 
 
@@ -249,7 +249,7 @@ def _ts_to_iso(ts_ms: Any, fallback: str) -> str:
     still sort sensibly when ts is missing."""
     if isinstance(ts_ms, int):
         return (
-            datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc)
+            datetime.fromtimestamp(ts_ms / 1000.0, tz=UTC)
             .strftime("%Y-%m-%dT%H:%M:%S.%fZ")[:-4]
             + "Z"
         )

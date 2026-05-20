@@ -34,17 +34,17 @@ All env vars are optional unless noted. Set them in your shell or a
 You can point all of these at a temp directory for isolated experiments:
 
 ```bash
-export LYRE_DB_PATH=/tmp/lyre-test/lyre.db
-export LYRE_OBJECT_STORE=/tmp/lyre-test/objects
-export LYRE_MEMORY_PATH=/tmp/lyre-test/memory
-uv run lyre init
+export LYRE_HOME=/tmp/lyre-test           # one knob sets db, memory, object_store
+uv run lyre onboard
 uv run lyre serve
 ```
 
-## Model registry (`model_registry.yaml`)
+## Model registry
 
-Located at the repository root. Declares every (provider, model) Lyre
-can route to.
+The shipped registry lives at `src/lyre/data/model_registry.yaml` (a
+packaged resource — not for hand-editing). To add or override entries,
+write `[[models]]` blocks in `~/.lyre/config.toml`. Same-id user entries
+REPLACE the shipped entry; new ids append.
 
 ```yaml
 models:
@@ -107,8 +107,13 @@ persona's preference list.
 
 ## Persona files
 
-Located at `src/lyre/personas/<name>.md`. Each one is a markdown file
-with YAML frontmatter:
+After `lyre onboard` runs, personas live at `~/.lyre/personas/<name>/identity.md`
+— that directory is the single source of truth. Lyre ships starter content
+under `src/lyre/personas/` and copies it into your home dir on first
+bootstrap; subsequent boots only fill in personas you've deleted (so your
+edits / renames stick).
+
+Each persona is a markdown file with YAML frontmatter:
 
 ```yaml
 ---
@@ -151,27 +156,52 @@ The body below the frontmatter is the persona's system prompt. It's
 appended after the runtime-generated **identity preamble** (which
 explains wakeups, mailbox protocol, ack-and-stop anti-pattern, etc.).
 
-Personas are read at process start via `lyre init` (or on `lyre serve`
-startup); they're upserted into the `personas` table. Edit the markdown
-file and restart `lyre serve` to apply changes.
+Personas are read at process start by `lyre onboard` and re-applied on
+`lyre serve` startup; they're upserted into the `personas` table. Edit
+`~/.lyre/personas/<name>/identity.md` and restart `lyre serve` to apply
+changes.
+
+**Two layouts supported** in `~/.lyre/personas/` (directory wins if both
+exist for the same name):
+
+  * `~/.lyre/personas/<name>/identity.md`  — preferred. Allows companion
+    files in the same directory (e.g. `APPEND.md` to inject extra
+    instructions at the bottom of the system prompt).
+  * `~/.lyre/personas/<name>.md`           — legacy / minimal-fuss.
+
+**Per-persona toml overrides** for single fields (model preference, allowed
+tools): write `[personas.<name>]` in `~/.lyre/config.toml`:
+
+```toml
+[personas.leader]
+model_preference = { prefer = ["anthropic.claude-opus-4-7"] }
+allowed_lyre_tools = ["mailbox_send", "mailbox_read", "dispatch_task"]
+```
+
+For everything else (system_prompt, role_description, etc.) just edit
+`identity.md` directly.
 
 See [writing-personas.md](./writing-personas.md) for how to design new
 personas, including the skills system.
 
 ## Memory directory layout
 
-Created by `lyre init`. The agents have constrained read access via
+Created by `lyre onboard`. The agents have constrained read access via
 `read_memory()` and arbitrary read/write via `shell_exec` / `python_exec`.
 
 ```
-~/.lyre/memory/
-├── facts/
-│   ├── agent-owner-notes.md          # owner's notebook (mostly for you)
-│   ├── agent-leader-notes.md         # leader's cross-wakeup notebook
-│   ├── agent-<worker-id>-notes.md    # auto-created when each new agent is born
-│   └── <other facts>.md              # ad-hoc facts agents drop here
-├── personas/
-│   └── owner.md                       # owner's "Soul" — preferences profile
+~/.lyre/
+├── user.md                            # owner identity & preferences (user-write-only)
+├── config.toml                        # owner identity, model overrides, paths
+├── .env                               # API keys (chmod 600)
+├── lyre.db                            # SQLite — runtime state only
+├── personas/<name>/identity.md        # SSOT for personas (copied from shipped on onboard)
+├── memory/                            # agent-write-only by convention
+│   └── facts/
+│       ├── agent-owner-notes.md       # owner's notebook (mostly for you)
+│       ├── agent-leader-notes.md      # leader's cross-wakeup notebook
+│       ├── agent-<worker-id>-notes.md # auto-created when each new agent is born
+│       └── <other facts>.md           # ad-hoc facts agents drop here
 └── skills/
     ├── approved/                      # active skills (loaded into prompts)
     │   ├── <skill-name>/SKILL.md      # PI-aligned: directory-per-skill
@@ -180,14 +210,22 @@ Created by `lyre init`. The agents have constrained read access via
         └── ...
 ```
 
+Authorship rules:
+
+- `user.md` — **user writes only**, agents read it (injected into every
+  system prompt). Edit freely; agents never overwrite it.
+- `memory/` — **agents write only** (by convention; not enforced). You
+  read but don't edit, so the agent doesn't get its notebook scrambled.
+
 Important defaults:
 
-- **Per-agent notes file.** When `create_agent` runs (or `seed_default_agents`
-  on `lyre init`), a notes file is pre-created at
-  `facts/agent-<id>-notes.md`. This is the **Codex-style "pre-create the
-  path, agent self-discovers"** pattern. The agent's identity preamble
-  tells it explicitly that this file exists; the agent then naturally
-  uses `read_memory()` / `shell_exec("cat >> ...")` to read and append.
+- **Per-agent notes file.** When `create_agent` runs (or
+  `seed_default_agents` on `lyre onboard`), a notes file is pre-created
+  at `memory/facts/agent-<id>-notes.md`. This is the **Codex-style
+  "pre-create the path, agent self-discovers"** pattern. The agent's
+  identity preamble tells it explicitly that this file exists; the agent
+  then naturally uses `read_memory()` / `shell_exec("cat >> ...")` to
+  read and append.
 
 - **Skills directory.** Markdown files describing reusable procedures.
   Each skill is a directory with a `SKILL.md` (frontmatter + body), per
@@ -204,7 +242,7 @@ Important defaults:
 | Mail in-flight | `mailboxes` + `mailbox_messages` (DB) | Forever (audit) |
 | Wakeup transcripts | `~/.lyre/object_store/wakeups/<id>/transcript.jsonl` | Forever (audit) |
 | Cross-wakeup agent notes | `~/.lyre/memory/facts/agent-<id>-notes.md` | Forever (owner can prune) |
-| Owner preferences | `~/.lyre/memory/personas/owner.md` | Forever (curated) |
+| Owner identity / preferences | `~/.lyre/user.md` | Forever (user-edited) |
 | Cross-task facts | `~/.lyre/memory/facts/*.md` | Forever (curated) |
 | Reusable skills | `~/.lyre/memory/skills/approved/<name>/SKILL.md` | Forever (curated) |
 

@@ -17,7 +17,7 @@ and to reuse from both the tool layer and the CLI:
 from __future__ import annotations
 
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from croniter import croniter
 
@@ -92,14 +92,14 @@ def validate_cron(expr: str) -> None:
 
 def now_utc() -> datetime:
     """Single seam — tests monkey-patch this when they need to fix time."""
-    return datetime.now(timezone.utc).replace(microsecond=0)
+    return datetime.now(UTC).replace(microsecond=0)
 
 
 def _ensure_utc(dt: datetime) -> datetime:
     """Coerce a naive datetime to UTC; pass through if already aware."""
     if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
+        return dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
 
 
 class PastDeliveryError(ValueError):

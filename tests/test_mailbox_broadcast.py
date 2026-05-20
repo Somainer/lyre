@@ -16,12 +16,12 @@ from lyre.runtime.tools.builtin import build_default_registry
 from lyre.runtime.tools.mailbox import MAILBOX_GET_MESSAGE, MAILBOX_SEND
 
 # ---------------------------------------------------------------------------
-# Migration runner: 0002 columns exist on a fresh init
+# Migration runner: initial schema includes broadcast columns
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_migration_0002_adds_broadcast_columns(tmp_path: Path) -> None:
+async def test_initial_schema_has_broadcast_columns(tmp_path: Path) -> None:
     db = tmp_path / "lyre.db"
     conn = await init_db(db)
     try:
@@ -37,9 +37,7 @@ async def test_migration_0002_adds_broadcast_columns(tmp_path: Path) -> None:
             "SELECT version FROM schema_migrations ORDER BY version"
         ) as cur:
             versions = [r["version"] for r in await cur.fetchall()]
-        # Update this list as new migrations land.
-        # Update this list as new migrations land.
-        assert versions == [1, 2, 3, 4, 5, 6]
+        assert versions == [1]
     finally:
         await conn.close()
 
@@ -49,16 +47,13 @@ async def test_migration_runner_idempotent_on_reinit(tmp_path: Path) -> None:
     db = tmp_path / "lyre.db"
     c1 = await init_db(db)
     await c1.close()
-    # Second init must NOT explode (would happen if 0002 ALTER ran twice).
     c2 = await init_db(db)
     try:
         async with c2.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
         ) as cur:
             versions = [r["version"] for r in await cur.fetchall()]
-        # Update this list as new migrations land.
-        # Update this list as new migrations land.
-        assert versions == [1, 2, 3, 4, 5, 6]
+        assert versions == [1]
     finally:
         await c2.close()
 

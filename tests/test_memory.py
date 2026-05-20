@@ -16,11 +16,9 @@ from lyre.persistence.models import Persona, TaskSpec
 from lyre.persistence.sqlite_impl import SqliteRepositories
 from lyre.runtime.context import assemble_system_prompt
 from lyre.runtime.memory import (
-    OWNER_SOUL_PLACEHOLDER,
     ensure_skeleton,
     format_memory_index,
     scan_memory_dir,
-    write_default_owner_soul,
 )
 from lyre.runtime.tools import ToolContext
 from lyre.runtime.tools.shell import SHELL_EXEC
@@ -42,27 +40,18 @@ def _write_md(
 
 
 # ---------------------------------------------------------------------------
-# Skeleton + Owner Soul seed
+# Skeleton
 # ---------------------------------------------------------------------------
 
 
 def test_ensure_skeleton_creates_all_canonical_dirs(tmp_path: Path) -> None:
     created = ensure_skeleton(tmp_path)
     paths = {p.relative_to(tmp_path).as_posix() for p in created}
-    # Skills moved out of memory/ to ~/.lyre/skills/ in B1.
-    assert paths == {"facts", "personas"}
+    # Skills live in ~/.lyre/skills/, owner identity in ~/.lyre/user.md;
+    # memory/ now holds only agent-authored knowledge files.
+    assert paths == {"facts"}
     # Idempotent: 2nd call creates nothing new.
     assert ensure_skeleton(tmp_path) == []
-
-
-def test_owner_soul_seed_writes_placeholder_once(tmp_path: Path) -> None:
-    p = write_default_owner_soul(tmp_path)
-    assert p.exists()
-    assert p.read_text() == OWNER_SOUL_PLACEHOLDER
-    # Don't overwrite an existing Soul.
-    p.write_text("---\ndescription: changed\n---\nnew body")
-    write_default_owner_soul(tmp_path)
-    assert "new body" in p.read_text()
 
 
 # ---------------------------------------------------------------------------
@@ -85,16 +74,10 @@ def test_scan_groups_by_directory(tmp_path: Path) -> None:
         {"description": "lisa-lang default branch is main", "scope": "lisa-lang"},
         "body 1",
     )
-    _write_md(
-        tmp_path / "personas" / "owner.md",
-        {"description": "Owner Soul"},
-        "body 2",
-    )
 
     entries = scan_memory_dir(tmp_path)
     by_kind = {(e.kind, e.name): e for e in entries}
     assert ("fact", "default-branch") in by_kind
-    assert ("persona", "owner") in by_kind
 
     fact = by_kind[("fact", "default-branch")]
     assert fact.description == "lisa-lang default branch is main"
@@ -151,20 +134,16 @@ def test_format_index_groups_and_describes(tmp_path: Path) -> None:
         tmp_path / "facts" / "c.md",
         {"description": "fact C", "scope": "lisa-lang"}, "",
     )
-    _write_md(
-        tmp_path / "personas" / "owner.md",
-        {"description": "Owner Soul"}, "",
-    )
     entries = scan_memory_dir(tmp_path)
     out = format_memory_index(entries)
 
     assert "## Available global memory" in out
     assert "### Facts" in out
-    assert "### Persona profiles" in out
     assert "`facts/c.md` — fact C  [scope: lisa-lang]" in out
-    assert "`personas/owner.md` — Owner Soul" in out
-    # Skills moved out — memory index doesn't render them anymore.
+    # Skills live in ~/.lyre/skills/; owner identity in ~/.lyre/user.md — neither
+    # appears in the memory index.
     assert "### Skills" not in out
+    assert "### Persona profiles" not in out
 
 
 def test_format_index_skips_empty_groups(tmp_path: Path) -> None:
@@ -211,7 +190,6 @@ def test_assemble_system_prompt_with_empty_memory_root_no_section(
 
 def test_assemble_system_prompt_includes_memory_index(tmp_path: Path) -> None:
     ensure_skeleton(tmp_path)
-    write_default_owner_soul(tmp_path)
     _write_md(
         tmp_path / "facts" / "x.md",
         {"description": "fact X"}, "",
@@ -220,7 +198,22 @@ def test_assemble_system_prompt_includes_memory_index(tmp_path: Path) -> None:
     assert "worker role" in prompt
     assert "## Available global memory" in prompt
     assert "facts/x.md" in prompt
-    assert "personas/owner.md" in prompt
+
+
+def test_assemble_system_prompt_includes_user_md_when_present(tmp_path: Path) -> None:
+    """user.md sitting at lyre_home is injected into every system prompt."""
+    lyre_home = tmp_path
+    memory = lyre_home / "memory"
+    memory.mkdir()
+    ensure_skeleton(memory)
+    (lyre_home / "user.md").write_text(
+        "Owner prefers concise technical replies, no fluff.", encoding="utf-8",
+    )
+    prompt = assemble_system_prompt(
+        _persona(), memory_root=memory, lyre_home=lyre_home,
+    )
+    assert "Owner identity" in prompt
+    assert "Owner prefers concise technical replies" in prompt
 
 
 # ---------------------------------------------------------------------------

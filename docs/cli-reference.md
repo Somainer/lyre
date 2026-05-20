@@ -10,7 +10,7 @@ stuck?").
 
 | Command | Purpose |
 |---|---|
-| `lyre init` | Create DB schema, memory dir skeleton, bootstrap agents (`owner`, `leader`). Idempotent — safe to re-run. |
+| `lyre onboard` | Interactive wizard: writes `~/.lyre/config.toml` + `.env` + `user.md`, copies shipped personas to `~/.lyre/personas/<name>/identity.md`, bootstraps DB + memory dirs + agents (`owner`, `leader`). Safe to re-run. |
 | `lyre serve [--no-dashboard] [--dashboard-port N]` | Run scheduler + outbox dispatcher (+ dashboard). The main runtime entry point. |
 | `lyre dashboard [--host H] [--port N]` | Run only the dashboard (no scheduler). For inspecting state without starting the runtime. |
 
@@ -161,24 +161,18 @@ For a clean experiment without losing the global setup:
 ```bash
 # Soft reset — drop the DB, keep memory + transcripts
 rm ~/.lyre/lyre.db ~/.lyre/lyre.db-{wal,shm}
-uv run lyre init
+uv run lyre onboard          # re-runs wizard; pick "keep existing" for config
 
 # Full reset — drop everything
 rm -rf ~/.lyre
-uv run lyre init
+uv run lyre onboard
 ```
 
-Or point everything at a tmpdir for the session:
+Or point everything at a tmpdir for the session via `LYRE_HOME`:
 
 ```bash
-LYRE_DB_PATH=/tmp/lyre-exp/db.sqlite \
-LYRE_OBJECT_STORE=/tmp/lyre-exp/obj \
-LYRE_MEMORY_PATH=/tmp/lyre-exp/mem \
-  uv run lyre init && \
-LYRE_DB_PATH=/tmp/lyre-exp/db.sqlite \
-LYRE_OBJECT_STORE=/tmp/lyre-exp/obj \
-LYRE_MEMORY_PATH=/tmp/lyre-exp/mem \
-  uv run lyre serve
+LYRE_HOME=/tmp/lyre-exp uv run lyre onboard
+LYRE_HOME=/tmp/lyre-exp uv run lyre serve
 ```
 
 ### "Inspect the schema directly"

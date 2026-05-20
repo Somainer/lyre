@@ -30,14 +30,13 @@ Both must pass before a PR is merged. CI runs them on every push.
 
 ## How the runtime behaves locally
 
-`uv run lyre init` creates `~/.lyre/lyre.db` + `~/.lyre/memory/`. For
-isolated experiments, point Lyre at a tmpdir:
+`uv run lyre onboard` runs an interactive wizard that writes
+`~/.lyre/config.toml`, `~/.lyre/.env`, `~/.lyre/user.md`, and bootstraps
+the DB. For isolated experiments, point Lyre at a tmpdir via `LYRE_HOME`:
 
 ```bash
-export LYRE_DB_PATH=/tmp/lyre-dev/lyre.db
-export LYRE_OBJECT_STORE=/tmp/lyre-dev/objects
-export LYRE_MEMORY_PATH=/tmp/lyre-dev/memory
-uv run lyre init
+export LYRE_HOME=/tmp/lyre-dev
+uv run lyre onboard          # writes /tmp/lyre-dev/{config.toml, .env, ...}
 uv run lyre serve
 ```
 

@@ -1,25 +1,25 @@
 """Filesystem-backed memory layer.
 
-Memory lives in `~/.lyre/memory/` (per Config.memory_path). Three categories,
-each a directory of `<name>.md` files with YAML frontmatter + markdown body:
+Memory lives in `~/.lyre/memory/` (per Config.memory_path). Agent-write,
+user-read-by-convention. Today the canonical category is:
 
     memory/
-    ├── skills/
-    │   ├── approved/<name>.md      ← reviewer-skill has promoted here
-    │   └── proposed/<name>.md      ← worker's draft, awaiting review
-    ├── facts/<topic>.md            ← global facts (kind, scope in frontmatter)
-    └── personas/<name>.md          ← persona profiles incl. owner Soul
+    └── facts/<topic>.md            ← agent-curated knowledge (kind, scope in frontmatter)
 
-No new tools. Agents read via `shell_exec cat`, write via `shell_exec` redirects.
-At wakeup start, Scheduler scans the dir, reads JUST the frontmatters, and
-injects an index ("MEMORY index") into the system prompt — so every agent
-sees what's available without searching. This is the anti-spike / anti-
-non-convergence mechanism (Hermes/Pi style menu-of-skills).
+Skills are tracked separately under `~/.lyre/skills/`. Owner identity &
+preferences (user-write, agent-read) live at `~/.lyre/user.md` and are
+injected into every system prompt by `context.assemble_system_prompt`;
+they never appear here.
+
+No new tools. Agents read via `shell_exec cat` / `read_memory`, write via
+`shell_exec` redirects / `python_exec`. At wakeup start, the scheduler scans
+this dir, reads JUST the frontmatters, and injects an index ("Available
+global memory") into the system prompt — so every agent sees what's
+available without searching.
 
 Frontmatter expected fields (all optional):
     description  : one-line summary used in the index
     scope        : free-form string ("lisa-lang", "global", ...)
-    triggers     : list[str], when the skill applies
     kind         : for facts, the fact category ("repo_info", "api_quirk", ...)
 """
 
@@ -31,7 +31,7 @@ from typing import Any, Literal
 
 import yaml
 
-MemoryKind = Literal["fact", "persona"]
+MemoryKind = Literal["fact"]
 
 
 @dataclass(frozen=True)
@@ -112,12 +112,10 @@ def scan_memory_dir(root: Path) -> list[MemoryEntry]:
         return []
     entries: list[MemoryEntry] = []
 
-    # Skills live in ~/.lyre/skills/ now (B1: PI Agent Skills standard),
-    # not under memory/. Memory keeps the durable knowledge files:
-    # personas (Souls) and facts.
+    # Skills live in ~/.lyre/skills/ (PI Agent Skills standard); Soul lives
+    # in ~/.lyre/user.md. Memory keeps agent-authored knowledge files.
     layout: dict[str, MemoryKind] = {
         "facts": "fact",
-        "personas": "persona",
     }
     for rel, kind in layout.items():
         d = root / rel
@@ -153,7 +151,6 @@ def format_memory_index(
 
     groups: dict[MemoryKind, list[MemoryEntry]] = {
         "fact": [],
-        "persona": [],
     }
     for e in entries:
         groups[e.kind].append(e)
@@ -217,12 +214,6 @@ def format_memory_index(
         for e in groups["fact"]:
             lines.append(_format_line(e))
 
-    if groups["persona"]:
-        lines.append("")
-        lines.append("### Persona profiles")
-        for e in groups["persona"]:
-            lines.append(_format_line(e))
-
     return "\n".join(lines)
 
 
@@ -248,15 +239,14 @@ def build_memory_index_for_prompt(
 
 
 # ---------------------------------------------------------------------------
-# Seed helpers — used by `lyre init` to put the directory skeleton in place
-# plus a placeholder owner Soul so the index isn't empty on day one.
+# Seed helpers — used by `lyre onboard` to put the directory skeleton in place.
 # ---------------------------------------------------------------------------
 
 
 SKELETON_SUBDIRS = (
-    # Skills moved to ~/.lyre/skills/ in B1 — see runtime.skills.
+    # Skills live in ~/.lyre/skills/ (see runtime.skills);
+    # Owner identity lives in ~/.lyre/user.md (user-only-writable).
     "facts",
-    "personas",
 )
 
 
@@ -270,31 +260,3 @@ def ensure_skeleton(root: Path) -> list[Path]:
             p.mkdir(parents=True, exist_ok=True)
             created.append(p)
     return created
-
-
-OWNER_SOUL_PLACEHOLDER = """---
-description: Owner preferences and style — read on every wakeup
-kind: persona_profile
----
-
-# Owner Soul
-
-This is a placeholder. The summary-agent will populate it over time as
-patterns emerge from owner feedback.
-
-Default conventions until updated:
-
-- Communication style: concise, technical, no fluff
-- Code style: prefer testability and clarity over cleverness
-- Decision philosophy: prefer simpler universal mechanisms over specialized tools
-- When unsure: ask via `mailbox_send to=owner urgency=blocker`
-"""
-
-
-def write_default_owner_soul(root: Path) -> Path:
-    """Drop the placeholder owner Soul into `personas/owner.md` if absent."""
-    target = root / "personas" / "owner.md"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    if not target.exists():
-        target.write_text(OWNER_SOUL_PLACEHOLDER, encoding="utf-8")
-    return target

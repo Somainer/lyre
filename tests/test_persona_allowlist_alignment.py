@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import pytest
 
-from lyre.personas.seed import discover_persona_files, load_persona_from_file
+from lyre.personas.seed import _shipped_persona_files, load_persona_from_file
 
 # Tools that the identity preamble *always* mentions to *every* persona
 # that gets the preamble (i.e. has any allowed_lyre_tools at all — the
@@ -35,9 +35,10 @@ _PREAMBLE_CORE_TOOLS: frozenset[str] = frozenset(
 
 
 def _personas_with_tools():
-    """All personas that actually use tools (excludes owner stub)."""
+    """All SHIPPED personas that actually use tools (excludes owner stub).
+    This is a CI correctness check on what Lyre ships, not on a user dir."""
     out = []
-    for path in discover_persona_files():
+    for path in _shipped_persona_files():
         p = load_persona_from_file(path)
         if p.allowed_lyre_tools:  # non-empty
             out.append(p)

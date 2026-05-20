@@ -26,7 +26,7 @@ uv sync
 # 至少配一个 provider 的 key（DeepSeek 最便宜）
 export DEEPSEEK_API_KEY=sk-...    # 或 ANTHROPIC_API_KEY、OPENAI_API_KEY
 
-uv run lyre init                  # 建 DB + memory 目录 + seed agent
+uv run lyre onboard               # 交互式 wizard：身份 / provider / DB / 目录
 uv run lyre serve                 # scheduler + dispatcher + dashboard
 ```
 

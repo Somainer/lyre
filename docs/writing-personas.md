@@ -316,14 +316,16 @@ notes:
    context. Prefer bullet lists with sources over flowing prose.
    ```
 
-2. **Reinit the personas table** (re-running `lyre init` is idempotent
-   and upserts personas):
+2. **Re-seed the personas table.** Personas auto-upsert on every
+   `lyre serve` start, so the simplest path is just restart serve. If
+   you want a one-shot bootstrap from a clean state, use
+   `lyre onboard` — it upserts personas as part of its bootstrap step
+   (re-run is safe; existing config.toml stays unless you confirm
+   overwrite).
 
    ```bash
-   uv run lyre init
+   uv run lyre onboard
    ```
-
-   You'll see `Seeded 7 personas: ..., web-researcher`.
 
 3. **Verify the persona is registered**:
 

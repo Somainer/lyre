@@ -109,7 +109,7 @@ async def run_command(
         out_bytes, err_bytes = await asyncio.wait_for(
             proc.communicate(), timeout=timeout_s
         )
-    except asyncio.TimeoutError:
+    except TimeoutError:
         timed_out = True
         try:
             proc.kill()

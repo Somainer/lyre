@@ -42,7 +42,7 @@ uv sync
 # Set at least one provider key (DeepSeek is the cheapest path)
 export DEEPSEEK_API_KEY=sk-...    # or ANTHROPIC_API_KEY, OPENAI_API_KEY
 
-uv run lyre init                  # create DB + memory dir + seed agents
+uv run lyre onboard               # interactive: identity, provider, DB, dirs
 uv run lyre serve                 # scheduler + dispatcher + dashboard
 ```
 

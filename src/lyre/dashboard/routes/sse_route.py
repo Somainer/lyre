@@ -27,7 +27,7 @@ async def sse_mailbox(request: Request, recipient: str = "owner"):
                     break
                 try:
                     msg = await asyncio.wait_for(queue.get(), timeout=15.0)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     yield ": keepalive\n\n"
                     continue
                 if msg.recipient != recipient:
