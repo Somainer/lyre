@@ -1,16 +1,73 @@
-<div class="card">
-  <div class="num">{{ in_progress }}</div>
-  <div class="label">in-progress</div>
-</div>
-<div class="card">
-  <div class="num">{{ completed_24h }}</div>
-  <div class="label">completed 24h</div>
-</div>
-<div class="card {{ 'alert' if blockers_unread else '' }}">
-  <div class="num">{{ blockers_unread }}</div>
-  <div class="label">blockers unread</div>
-</div>
-<div class="card">
-  <div class="num">{{ tokens_in_24h }} / {{ tokens_out_24h }}</div>
-  <div class="label">tokens in/out 24h</div>
-</div>
+{% from "_macros.html" import spark, live_dot, status_pill, model_pill %}
+{# Tile 1 — Tasks in flight #}
+<a class="stat" href="/runs" style="text-decoration:none;color:inherit;">
+  <div class="stat-label">Tasks in flight</div>
+  <div class="stat-main">
+    <div class="stat-num">{{ tasks_in_flight }}</div>
+    <div class="stat-delta">{{ tasks_delta_label }}</div>
+  </div>
+  {{ spark(tasks_spark, "oklch(0.78 0.09 200)") }}
+  <div class="stat-break">
+    <span class="seg"><span class="seg-dot" style="background:var(--st-run);"></span><span class="seg-n">{{ in_progress }}</span><span>in_progress</span></span>
+    <span class="seg"><span class="seg-dot" style="background:var(--st-idle);"></span><span class="seg-n">{{ pending }}</span><span>pending</span></span>
+    <span class="seg"><span class="seg-dot" style="background:var(--st-warn);"></span><span class="seg-n">{{ needs_input }}</span><span>needs_input</span></span>
+  </div>
+</a>
+
+{# Tile 2 — Unread mail to owner #}
+<a class="stat" href="/mail" style="text-decoration:none;color:inherit;">
+  <div class="stat-label">Unread mail to owner</div>
+  <div class="stat-main">
+    <div class="stat-num">{{ unread_total }}</div>
+    <div class="stat-delta">{{ mail_delta_label }}</div>
+  </div>
+  {{ spark(mail_spark, "oklch(0.78 0.13 70)") }}
+  <div class="stat-break">
+    <span class="seg"><span class="seg-dot" style="background:var(--urg-blocker);"></span><span class="seg-n">{{ blockers_unread }}</span><span>blockers unread</span></span>
+    <span class="seg"><span class="seg-dot" style="background:var(--urg-high);"></span><span class="seg-n">{{ high_unread }}</span><span>high</span></span>
+    <span class="seg"><span class="seg-dot" style="background:var(--urg-normal);"></span><span class="seg-n">{{ normal_unread }}</span><span>normal</span></span>
+  </div>
+</a>
+
+{# Tile 3 — Active wakeups #}
+<a class="stat" href="/activity" style="text-decoration:none;color:inherit;">
+  <div class="stat-label">Active wakeups</div>
+  <div class="stat-main">
+    <div class="stat-num">{{ active_wakeups_count }}</div>
+    <div class="stat-delta">{{ live_dot() }} {{ tok_rate_label }}</div>
+  </div>
+  {{ spark(wakeup_spark, "var(--accent)") }}
+  <div class="stat-break">
+    {% if active_wakeups_count == 0 %}
+      <span class="seg"><span>idle</span></span>
+    {% else %}
+      {% for w in active_wakeups_preview %}
+        <span class="seg"><span class="seg-dot" style="background:var(--st-run);"></span><span class="seg-n">{{ w.tok_in_fmt }}</span><span>{{ w.persona_name }}</span></span>
+      {% endfor %}
+    {% endif %}
+  </div>
+</a>
+
+{# Tile 4 — Last wakeup #}
+<a class="stat" href="/activity" style="text-decoration:none;color:inherit;">
+  <div class="stat-label">Last wakeup</div>
+  {% if last_wakeup %}
+    <div class="row" style="gap:var(--s-3);align-items:center;">
+      <span class="mono" style="font-size:var(--t-meta);color:var(--fg-3);">{{ last_wakeup.id[:13] }}</span>
+      {{ status_pill(last_wakeup.end_status or "running") }}
+    </div>
+    <div class="row" style="gap:var(--s-3);align-items:center;">
+      <span class="mono" style="font-size:var(--t-meta);color:var(--fg-2);">{{ last_wakeup.persona_name }}</span>
+      {{ model_pill(last_wakeup.model) }}
+    </div>
+    <div class="stat-break">
+      <span class="seg"><span class="seg-n">{{ last_wakeup_tok_in }}</span><span>tokens in/out 24h</span></span>
+      <span class="seg"><span class="seg-n">{{ last_wakeup_tok_out }}</span><span>out</span></span>
+      <span class="seg"><span class="seg-n">{{ last_wakeup_wall }}</span><span>wall</span></span>
+      <span class="seg"><span class="seg-n{% if last_wakeup_ctx_pct and last_wakeup_ctx_pct >= 80 %} num-warn{% endif %}">{{ last_wakeup_ctx_pct or 0 }}%</span><span>ctx peak</span></span>
+    </div>
+  {% else %}
+    <div class="stat-num dim">—</div>
+    <div class="stat-delta">no wakeups yet</div>
+  {% endif %}
+</a>

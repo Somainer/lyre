@@ -1,0 +1,118 @@
+{% extends "base.html" %}
+{% from "_macros.html" import glyph, agent_id_pill, status_pill, model_pill %}
+{% block content %}
+<div class="page">
+  <div class="page-header">
+    <div>
+      <h1 class="page-title">Runs</h1>
+      <div class="page-subtitle">
+        Tasks and wakeups ·
+        <span class="mono">{{ wakeups_running_count }}</span> wakeups running now
+      </div>
+    </div>
+    <div class="row">
+      <div class="tw-chips runs-tabs" role="tablist">
+        <a class="tw-chip{% if tab_kind == 'tasks' %} is-active{% endif %}"
+           href="/runs?tab=tasks">Tasks · {{ task_counts.all }}</a>
+        <a class="tw-chip{% if tab_kind == 'wakeups' %} is-active{% endif %}"
+           href="/runs?tab=wakeups">Wakeups · {{ wakeup_counts.all }}</a>
+      </div>
+    </div>
+  </div>
+
+  {% if tab_kind == "tasks" %}
+    <div class="row" style="margin-bottom:var(--s-4);">
+      <div class="fchips">
+        {% for k, label in [
+          ("all",         "All"),
+          ("in_progress", "in_progress"),
+          ("pending",     "pending"),
+          ("needs_input", "needs_input"),
+          ("completed",   "completed"),
+          ("failed",      "failed"),
+        ] %}
+          <a class="fchip{% if task_filter == k %} is-active{% endif %}"
+             href="/runs?tab=tasks&status={{ k }}">{{ label }}<span class="count">{{ task_counts.get(k, 0) }}</span></a>
+        {% endfor %}
+      </div>
+    </div>
+
+    <div class="card">
+      {% if tasks %}
+      <table id="tasks-table" class="dtable">
+        <thead><tr>
+          <th>id</th><th>agent</th><th>status</th><th>parent</th><th>goal</th>
+        </tr></thead>
+        <tbody>
+          {% for t in tasks %}
+            <tr>
+              <td class="id"><a href="/tasks/{{ t.id }}" style="color:inherit;text-decoration:none;">{{ t.id[:13] }}</a></td>
+              <td>{{ agent_id_pill(t.agent_id or t.persona_name, size='sm') }}</td>
+              <td>{{ status_pill(t.status) }}</td>
+              <td class="id">{% if t.parent_task_id %}{{ t.parent_task_id[:13] }}{% else %}<span class="dim">—</span>{% endif %}</td>
+              <td class="goal">{{ t.goal }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% else %}
+        <p id="tasks-table" class="empty">no tasks{% if task_filter and task_filter != "all" %} with status={{ task_filter }}{% endif %}</p>
+      {% endif %}
+    </div>
+  {% else %}
+    <div class="row" style="margin-bottom:var(--s-4);">
+      <div class="fchips">
+        {% for k, label in [
+          ("all",         "All"),
+          ("running",     "running"),
+          ("silent_close","silent_close"),
+          ("failed",      "failed / error"),
+          ("completed",   "completed"),
+        ] %}
+          <a class="fchip{% if wakeup_filter == k %} is-active{% endif %}"
+             href="/runs?tab=wakeups&status={{ k }}">{{ label }}<span class="count">{{ wakeup_counts.get(k, 0) }}</span></a>
+        {% endfor %}
+      </div>
+      <span class="dim mono" style="font-size:var(--t-micro);margin-left:var(--s-3);">
+        anomalies highlighted: ctx ≥ 80%, compaction &gt; 0, silent_close
+      </span>
+    </div>
+
+    <div class="card">
+      {% if wakeups %}
+      <table id="wakeups-table" class="dtable">
+        <thead><tr>
+          <th>id</th><th>task</th><th>agent</th><th>status</th>
+          <th style="text-align:right;">tok in</th><th style="text-align:right;">tok out</th>
+          <th style="text-align:right;">wall</th><th style="text-align:right;">tools</th>
+          <th>model</th><th style="text-align:right;">ctx peak</th><th style="text-align:right;">compact</th>
+          <th>started</th>
+        </tr></thead>
+        <tbody>
+          {% for w in wakeups %}
+            {% set ctx_pct = w.context_peak_tokens | context_peak_pct(model_context_windows.get(w.model or "")) %}
+            {% set is_anomaly = (ctx_pct and ctx_pct >= 80) or (w.compaction_count and w.compaction_count > 0) or w.end_status == "silent_close" %}
+            <tr{% if is_anomaly %} class="is-selected"{% endif %}>
+              <td class="id">{{ w.id[:13] }}</td>
+              <td class="id">{{ w.task_id[:13] }}</td>
+              <td>{{ agent_id_pill(w.agent_id or w.persona_name, size='sm', dim=True) }}</td>
+              <td>{{ status_pill(w.end_status or "running") }}</td>
+              <td class="mono" style="text-align:right;">{{ (w.token_input or 0) | fmt_tokens }}</td>
+              <td class="mono" style="text-align:right;">{{ (w.token_output or 0) | fmt_tokens }}</td>
+              <td class="mono" style="text-align:right;">{{ w.wall_clock_ms | fmt_ms }}</td>
+              <td class="mono" style="text-align:right;">{{ w.tool_call_count or 0 }}</td>
+              <td>{{ model_pill(w.model) }}</td>
+              <td class="mono{% if ctx_pct and ctx_pct >= 80 %} num-warn{% endif %}" style="text-align:right;">{% if ctx_pct %}{{ ctx_pct | round | int }}%{% else %}—{% endif %}</td>
+              <td class="mono{% if w.compaction_count and w.compaction_count > 0 %} num-warn{% endif %}" style="text-align:right;">{{ w.compaction_count or 0 }}</td>
+              <td class="mono dim">{{ w.started_at | clock_time }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% else %}
+        <p id="wakeups-table" class="empty">no wakeups{% if wakeup_filter and wakeup_filter != "all" %} with status={{ wakeup_filter }}{% endif %}</p>
+      {% endif %}
+    </div>
+  {% endif %}
+</div>
+{% endblock %}

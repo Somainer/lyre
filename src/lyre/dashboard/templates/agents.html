@@ -1,71 +1,91 @@
 {% extends "base.html" %}
+{% from "_macros.html" import glyph, agent_id_pill, occupancy_pill, status_pill, model_pill %}
 {% block content %}
-<h2>Agents</h2>
+<div class="page">
+  <div class="page-header">
+    <div>
+      <h1 class="page-title">Agents</h1>
+      <div class="page-subtitle">
+        <span class="mono">{{ agents|length }}</span> instances across
+        <span class="mono">{{ persona_count }}</span> personas
+      </div>
+    </div>
+    <div class="row">
+      <div class="tw-chips" role="tablist">
+        <a class="tw-chip{% if mode != 'lineage' %} is-active{% endif %}" href="/agents">Table</a>
+        <a class="tw-chip{% if mode == 'lineage' %} is-active{% endif %}" href="/agents?mode=lineage" style="white-space:nowrap;">{{ glyph("tree", 11) }} Lineage</a>
+      </div>
+    </div>
+  </div>
 
-<p class="hint">
-  Each row is a running <em>instance</em> of a persona. Click an agent
-  to see its full activity (incl. transcript-level tool calls and
-  assistant text). The <a href="/activity">Activity</a> tab is the
-  cross-agent overview; this drill-down is where you troubleshoot a
-  specific agent.
-</p>
-
-{% if agents %}
-<table class="agent-table">
-  <thead>
-    <tr>
-      <th>ID</th>
-      <th>Persona</th>
-      <th>Status</th>
-      <th>Model</th>
-      <th>Description</th>
-      <th>Created</th>
-    </tr>
-  </thead>
-  <tbody>
-    {% for a in agents %}
-      {% set is_busy = a.id in busy_agents %}
-      <tr class="{{ 'busy' if is_busy else '' }}">
-        <td>
-          <a class="agent-link" href="/agents/{{ a.id }}">
-            <strong>{{ a.id }}</strong>
-            {% if is_busy %}
-              <span class="dot live" title="wakeup in flight"></span>
-            {% endif %}
+  {% if mode == "lineage" %}
+    <div class="card" style="padding:var(--s-4);">
+      {% macro render_node(a, depth) %}
+        <div class="lineage-node" style="padding-left:{% if depth == 0 %}0{% else %}{{ 22 * depth }}px{% endif %};">
+          <a class="lineage-row" href="/agents/{{ a.id }}" style="text-decoration:none;color:inherit;">
+            <span class="lineage-connector" aria-hidden{% if depth == 0 %} style="visibility:hidden;"{% endif %}>└─</span>
+            {{ agent_id_pill(a.id) }}
+            {{ occupancy_pill(a, in_flight_by_agent.get(a.id, 0)) }}
+            {{ model_pill(a.model_id) }}
+            <span class="dim" style="font-size:var(--t-meta);">{{ a.description or "" }}</span>
+            {% set kids = children_by_parent.get(a.id, []) %}
+            {% if kids %}<span class="lineage-count">+{{ kids|length }}</span>{% endif %}
           </a>
-        </td>
-        <td>{{ a.persona_name }}</td>
-        <td>
-          {% if is_busy %}
-            <span class="status-tag busy">running</span>
-          {% else %}
-            <span class="status-tag idle">{{ a.status }}</span>
-          {% endif %}
-        </td>
-        <td class="dim">{{ a.model_id or "(persona default)" }}</td>
-        <td class="dim">{{ a.description or "" }}</td>
-        <td class="dim">
-          {{ a.created_at.isoformat()[:19] if a.created_at else "" }}
-        </td>
-      </tr>
-    {% endfor %}
-  </tbody>
-</table>
-{% else %}
-  <p class="empty">No live agents. Use <code>lyre agent create &lt;persona&gt;</code> to spawn one.</p>
-{% endif %}
+          {% for k in children_by_parent.get(a.id, []) %}
+            {{ render_node(k, depth + 1) }}
+          {% endfor %}
+        </div>
+      {% endmacro %}
+      {% for r in lineage_roots %}{{ render_node(r, 0) }}{% endfor %}
+    </div>
+  {% else %}
+    <div class="card">
+      {% if agents %}
+      <table class="dtable">
+        <thead><tr>
+          <th>agent id</th><th>occupancy</th><th>model</th><th>parent</th>
+          <th>description</th><th>created</th><th></th>
+        </tr></thead>
+        <tbody>
+          {% for a in agents %}
+            <tr onclick="window.location='/agents/{{ a.id }}'" style="cursor:pointer;">
+              <td>{{ agent_id_pill(a.id) }}</td>
+              <td>{{ occupancy_pill(a, in_flight_by_agent.get(a.id, 0)) }}</td>
+              <td>{{ model_pill(a.model_id) }}</td>
+              <td>{% if a.parent_agent_id %}{{ agent_id_pill(a.parent_agent_id, dim=True, size='sm') }}{% else %}<span class="dim">bootstrap</span>{% endif %}</td>
+              <td>{{ a.description or "" }}</td>
+              <td class="mono dim">{{ a.created_at | rel_time }}</td>
+              <td><a class="btn ghost sm" href="/agents/{{ a.id }}">open →</a></td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% else %}
+        <p class="empty">No live agents. Use <code>lyre agent create &lt;persona&gt;</code> to spawn one.</p>
+      {% endif %}
+    </div>
+  {% endif %}
 
-{% if archived_agents %}
-  <details class="archived-fold">
-    <summary>Archived agents ({{ archived_agents|length }})</summary>
-    <ul class="archived-list">
-      {% for a in archived_agents %}
-        <li>
-          <a href="/agents/{{ a.id }}">{{ a.id }}</a>
-          <span class="dim">(persona={{ a.persona_name }})</span>
-        </li>
-      {% endfor %}
-    </ul>
-  </details>
-{% endif %}
+  {% if archived_agents %}
+    <details style="margin-top:var(--s-5);">
+      <summary style="cursor:pointer;font-size:var(--t-meta);color:var(--fg-3);padding:var(--s-2) 0;">
+        ▸ Archived <span class="mono">({{ archived_agents|length }})</span>
+      </summary>
+      <div class="card" style="margin-top:var(--s-2);">
+        <table class="dtable">
+          <tbody>
+            {% for a in archived_agents %}
+              <tr>
+                <td>{{ agent_id_pill(a.id, dim=True) }}</td>
+                <td>{{ status_pill("archived") }}</td>
+                <td>{% if a.parent_agent_id %}{{ agent_id_pill(a.parent_agent_id, dim=True, size='sm') }}{% else %}<span class="dim">bootstrap</span>{% endif %}</td>
+                <td class="dim">{{ a.description or "" }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </details>
+  {% endif %}
+</div>
 {% endblock %}

@@ -1,81 +1,128 @@
 {% extends "base.html" %}
+{% from "_macros.html" import glyph, agent_id_pill, urgency_chip %}
 {% block content %}
-<h2>Send a mailbox message</h2>
-
-{% if success %}
-  <div class="banner banner-ok">
-    <h3>✓ Sent</h3>
-    <p>{{ success }}</p>
-    <p class="banner-actions">
-      <a href="/activity">→ watch what happens in Activity</a>
-      &nbsp;·&nbsp;
-      <a href="/feed">→ view in Feed</a>
-      &nbsp;·&nbsp;
-      <a href="/send?to={{ preset_to }}">send another</a>
-    </p>
+<div class="page" style="max-width:760px;">
+  <div class="page-header">
+    <div>
+      <h1 class="page-title">{% if reply_ctx %}Reply{% else %}Send mail{% endif %}</h1>
+      <div class="page-subtitle">As <span class="mono">{{ sender_default }}</span></div>
+    </div>
   </div>
-{% endif %}
-{% if error %}
-  <div class="banner banner-err">
-    <h3>✕ Failed</h3>
-    <p>{{ error }}</p>
-  </div>
-{% endif %}
 
-{% if reply_ctx %}
-  <div class="banner banner-info">
-    <h3>↩ Replying to mailbox #{{ reply_ctx.id }}</h3>
-    <p>
-      <span class="urgency">{{ reply_ctx.urgency }}</span>
-      <strong>{{ reply_ctx.sender }} → {{ reply_ctx.recipient }}</strong>
-    </p>
-    <pre class="reply-preview">{{ reply_ctx.preview }}</pre>
-  </div>
-{% endif %}
-
-<form method="post" action="/send" class="send-form">
-  {% if reply_to %}
-    <input type="hidden" name="reply_to" value="{{ reply_to }}">
+  {% if success %}
+    <div class="banner success" style="margin-bottom:var(--s-4);">
+      {{ glyph("check", 14) }}
+      <div style="flex:1;">
+        <div>{{ success }}</div>
+        <div class="dim" style="margin-top:4px;font-size:var(--t-micro);font-family:var(--font-mono);">
+          watch what happens in Activity ·
+          <a href="/activity">→ Activity</a> ·
+          <a href="/mail">→ Mail</a> ·
+          <a href="/send?to={{ preset_to }}">send another</a>
+        </div>
+      </div>
+    </div>
   {% endif %}
-  <label>
-    <span>to (agent id)</span>
-    <input name="recipient" value="{{ preset_to }}" required>
-  </label>
-  <label>
-    <span>from (sender)</span>
-    <input name="sender" value="owner">
-  </label>
-  <label>
-    <span>urgency</span>
-    <select name="urgency">
-      <option value="blocker">blocker</option>
-      <option value="high">high</option>
-      <option value="normal" selected>normal</option>
-      <option value="low">low</option>
-    </select>
-  </label>
-  <label>
-    <span>title (subject line, ≤140)</span>
-    <input
-      name="title" maxlength="140"
-      placeholder="(optional — derived from first line of body if blank)"
-    >
-  </label>
-  <label>
-    <span>body</span>
-    <textarea name="body" rows="5" required autofocus></textarea>
-  </label>
-  <button type="submit">send</button>
-</form>
+  {% if error %}
+    <div class="banner error banner-err" style="margin-bottom:var(--s-4);">
+      {{ glyph("warn", 14) }}
+      <div style="flex:1;">
+        <div>{{ error }}</div>
+      </div>
+    </div>
+  {% endif %}
 
-<p class="hint">
-  Equivalent to the CLI:
-  <code>uv run lyre send &lt;to&gt; "&lt;body&gt;" --urgency &lt;u&gt; --from &lt;sender&gt;</code>
-</p>
+  {% if reply_ctx %}
+    <div class="banner reply" style="margin-bottom:var(--s-4);">
+      {{ glyph("reply", 14) }}
+      <div style="flex:1;">
+        <div>Replying to mailbox <span class="mono">#{{ reply_ctx.id }}</span> from
+          {{ agent_id_pill(reply_ctx.sender, size='sm') }}
+        </div>
+        <div style="margin-top:4px;color:var(--fg-2);font-size:var(--t-meta);">
+          "{{ reply_ctx.preview }}"
+        </div>
+      </div>
+    </div>
+  {% endif %}
 
-<p class="hint">
-  <strong>Right after sending</strong>, watch <a href="/activity">/activity</a> —
-  scheduler usually picks up the resulting task within 1s and you'll see the
-  agent's wakeup + tool calls in real time.
-</p>
+  <form class="form" method="post" action="/send">
+    {% if reply_to %}<input type="hidden" name="reply_to" value="{{ reply_to }}"/>{% endif %}
+    <input type="hidden" name="sender" value="{{ sender_default }}"/>
+
+    <div class="field-block">
+      <div class="row between" style="margin-bottom:0;">
+        <label class="field-label">Recipient</label>
+        <span class="dim mono" style="font-size:var(--t-micro);">agent id</span>
+      </div>
+      <div class="recipient-row">
+        <div class="recipient-fields">
+          <input class="rec-name" name="recipient" value="{{ preset_to }}" required
+                 placeholder="agent id (e.g. leader, worker-maintainer)"
+                 style="flex:1;"/>
+        </div>
+        <div class="recipient-meta">
+          <div class="rec-resolved">
+            <span class="dim mono" style="font-size:var(--t-micro);">
+              {% if known_agents %}known: {{ known_agents|join(", ") }}{% else %}—{% endif %}
+            </span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="field-block">
+      <label class="field-label">Urgency</label>
+      <div class="urg-radio" role="radiogroup" aria-label="Urgency">
+        {% for u, hint in [
+          ("blocker", "interrupts owner immediately"),
+          ("high",    "surfaced in needs-attention"),
+          ("normal",  "default · feed"),
+          ("low",     "FYI · feed only"),
+        ] %}
+          <label class="urg-radio-opt {{ u }}{% if (reply_ctx and reply_ctx.urgency == u) or (not reply_ctx and u == 'normal') %} is-active{% endif %}"
+                 style="cursor:pointer;">
+            <input type="radio" name="urgency" value="{{ u }}"
+                   style="display:none;"
+                   {% if (reply_ctx and reply_ctx.urgency == u) or (not reply_ctx and u == 'normal') %}checked{% endif %}/>
+            {{ urgency_chip(u) }}
+            <span class="urg-radio-hint">{{ hint }}</span>
+          </label>
+        {% endfor %}
+      </div>
+    </div>
+
+    <div class="field-block">
+      <label class="field-label">Title <span class="dim">(optional, ≤140 chars)</span></label>
+      <input class="field-input" name="title" maxlength="140" placeholder="One-line subject…"
+             value="{% if reply_ctx %}Re: {{ reply_ctx.title or '(no title)' }}{% endif %}"/>
+    </div>
+
+    <div class="field-block">
+      <label class="field-label">Body <span class="dim">(markdown)</span></label>
+      <textarea class="field-textarea" name="body" required autofocus
+        placeholder="What should this agent do?&#10;&#10;Use markdown — code blocks, lists, links all render in the recipient's mailbox view."></textarea>
+    </div>
+
+    <div class="row between">
+      <div class="dim" style="font-size:var(--t-micro);">
+        <span class="kbd">⌘</span> <span class="kbd">↵</span> to send · equivalent CLI:
+        <code class="mono">uv run lyre send &lt;to&gt; "…" --urgency &lt;u&gt;</code>
+      </div>
+      <div class="row">
+        <button type="submit" class="btn primary">{{ glyph("send", 12) }} Deliver</button>
+      </div>
+    </div>
+  </form>
+</div>
+
+<script>
+  // Highlight active urgency option on click.
+  document.querySelectorAll('.urg-radio-opt').forEach((opt) => {
+    opt.addEventListener('click', () => {
+      document.querySelectorAll('.urg-radio-opt').forEach(o => o.classList.remove('is-active'));
+      opt.classList.add('is-active');
+    });
+  });
+</script>
 {% endblock %}

@@ -1,40 +1,61 @@
 {% extends "base.html" %}
+{% from "_macros.html" import glyph, agent_id_pill, status_pill %}
 {% block content %}
-<p><a href="/tasks">← back</a></p>
-<h2>Task <code>{{ task.id }}</code></h2>
-<dl class="kv">
-  <dt>persona</dt><dd>{{ task.persona_name }}</dd>
-  <dt>status</dt><dd><span class="status status-{{ task.status }}">{{ task.status }}</span></dd>
-  <dt>goal</dt><dd>{{ task.goal }}</dd>
-  <dt>acceptance</dt><dd>{{ task.acceptance }}</dd>
-  {% if task.parent_task_id %}
-    <dt>parent</dt>
-    <dd><a href="/tasks/{{ task.parent_task_id }}"><code>{{ task.parent_task_id }}</code></a></dd>
-  {% endif %}
-  {% if task.lease_holder %}
-    <dt>lease holder</dt><dd><code>{{ task.lease_holder }}</code></dd>
-  {% endif %}
-  {% if task.checkpoint %}
-    <dt>checkpoint</dt><dd><pre>{{ task.checkpoint }}</pre></dd>
-  {% endif %}
-</dl>
+<div class="page">
+  <div class="page-header">
+    <div>
+      <h1 class="page-title">
+        <a href="/runs" class="btn ghost sm" style="vertical-align:middle;">← Runs</a>
+        Task <span class="mono dim" style="font-size:18px;">{{ task.id[:13] }}</span>
+      </h1>
+      <div class="page-subtitle">
+        {{ agent_id_pill(task.agent_id or task.persona_name) }} ·
+        {{ status_pill(task.status) }}
+        {% if task.parent_task_id %}
+          · parent <a href="/tasks/{{ task.parent_task_id }}" class="mono">{{ task.parent_task_id[:13] }}</a>
+        {% endif %}
+      </div>
+    </div>
+  </div>
 
-<h3>Children ({{ children|length }})</h3>
-{% if children %}
-  <table class="taskgrid">
-    <thead><tr><th>id</th><th>persona</th><th>status</th><th>goal</th></tr></thead>
-    <tbody>
-      {% for c in children %}
-        <tr>
-          <td><a href="/tasks/{{ c.id }}"><code>{{ c.id[:8] }}</code></a></td>
-          <td>{{ c.persona_name }}</td>
-          <td><span class="status status-{{ c.status }}">{{ c.status }}</span></td>
-          <td>{{ c.goal[:80] }}</td>
-        </tr>
-      {% endfor %}
-    </tbody>
-  </table>
-{% else %}
-  <p class="empty">no subagent children</p>
-{% endif %}
+  <div class="card" style="padding:var(--s-5);">
+    <div style="font-size:var(--t-micro);text-transform:uppercase;letter-spacing:0.06em;color:var(--fg-3);margin-bottom:var(--s-2);">Goal</div>
+    <div class="md-body">{{ task.goal | markdown }}</div>
+    {% if task.acceptance %}
+      <div style="font-size:var(--t-micro);text-transform:uppercase;letter-spacing:0.06em;color:var(--fg-3);margin:var(--s-4) 0 var(--s-2);">Acceptance criteria</div>
+      <div class="md-body">{{ task.acceptance | markdown }}</div>
+    {% endif %}
+    {% if task.lease_holder %}
+      <div style="font-size:var(--t-micro);text-transform:uppercase;letter-spacing:0.06em;color:var(--fg-3);margin:var(--s-4) 0 var(--s-2);">Lease holder</div>
+      <code class="mono">{{ task.lease_holder }}</code>
+    {% endif %}
+    {% if task.checkpoint %}
+      <div style="font-size:var(--t-micro);text-transform:uppercase;letter-spacing:0.06em;color:var(--fg-3);margin:var(--s-4) 0 var(--s-2);">Checkpoint</div>
+      <pre class="mail-raw">{{ task.checkpoint }}</pre>
+    {% endif %}
+  </div>
+
+  <div class="card" style="margin-top:var(--s-5);">
+    <div class="card-h">
+      <span class="title">Subagent children <span class="num">· {{ children|length }}</span></span>
+    </div>
+    {% if children %}
+      <table class="dtable">
+        <thead><tr><th>id</th><th>agent</th><th>status</th><th>goal</th></tr></thead>
+        <tbody>
+          {% for c in children %}
+            <tr onclick="window.location='/tasks/{{ c.id }}'" style="cursor:pointer;">
+              <td class="id">{{ c.id[:13] }}</td>
+              <td>{{ agent_id_pill(c.agent_id or c.persona_name, size='sm') }}</td>
+              <td>{{ status_pill(c.status) }}</td>
+              <td class="goal">{{ c.goal }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="empty">no subagent children</p>
+    {% endif %}
+  </div>
+</div>
 {% endblock %}

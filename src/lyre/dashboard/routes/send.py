@@ -1,13 +1,9 @@
-"""Send-message form — Sprint D1's minimum-write seam.
+"""Send-message form — owner writes to an agent's mailbox.
 
-Mirrors the `lyre send` CLI: owner writes directly to an agent's mailbox,
-bypassing outbox (owner is at the system edge — no wakeup to attribute the
-message to). Uses a uuid-based external_id so each form submission produces
-a fresh row.
-
-Supports replying to an existing mailbox message: pass `?reply_to=<id>` on
-GET and the form pre-fills recipient + shows the original message; the
-POST writes `parent_msg_id` to thread the reply.
+Mirrors the `lyre send` CLI; bypasses outbox because owner sits at the
+system edge (no wakeup attribution). Single-recipient form for now —
+the persona/name + spawn-if-missing UX lands as a follow-up that wires
+the form to the agent addressing primitives.
 """
 
 from __future__ import annotations
@@ -24,8 +20,8 @@ router = APIRouter()
 
 async def _validate_recipient(repos, recipient: str) -> str | None:
     """Return None if valid, else an error string. 'owner' is always
-    valid; otherwise must be a known (non-archived) agent — matches the
-    CLI validation that catches hallucination / typo'd recipients."""
+    valid; anything else must be a known (non-archived) agent — matches
+    the CLI validation that catches hallucination / typo'd recipients."""
     if recipient == "owner":
         return None
     if not await repos.agents.exists(recipient):
@@ -40,8 +36,6 @@ async def _validate_recipient(repos, recipient: str) -> str | None:
 
 
 async def _load_reply_context(repos, reply_to_id: int) -> dict | None:
-    """Load the original message so the form can show it as context.
-    Returns None if no such message."""
     msg = await repos.mailbox.get_message(reply_to_id)
     if msg is None:
         return None
@@ -51,8 +45,15 @@ async def _load_reply_context(repos, reply_to_id: int) -> dict | None:
         "sender": msg.sender,
         "recipient": msg.recipient,
         "urgency": msg.urgency,
+        "title": msg.title,
         "preview": body if len(body) <= 400 else body[:400] + "…",
     }
+
+
+async def _known_agent_ids(repos) -> list[str]:
+    return sorted(
+        {a.id for a in await repos.agents.list_all(include_archived=False)}
+    )
 
 
 @router.get("/send", response_class=HTMLResponse)
@@ -61,15 +62,13 @@ async def send_form(
     to: str = "leader",
     reply_to: int | None = None,
 ) -> HTMLResponse:
+    repos = request.app.state.repos
     templates = request.app.state.templates
     reply_ctx = None
     preset_to = to
     if reply_to is not None:
-        repos = request.app.state.repos
         reply_ctx = await _load_reply_context(repos, reply_to)
         if reply_ctx is not None:
-            # Reply goes back to the original sender, not whoever the
-            # current owner was looking at.
             preset_to = reply_ctx["sender"]
     return templates.TemplateResponse(
         request, "send.html",
@@ -78,6 +77,8 @@ async def send_form(
             "preset_to": preset_to,
             "reply_to": reply_to,
             "reply_ctx": reply_ctx,
+            "sender_default": "owner",
+            "known_agents": await _known_agent_ids(repos),
         },
     )
 
@@ -97,13 +98,14 @@ async def send_post(
 
     if urgency not in ("blocker", "high", "normal", "low"):
         return templates.TemplateResponse(
-            request,
-            "send.html",
+            request, "send.html",
             {
                 "tab": "send",
                 "preset_to": recipient,
                 "reply_to": reply_to,
                 "error": f"invalid urgency '{urgency}'",
+                "sender_default": sender or "owner",
+                "known_agents": await _known_agent_ids(repos),
             },
             status_code=400,
         )
@@ -111,13 +113,14 @@ async def send_post(
     err = await _validate_recipient(repos, recipient)
     if err is not None:
         return templates.TemplateResponse(
-            request,
-            "send.html",
+            request, "send.html",
             {
                 "tab": "send",
                 "preset_to": recipient,
                 "reply_to": reply_to,
                 "error": err,
+                "sender_default": sender or "owner",
+                "known_agents": await _known_agent_ids(repos),
             },
             status_code=400,
         )
@@ -143,7 +146,9 @@ async def send_post(
         {
             "tab": "send",
             "preset_to": recipient,
-            "reply_to": None,  # clear after send
+            "reply_to": None,
             "success": success,
+            "sender_default": sender or "owner",
+            "known_agents": await _known_agent_ids(repos),
         },
     )
