@@ -29,7 +29,7 @@ import click
 from .persistence.db import init_db
 from .persistence.sqlite_impl import SqliteRepositories
 from .personas.seed import ensure_user_personas, seed_default_agents, seed_personas
-from .runtime.memory import ensure_skeleton
+from .runtime.memory import ensure_shipped_facts, ensure_skeleton
 from .runtime.skills import ensure_skills_skeleton
 
 # ---------------------------------------------------------------------------
@@ -386,6 +386,7 @@ async def bootstrap_runtime(cfg: Any) -> list[str]:  # noqa: ANN401 — Config
             persona_overrides=cfg.persona_overrides,
         )
         ensure_skeleton(cfg.memory_path)
+        ensure_shipped_facts(cfg.memory_path)
         created_agents = await seed_default_agents(
             repos.agents, memory_root=cfg.memory_path,
         )

@@ -193,7 +193,7 @@ def test_load_filters_global_visible_to_everyone(tmp_path: Path) -> None:
 def test_load_filters_persona_scope(tmp_path: Path) -> None:
     ensure_skills_skeleton(tmp_path)
     _write_skill(tmp_path, "for-worker", scope="persona=worker-maintainer")
-    _write_skill(tmp_path, "for-reviewer", scope="persona=reviewer-skill")
+    _write_skill(tmp_path, "for-reviewer", scope="persona=reviewer")
     out = load_skills_for_context(
         tmp_path, agent_id="alice", persona_name="worker-maintainer"
     )
