@@ -31,18 +31,22 @@ CREATE INDEX IF NOT EXISTS personas_status ON personas(status);
 -- agent   = running instance with own identity, mailbox, task queue.
 --           Multiple agents can share one persona.
 CREATE TABLE IF NOT EXISTS agents (
-  id            TEXT PRIMARY KEY,
-  persona_name  TEXT NOT NULL REFERENCES personas(name),
-  status        TEXT NOT NULL DEFAULT 'idle'
-                CHECK (status IN ('idle','busy','archived')),
-  created_by    TEXT,    -- 'owner' or another agent_id
-  created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-  archived_at   TEXT,
-  metadata      TEXT     -- JSON: {model_id?, description?, ...}
+  id                TEXT PRIMARY KEY,
+  persona_name      TEXT NOT NULL REFERENCES personas(name),
+  status            TEXT NOT NULL DEFAULT 'idle'
+                    CHECK (status IN ('idle','busy','archived')),
+  -- parent_agent_id: the agent that spawned this one (or NULL for
+  -- bootstrap agents `owner`/`leader`). String "owner" is also valid
+  -- when the human owner created the agent directly via CLI/dashboard.
+  parent_agent_id   TEXT,
+  created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  archived_at       TEXT,
+  metadata          TEXT     -- JSON: {model_id?, description?, ...}
 );
 
 CREATE INDEX IF NOT EXISTS agents_persona ON agents(persona_name, status);
 CREATE INDEX IF NOT EXISTS agents_status ON agents(status);
+CREATE INDEX IF NOT EXISTS agents_parent ON agents(parent_agent_id);
 
 ------------------------------------------------------------
 -- Tasks

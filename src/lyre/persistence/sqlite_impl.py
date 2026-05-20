@@ -230,15 +230,15 @@ class SqliteAgentRepository:
         self,
         agent_id: str,
         persona_name: str,
-        created_by: str | None = None,
+        parent_agent_id: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> None:
         await self.conn.execute(
             """
-            INSERT INTO agents (id, persona_name, created_by, metadata)
+            INSERT INTO agents (id, persona_name, parent_agent_id, metadata)
             VALUES (?, ?, ?, ?)
             """,
-            (agent_id, persona_name, created_by, _json(metadata)),
+            (agent_id, persona_name, parent_agent_id, _json(metadata)),
         )
         await self.conn.commit()
 
@@ -311,7 +311,7 @@ class SqliteAgentRepository:
             id=row["id"],
             persona_name=row["persona_name"],
             status=row["status"],
-            created_by=row["created_by"],
+            parent_agent_id=row["parent_agent_id"],
             created_at=row["created_at"],
             archived_at=row["archived_at"],
             metadata=_parse_json(row["metadata"]),

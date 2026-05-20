@@ -27,12 +27,20 @@ class Agent(BaseModel):
     instance, with its own mailbox, own task queue, possibly own model
     override." Multiple agents can share one persona; mail and tasks are
     addressed to agent_id, never to persona name.
+
+    Spawned agents use `<persona>/<name>` ids (e.g.
+    `worker-maintainer/refactor-auth`). Bootstrap agents (`owner`,
+    `leader`) keep bare ids. `parent_agent_id` records the spawner so
+    a child can escalate / reply up the chain without searching.
     """
 
     id: str
     persona_name: str
     status: AgentStatus = "idle"
-    created_by: str | None = None
+    # The agent that spawned this one. NULL for bootstrap agents
+    # (`owner`, `leader`). String "owner" when the human created the
+    # agent directly via CLI/dashboard. Otherwise an existing agent_id.
+    parent_agent_id: str | None = None
     created_at: datetime | None = None
     archived_at: datetime | None = None
     # JSON metadata. Currently recognized keys:

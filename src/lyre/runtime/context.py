@@ -111,7 +111,16 @@ def assemble_system_prompt(
     # WAKEUPS for the same (agent_id, persona, allowed_tools). Putting it
     # first maximizes the cached prefix on Anthropic & DeepSeek.
     effective_id = agent_id or persona.name
-    identity = _build_identity_preamble(effective_id, persona.name)
+    parent_agent_id: str | None = None
+    if other_agents:
+        for a in other_agents:
+            # Pydantic Agent or dataclass-like; just look up id.
+            if getattr(a, "id", None) == effective_id:
+                parent_agent_id = getattr(a, "parent_agent_id", None)
+                break
+    identity = _build_identity_preamble(
+        effective_id, persona.name, parent_agent_id=parent_agent_id,
+    )
 
     parts: list[str] = [
         identity,
@@ -211,11 +220,33 @@ def assemble_system_prompt(
     return "\n".join(parts).strip()
 
 
-def _build_identity_preamble(agent_id: str, persona_name: str) -> str:
+def _build_identity_preamble(
+    agent_id: str,
+    persona_name: str,
+    *,
+    parent_agent_id: str | None = None,
+) -> str:
     """The universal head of every system prompt. Byte-identical for a
-    given (agent_id, persona_name) — maximizes Anthropic / DeepSeek
-    prefix-cache hits across wakeups."""
-    notes_path = f"~/.lyre/memory/facts/agent-{agent_id}-notes.md"
+    given (agent_id, persona_name, parent_agent_id) — maximizes
+    Anthropic / DeepSeek prefix-cache hits across wakeups. The
+    parent-agent line only appears when there IS a parent (spawned
+    agents); bootstrap roots like `owner`/`leader` see the prompt
+    without that line, preserving cache reuse for them too."""
+    # `persona/name` ids would otherwise hint at a directory layer in
+    # the notes path; flatten `/` to `-` to match
+    # ensure_agent_notes_file's filename convention.
+    _flat_id = agent_id.replace("/", "-")
+    notes_path = f"~/.lyre/memory/facts/agent-{_flat_id}-notes.md"
+    parent_line = ""
+    if parent_agent_id:
+        parent_line = (
+            f"You were spawned by `{parent_agent_id}` — that is your "
+            f"parent agent. If you need clarification, are blocked, or "
+            f"want to escalate, mailbox_send to `{parent_agent_id}` "
+            f"rather than going to `owner` directly. The parent "
+            f"orchestrates the work; let them decide whether owner needs "
+            f"to be looped in.\n"
+        )
     return (
         f"You are agent **{agent_id}** (persona: `{persona_name}`).\n"
         f"Your mailbox key is `{agent_id}` — when you call mailbox_read "
@@ -224,6 +255,7 @@ def _build_identity_preamble(agent_id: str, persona_name: str) -> str:
         f"Do not refer to yourself by any other name. In particular, do "
         f"not synthesize variants like `{agent_id}-scheduler` or "
         f"`{persona_name}-foo`.\n"
+        + parent_line +
         f"\n"
         f"**HOW WAKEUPS END — IMPORTANT MECHANICS.** There is NO "
         f"`end_turn` tool to call. The wakeup ends *naturally* when you "

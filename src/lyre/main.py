@@ -423,38 +423,90 @@ def dashboard_cmd(host: str, port: int) -> None:
     "--until", "recur_until", default=None,
     help="ISO 8601 UTC. Stop recurrence after this. Default: first_fire + 1 year.",
 )
+@click.option(
+    "--no-spawn", is_flag=True, default=False,
+    help="Reject unknown `persona/name` recipients instead of "
+         "spawning the agent on the fly. Use when you want a strict "
+         "'this agent must already exist' check.",
+)
 def send_cmd(
     recipient: str, body: str, title: str | None,
     urgency: str, sender: str, task_id: str | None,
     deliver_at: str | None, deliver_in: str | None,
     recur_every: str | None, recur_cron: str | None, recur_until: str | None,
+    no_spawn: bool,
 ) -> None:
     """Send a mailbox message to an agent.
 
-    `recipient` is an AGENT ID (post-A3: agents are first-class). Use
-    `lyre agent list` to see live agent ids. Owner-originated messages
-    bypass the outbox.
+    `recipient` is an AGENT ID (post-A3: agents are first-class). Bare
+    ids (`owner`, `leader`) reach bootstrap agents directly. Spawned
+    agents use `persona/name` (e.g. `worker-maintainer/refactor-auth`);
+    if that id doesn't exist yet the CLI auto-creates it (use
+    `--no-spawn` to disable). `lyre agent list` shows live agent ids.
     """
 
     async def _run() -> None:
+        from .runtime.identity import (
+            is_bootstrap,
+            is_valid_agent_id,
+            split_id,
+        )
         cfg = Config.from_env()
         conn = await init_db(cfg.db_path)
         try:
             import uuid as _uuid
 
             repos = SqliteRepositories(conn)
-            # Validate recipient is a real agent (or special 'owner'
-            # mailbox). Catches typos / "I meant the persona" mistakes
-            # before they end up as silently-undeliverable mail.
-            if recipient != "owner" and not await repos.agents.exists(recipient):
-                live = sorted({a.id for a in await repos.agents.list_all()} | {"owner"})
+            # Resolve / auto-spawn:
+            #   - "owner": always valid (human mailbox at the edge)
+            #   - bare bootstrap id: must exist (no spawning bootstrap agents)
+            #   - bare unknown id: error (anti-hallucination — `leader-scheduler`)
+            #   - persona/name: spawn if missing AND --no-spawn not set
+            if recipient == "owner":
+                pass
+            elif not is_valid_agent_id(recipient):
                 click.echo(
-                    f"unknown agent {recipient!r}. Known: {live}. "
-                    f"`lyre agent list` for details or "
-                    f"`lyre agent create <persona>` to spawn a new one.",
+                    f"invalid agent id {recipient!r}: must be a bootstrap "
+                    f"id (owner / leader) or `persona/name`. See "
+                    f"`lyre agent list` for live agents.",
                     err=True,
                 )
                 sys.exit(1)
+            elif not await repos.agents.exists(recipient):
+                persona, name = split_id(recipient)
+                # Bare names (no `/`) must already exist — they can't be
+                # spawned because there's no persona side to validate.
+                if name is None or is_bootstrap(recipient):
+                    live = sorted({a.id for a in await repos.agents.list_all()} | {"owner"})
+                    click.echo(
+                        f"unknown agent {recipient!r}. Known: {live}. "
+                        f"Pass an existing agent id, or use `persona/name` "
+                        f"to auto-spawn.",
+                        err=True,
+                    )
+                    sys.exit(1)
+                if no_spawn:
+                    click.echo(
+                        f"agent {recipient!r} doesn't exist and "
+                        f"--no-spawn was passed; refusing to create it.",
+                        err=True,
+                    )
+                    sys.exit(1)
+                persona_row = await repos.personas.get(persona)
+                if persona_row is None or persona_row.status != "approved":
+                    click.echo(
+                        f"can't spawn agent {recipient!r}: persona "
+                        f"{persona!r} is not an approved persona. "
+                        f"`lyre persona list` for the valid set.",
+                        err=True,
+                    )
+                    sys.exit(1)
+                await repos.agents.create(
+                    agent_id=recipient,
+                    persona_name=persona,
+                    parent_agent_id=sender or "owner",
+                )
+                click.echo(f"spawned agent {recipient} (persona={persona})")
             await repos.mailbox.ensure_mailbox(recipient)
 
             # Future-mail branch — any of --at/--in/--recur-* flips this on.
@@ -1117,7 +1169,7 @@ def agent_create_cmd(
             await repos.agents.create(
                 agent_id=agent_id,
                 persona_name=persona,
-                created_by="owner",
+                parent_agent_id="owner",
                 metadata=metadata or None,
             )
             click.echo(f"created agent {agent_id} (persona={persona})")

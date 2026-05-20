@@ -604,22 +604,30 @@ async def test_list_tasks_validates_status(ctx: ToolContext) -> None:
 
 @pytest.mark.asyncio
 async def test_create_agent_auto_names(ctx: ToolContext) -> None:
+    """Auto-name uses `<persona>/<n>` for the smallest unused n.
+
+    Models are expected to supply a meaningful `name` in practice; the
+    numeric fallback only fires in degenerate cases (model didn't
+    bother / migrated from older spec). The `/n` form keeps the
+    persona/name grammar intact."""
     from lyre.runtime.tools.introspect import CREATE_AGENT
 
     out = await CREATE_AGENT.handler(ctx, {"persona": "worker"})
-    assert out["agent_id"] == "worker-1"
+    assert out["agent_id"] == "worker/1"
     out2 = await CREATE_AGENT.handler(ctx, {"persona": "worker"})
-    assert out2["agent_id"] == "worker-2"
+    assert out2["agent_id"] == "worker/2"
 
 
 @pytest.mark.asyncio
 async def test_create_agent_explicit_name(ctx: ToolContext) -> None:
+    """Explicit name composes into `<persona>/<name>` — that's now the
+    canonical addressing form for spawned agents (bootstrap stays bare)."""
     from lyre.runtime.tools.introspect import CREATE_AGENT
 
     out = await CREATE_AGENT.handler(
         ctx, {"persona": "worker", "name": "alice", "description": "test"}
     )
-    assert out["agent_id"] == "alice"
+    assert out["agent_id"] == "worker/alice"
     # Duplicate explicit name fails
     with pytest.raises(ToolError, match="already exists"):
         await CREATE_AGENT.handler(ctx, {"persona": "worker", "name": "alice"})
@@ -631,10 +639,32 @@ async def test_create_agent_validates_inputs(ctx: ToolContext) -> None:
 
     with pytest.raises(ToolError, match="persona"):
         await CREATE_AGENT.handler(ctx, {"persona": "ghost-persona"})
-    with pytest.raises(ToolError, match="invalid agent id"):
+    with pytest.raises(ToolError, match="invalid agent name"):
         await CREATE_AGENT.handler(
             ctx, {"persona": "worker", "name": "Has Spaces"}
         )
+    # Bootstrap personas can't be respawned with this tool.
+    with pytest.raises(ToolError, match="reserved for bootstrap"):
+        await CREATE_AGENT.handler(ctx, {"persona": "leader", "name": "x"})
+
+
+@pytest.mark.asyncio
+async def test_create_agent_records_parent_from_caller(
+    ctx: ToolContext,
+) -> None:
+    """The new agent's `parent_agent_id` should be the caller's
+    self_mailbox — establishing lineage automatically without the model
+    having to remember to pass it."""
+    from lyre.runtime.tools.introspect import CREATE_AGENT
+
+    out = await CREATE_AGENT.handler(
+        ctx, {"persona": "worker", "name": "refactor-auth"}
+    )
+    assert out["parent_agent_id"] == ctx.self_mailbox
+
+    row = await ctx.repos.agents.get("worker/refactor-auth")
+    assert row is not None
+    assert row.parent_agent_id == ctx.self_mailbox
 
 
 @pytest.mark.asyncio
@@ -658,11 +688,13 @@ async def test_create_agent_pre_creates_notes_file(
     )
     notes_path = Path(out["notes_file"])
     assert notes_path.exists()
-    assert notes_path.name == "agent-scout-notes.md"
+    # Notes path mirrors the agent_id with `/` flattened to `-` so the
+    # filename remains a single segment under facts/.
+    assert "agent-worker" in notes_path.name and "scout" in notes_path.name
     text = notes_path.read_text(encoding="utf-8")
     # frontmatter + a "this is YOUR notebook" preamble
     assert "type: agent_notes" in text
-    assert "agent_id: scout" in text
+    assert "agent_id: worker/scout" in text
     assert "private notebook" in text
 
 
@@ -712,7 +744,7 @@ async def test_archive_agent_refuses_bootstrap(ctx: ToolContext) -> None:
     await CREATE_AGENT.handler(
         ctx, {"persona": "worker", "name": "scratch"}
     )
-    out = await ARCHIVE_AGENT.handler(ctx, {"agent_id": "scratch"})
+    out = await ARCHIVE_AGENT.handler(ctx, {"agent_id": "worker/scratch"})
     assert out["archived"] is True
 
     with pytest.raises(ToolError, match="well-known agent"):
@@ -733,17 +765,22 @@ async def test_list_agents_excludes_archived_by_default(
 
     await CREATE_AGENT.handler(ctx, {"persona": "worker", "name": "live"})
     await CREATE_AGENT.handler(ctx, {"persona": "worker", "name": "dead"})
-    await ARCHIVE_AGENT.handler(ctx, {"agent_id": "dead"})
+    await ARCHIVE_AGENT.handler(ctx, {"agent_id": "worker/dead"})
 
     out = await LIST_AGENTS.handler(ctx, {})
     ids = {a["id"] for a in out["agents"]}
-    assert "live" in ids
-    assert "dead" not in ids
+    assert "worker/live" in ids
+    assert "worker/dead" not in ids
 
     out_all = await LIST_AGENTS.handler(ctx, {"include_archived": True})
     ids_all = {a["id"] for a in out_all["agents"]}
-    assert "dead" in ids_all
-    assert "live" in ids_all
+    assert "worker/dead" in ids_all
+    assert "worker/live" in ids_all
+    # Enrichment fields land in every entry.
+    sample = next(a for a in out_all["agents"] if a["id"] == "worker/live")
+    assert "occupancy" in sample
+    assert "parent_agent_id" in sample
+    assert sample["occupancy"] in ("available", "queued", "busy", "archived")
 
 
 @pytest.mark.asyncio

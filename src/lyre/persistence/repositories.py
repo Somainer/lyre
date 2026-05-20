@@ -34,10 +34,15 @@ class AgentRepository(Protocol):
         self,
         agent_id: str,
         persona_name: str,
-        created_by: str | None = None,
+        parent_agent_id: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> None:
-        """Insert a new agent. Errors if id already exists."""
+        """Insert a new agent. Errors if id already exists.
+
+        `parent_agent_id` records who spawned this agent — NULL for
+        bootstrap roots, "owner" when the human created via CLI/dashboard,
+        else another agent_id (spawned via `create_agent` tool).
+        """
         ...
 
     async def get(self, agent_id: str) -> Agent | None: ...

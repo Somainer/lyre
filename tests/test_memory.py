@@ -179,6 +179,27 @@ def test_assemble_system_prompt_without_memory_root_unchanged() -> None:
     assert "worker role\n\nyou write code" in prompt
 
 
+def test_assemble_system_prompt_omits_parent_line_for_bootstrap() -> None:
+    """Bootstrap agents (no parent_agent_id in the agents list) get a
+    preamble WITHOUT the 'You were spawned by …' line — that line is
+    only meaningful for spawned children."""
+    prompt = assemble_system_prompt(_persona())
+    assert "You were spawned by" not in prompt
+
+
+def test_assemble_system_prompt_includes_parent_hint_for_spawned() -> None:
+    """A spawned agent's preamble surfaces its parent so the model
+    knows where to escalate before hitting owner directly."""
+    from types import SimpleNamespace
+
+    other_agents = [
+        SimpleNamespace(id="worker", parent_agent_id="leader"),
+    ]
+    prompt = assemble_system_prompt(_persona(), other_agents=other_agents)
+    assert "You were spawned by `leader`" in prompt
+    assert "mailbox_send to `leader`" in prompt
+
+
 def test_assemble_system_prompt_with_empty_memory_root_no_section(
     tmp_path: Path,
 ) -> None:
