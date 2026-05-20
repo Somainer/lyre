@@ -35,9 +35,15 @@ from ..persistence.repositories import AgentRepository, PersonaRepository
 # Agent ids that always exist after `lyre onboard`. These are the long-lived
 # "well-known" agents users (owner) and the CLI default `lyre send leader ...`
 # expect to be addressable from day one. Workers spawn on demand.
+#
+# `reviewer-1` is seeded so worker can mailbox_send directly to it without
+# going through leader — auto-wake-on-mail picks it up. Multiple reviewers
+# can be created later via create_agent if parallel review throughput is
+# needed.
 DEFAULT_AGENTS: tuple[tuple[str, str], ...] = (
     ("owner", "owner"),   # (agent_id, persona_name)
     ("leader", "leader"),
+    ("reviewer-1", "reviewer"),
 )
 
 

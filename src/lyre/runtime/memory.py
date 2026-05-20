@@ -260,3 +260,30 @@ def ensure_skeleton(root: Path) -> list[Path]:
             p.mkdir(parents=True, exist_ok=True)
             created.append(p)
     return created
+
+
+def _shipped_checklists_dir() -> Path:
+    # src/lyre/runtime/memory.py → ../data/checklists/
+    return Path(__file__).resolve().parent.parent / "data" / "checklists"
+
+
+def ensure_shipped_facts(root: Path) -> list[str]:
+    """Copy shipped facts (currently: review checklists) into ``<root>/facts/``.
+
+    Idempotent: a fact already present in the user's memory is never
+    overwritten — owner edits stick across re-runs of ``lyre onboard``.
+    Returns the list of basenames actually copied.
+    """
+    facts_dir = root / "facts"
+    facts_dir.mkdir(parents=True, exist_ok=True)
+    copied: list[str] = []
+    src_dir = _shipped_checklists_dir()
+    if not src_dir.is_dir():
+        return copied
+    for src in sorted(src_dir.glob("*.md")):
+        target = facts_dir / src.name
+        if target.exists():
+            continue
+        target.write_bytes(src.read_bytes())
+        copied.append(src.name)
+    return copied

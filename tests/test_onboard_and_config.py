@@ -598,8 +598,8 @@ async def test_bootstrap_runtime_creates_db_and_seeds(
 
     created_agents = await bootstrap_runtime(cfg)
 
-    # First bootstrap creates owner + leader.
-    assert set(created_agents) == {"owner", "leader"}
+    # First bootstrap creates owner + leader + reviewer-1.
+    assert set(created_agents) == {"owner", "leader", "reviewer-1"}
     assert cfg.db_path.exists()
     assert (cfg.memory_path / "facts").is_dir()
     # Per-agent notebook files appeared.
@@ -640,8 +640,8 @@ async def test_bootstrap_copies_shipped_personas_as_directory_layout(
 
     user_personas = cfg.user_personas_dir
     # Every shipped persona has been materialized as <name>/identity.md.
-    expected_personas = {"owner", "leader", "worker-maintainer", "reviewer-pr",
-                         "reviewer-skill", "summary-agent"}
+    expected_personas = {"owner", "leader", "worker-maintainer", "reviewer",
+                         "summary-agent"}
     for name in expected_personas:
         assert (user_personas / name / "identity.md").is_file(), name
 
@@ -701,7 +701,7 @@ def test_discover_persona_falls_back_to_shipped_when_user_dir_empty(
     empty = tmp_path / "empty_personas"
     empty.mkdir()
     files = discover_persona_files(empty)
-    # Falls back to shipped, so we get the same 6 personas Lyre ships.
+    # Falls back to shipped personas.
     names = {p.stem for p in files}
-    assert names == {"owner", "leader", "worker-maintainer", "reviewer-pr",
-                     "reviewer-skill", "summary-agent"}
+    assert names == {"owner", "leader", "worker-maintainer", "reviewer",
+                     "summary-agent"}

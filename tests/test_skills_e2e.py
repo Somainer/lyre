@@ -78,9 +78,9 @@ async def _seed_personas(repos: SqliteRepositories) -> None:
     )
     await repos.personas.upsert(
         Persona(
-            name="reviewer-skill",
-            role_description="skill reviewer",
-            system_prompt="you review skills",
+            name="reviewer",
+            role_description="generic reviewer",
+            system_prompt="you review artifacts",
             allowed_lyre_tools=["shell_exec", "mailbox_send"],
             model_preference={
                 "tier": "workhorse", "requires": ["tool_use"], "prefer": [],
@@ -105,7 +105,7 @@ async def _seed_personas(repos: SqliteRepositories) -> None:
         agent_id="worker-1", persona_name="worker-maintainer"
     )
     await repos.agents.create(
-        agent_id="reviewer-1", persona_name="reviewer-skill"
+        agent_id="reviewer-1", persona_name="reviewer"
     )
     await repos.mailbox.ensure_mailbox("owner")
     await repos.mailbox.ensure_mailbox("leader")
@@ -215,7 +215,7 @@ async def test_skill_proposal_approve_reuse_loop(
     t = await repos.tasks.get(worker1_task)
     assert t is not None and t.status == "completed"
 
-    # === TICK 2: reviewer-skill approves ===
+    # === TICK 2: reviewer approves ===
     reviewer_task = await repos.tasks.create(
         TaskSpec(
             agent_id="reviewer-1",

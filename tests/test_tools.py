@@ -715,16 +715,17 @@ async def test_seed_default_agents_pre_creates_notes_files(
     conn = await init_db(":memory:")
     try:
         repos = SqliteRepositories(conn)
-        # Personas must exist before agents (FK).
-        for name in ("owner", "leader"):
+        # Personas must exist before agents (FK). The DEFAULT_AGENTS tuple
+        # ships owner/leader/reviewer; each needs its persona row first.
+        for name in ("owner", "leader", "reviewer"):
             await repos.personas.upsert(
                 Persona(name=name, role_description=name, system_prompt=name)
             )
         created = await seed_default_agents(
             repos.agents, memory_root=memory_root,
         )
-        assert "owner" in created and "leader" in created
-        for aid in ("owner", "leader"):
+        assert {"owner", "leader", "reviewer-1"} <= set(created)
+        for aid in ("owner", "leader", "reviewer-1"):
             p = memory_root / "facts" / f"agent-{aid}-notes.md"
             assert p.exists(), f"missing notes file for {aid}"
             assert f"agent_id: {aid}" in p.read_text(encoding="utf-8")

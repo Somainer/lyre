@@ -65,7 +65,7 @@ async def test_migration_runner_idempotent_on_reinit(tmp_path: Path) -> None:
 
 @pytest.fixture
 async def ctx(repos: SqliteRepositories) -> ToolContext:
-    for name in ("leader", "worker-maintainer", "reviewer-pr", "owner"):
+    for name in ("leader", "worker-maintainer", "reviewer", "owner"):
         await repos.personas.upsert(
             Persona(name=name, role_description=f"{name} role", system_prompt=name)
         )
@@ -91,14 +91,14 @@ async def test_broadcast_creates_n_outbox_rows_with_shared_broadcast_id(
     res = await MAILBOX_SEND.handler(
         ctx,
         {
-            "to": ["worker-maintainer", "reviewer-pr"],
+            "to": ["worker-maintainer", "reviewer"],
             "body": "kickoff",
             "_tool_use_id": "tu_bc",
         },
     )
     assert res["status"] == "queued"
     assert res["broadcast_id"] is not None
-    assert set(res["recipients"]) == {"worker-maintainer", "reviewer-pr"}
+    assert set(res["recipients"]) == {"worker-maintainer", "reviewer"}
 
     batch = await ctx.repos.outbox.dequeue_batch(limit=10)
     assert len(batch) == 2
@@ -110,7 +110,7 @@ async def test_broadcast_creates_n_outbox_rows_with_shared_broadcast_id(
     # Both copies must list the SAME full recipient set.
     assert len(recipients_all_sets) == 1
     full = next(iter(recipients_all_sets))
-    assert set(full) == {"worker-maintainer", "reviewer-pr"}
+    assert set(full) == {"worker-maintainer", "reviewer"}
 
 
 @pytest.mark.asyncio
@@ -133,7 +133,7 @@ async def test_broadcast_delivered_via_dispatcher_yields_n_rows(
     await MAILBOX_SEND.handler(
         ctx,
         {
-            "to": ["worker-maintainer", "reviewer-pr"],
+            "to": ["worker-maintainer", "reviewer"],
             "body": "go",
             "_tool_use_id": "tu_d",
         },
@@ -143,12 +143,12 @@ async def test_broadcast_delivered_via_dispatcher_yields_n_rows(
     assert delivered == 2
 
     a = await ctx.repos.mailbox.read_messages("worker-maintainer")
-    b = await ctx.repos.mailbox.read_messages("reviewer-pr")
+    b = await ctx.repos.mailbox.read_messages("reviewer")
     assert [m.body for m in a] == ["go"]
     assert [m.body for m in b] == ["go"]
     # Each delivered row carries the shared broadcast_id + recipients_all.
     assert a[0].broadcast_id == b[0].broadcast_id
-    assert set(a[0].recipients_all or []) == {"worker-maintainer", "reviewer-pr"}
+    assert set(a[0].recipients_all or []) == {"worker-maintainer", "reviewer"}
 
 
 @pytest.mark.asyncio
@@ -189,7 +189,7 @@ async def test_forward_msg_id_lands_in_metadata(ctx: ToolContext) -> None:
     await MAILBOX_SEND.handler(
         ctx,
         {
-            "to": ["worker-maintainer", "reviewer-pr"],
+            "to": ["worker-maintainer", "reviewer"],
             "body": "owner wants this — context in attachment",
             "forward_msg_id": original_id,
             "_tool_use_id": "tu_fwd",
@@ -242,13 +242,13 @@ async def test_mailbox_get_message_fetches_any_recipient(
             urgency="normal",
             body="hi worker",
             broadcast_id="bc-x",
-            recipients_all=["worker-maintainer", "reviewer-pr"],
+            recipients_all=["worker-maintainer", "reviewer"],
         )
     )
     res = await MAILBOX_GET_MESSAGE.handler(ctx, {"msg_id": mid})
     assert res["recipient"] == "worker-maintainer"
     assert res["broadcast_id"] == "bc-x"
-    assert set(res["recipients_all"]) == {"worker-maintainer", "reviewer-pr"}
+    assert set(res["recipients_all"]) == {"worker-maintainer", "reviewer"}
 
 
 @pytest.mark.asyncio
