@@ -22,13 +22,14 @@ def fake_entry(
     base_url: str | None = None,
     auth_env: str | None = "FAKE_API_KEY",
     headers: tuple[tuple[str, str], ...] = (),
+    api: str = "chat-completions",
     status: str = "enabled",
 ) -> ModelEntry:
     return ModelEntry(
         id=id,
         provider=provider,
         endpoint=ModelEndpoint(
-            base_url=base_url, auth_env=auth_env, headers=headers,
+            base_url=base_url, auth_env=auth_env, headers=headers, api=api,
         ),
         capabilities=capabilities,
         tier=tier,  # type: ignore[arg-type]

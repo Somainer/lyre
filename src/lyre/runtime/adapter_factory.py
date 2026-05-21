@@ -99,25 +99,22 @@ class AdapterFactory:
                 extra_headers=extra_headers or None,
             )
         if entry.provider == "openai":
-            return OpenAIAdapter(
-                api_key=sdk_api_key,
-                base_url=entry.endpoint.base_url,
-                extra_headers=extra_headers or None,
-            )
-        if entry.provider == "openai-responses":
-            # OpenAI's newer Responses API (POST /v1/responses) — picked
-            # by users whose endpoint / proxy exposes `/responses` (e.g.
-            # internal gateways like bytedance's ai-coder). Same auth /
-            # headers / base_url contract as the chat-completions
-            # variant; differs only in API surface.
-            return OpenAIResponsesAdapter(
-                api_key=sdk_api_key,
-                base_url=entry.endpoint.base_url,
-                extra_headers=extra_headers or None,
-            )
+            # Within the OpenAI family the `endpoint.api` field picks
+            # the dialect — `chat-completions` (the historical
+            # default, what OpenRouter / Together / vLLM-OAI expose)
+            # or `responses` (OpenAI's newer surface, also some
+            # internal corporate gateways like bytedance ai-coder).
+            common_kwargs = {
+                "api_key": sdk_api_key,
+                "base_url": entry.endpoint.base_url,
+                "extra_headers": extra_headers or None,
+            }
+            if entry.endpoint.api == "responses":
+                return OpenAIResponsesAdapter(**common_kwargs)
+            return OpenAIAdapter(**common_kwargs)
         raise AdapterFactoryError(
             f"Unknown provider {entry.provider!r} for model {entry.id!r}. "
-            f"Supported: 'anthropic', 'openai', 'openai-responses'."
+            f"Supported: 'anthropic', 'openai'."
         )
 
 

@@ -271,17 +271,19 @@ def test_serve_reachability_stacked_mode_needs_api_key(monkeypatch) -> None:
 
 
 # ---------------------------------------------------------------------------
-# openai-responses provider — Responses API (/v1/responses) surface
+# openai provider + endpoint.api="responses" — Responses API surface.
+# Same provider as Chat Completions; dialect picked by `endpoint.api`.
 # ---------------------------------------------------------------------------
 
 
 def test_factory_makes_openai_responses_adapter(monkeypatch) -> None:
-    """provider='openai-responses' routes to OpenAIResponsesAdapter —
-    covers OpenAI's newer /v1/responses surface and corporate
-    proxies that mirror it."""
+    """provider='openai' + endpoint.api='responses' routes to
+    OpenAIResponsesAdapter — covers OpenAI's newer /v1/responses
+    surface and corporate proxies that mirror it."""
     monkeypatch.setenv("OPENAI_API_KEY", "sk-fake")
     entry = fake_entry(
-        provider="openai-responses",
+        provider="openai",
+        api="responses",
         auth_env="OPENAI_API_KEY",
         base_url="https://internal-proxy.example/responses",
     )
@@ -290,13 +292,27 @@ def test_factory_makes_openai_responses_adapter(monkeypatch) -> None:
     assert isinstance(adapter, OpenAIResponsesAdapter)
 
 
+def test_factory_openai_default_api_is_chat_completions(monkeypatch) -> None:
+    """No explicit `api` → default 'chat-completions' → OpenAIAdapter
+    (NOT OpenAIResponsesAdapter). Guards against accidentally routing
+    every OpenAI-family entry through Responses."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-fake")
+    entry = fake_entry(provider="openai", auth_env="OPENAI_API_KEY")
+    adapter = AdapterFactory().make(entry)
+    from lyre.adapter.openai import OpenAIAdapter
+    from lyre.adapter.openai_responses import OpenAIResponsesAdapter
+    assert isinstance(adapter, OpenAIAdapter)
+    assert not isinstance(adapter, OpenAIResponsesAdapter)
+
+
 def test_factory_openai_responses_header_only(monkeypatch) -> None:
     """Header-only auth path works with the Responses adapter too —
     that's the actual production setup for bytedance / similar
     internal gateways."""
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     entry = fake_entry(
-        provider="openai-responses",
+        provider="openai",
+        api="responses",
         auth_env=None,
         headers=(("Authorization", "Bearer abc"),),
         base_url="https://gateway.internal/responses",
@@ -305,6 +321,27 @@ def test_factory_openai_responses_header_only(monkeypatch) -> None:
     from lyre.adapter.openai_responses import OpenAIResponsesAdapter
     assert isinstance(adapter, OpenAIResponsesAdapter)
     assert adapter.client.default_headers.get("Authorization") == "Bearer abc"
+
+
+def test_endpoint_api_field_validates_value() -> None:
+    """ModelEndpoint.from_dict must reject unknown `api` values up-front
+    so config typos surface at startup, not on first request."""
+    from lyre.runtime.model_registry import ModelEndpoint
+    with pytest.raises(ValueError, match="endpoint.api"):
+        ModelEndpoint.from_dict({"api": "completions"})  # typo
+    with pytest.raises(ValueError, match="endpoint.api"):
+        ModelEndpoint.from_dict({"api": "anthropic-messages"})
+
+
+def test_endpoint_api_field_defaults_to_chat_completions() -> None:
+    """Empty/missing `api` → default 'chat-completions' for backward
+    compat with configs that predate the Responses surface."""
+    from lyre.runtime.model_registry import ModelEndpoint
+    assert ModelEndpoint.from_dict({}).api == "chat-completions"
+    assert ModelEndpoint.from_dict(None).api == "chat-completions"
+    assert (
+        ModelEndpoint.from_dict({"api": "responses"}).api == "responses"
+    )
 
 
 def test_responses_adapter_input_conversion_text_only() -> None:

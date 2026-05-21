@@ -18,6 +18,11 @@ Tier = Literal["flagship", "workhorse", "cheap"]
 RegistryStatus = Literal["enabled", "disabled"]
 
 
+_VALID_OPENAI_APIS: frozenset[str] = frozenset(
+    {"chat-completions", "responses"}
+)
+
+
 @dataclass(frozen=True)
 class ModelEndpoint:
     """How to reach + authenticate to one model endpoint.
@@ -39,12 +44,23 @@ class ModelEndpoint:
 
     At least one of the two must be set — adapter factory will refuse
     to build a client otherwise.
+
+    `api` picks the dialect within an OpenAI-family provider:
+
+      * `"chat-completions"` (default) — POST /v1/chat/completions
+      * `"responses"`                  — POST /v1/responses (newer
+                                          API surface; some internal
+                                          gateways like bytedance
+                                          ai-coder)
+
+    Ignored for non-openai providers.
     """
 
     base_url: str | None
     auth_env: str | None
     # tuple of (name, value) pairs — frozen so the dataclass stays hashable.
     headers: tuple[tuple[str, str], ...] = ()
+    api: str = "chat-completions"
 
     @classmethod
     def from_dict(cls, d: dict | None) -> ModelEndpoint:
@@ -59,10 +75,17 @@ class ModelEndpoint:
             (str(k), _interpolate_env(str(v)))
             for k, v in raw_headers.items()
         )
+        api = d.get("api") or "chat-completions"
+        if api not in _VALID_OPENAI_APIS:
+            raise ValueError(
+                f"endpoint.api must be one of "
+                f"{sorted(_VALID_OPENAI_APIS)}; got {api!r}"
+            )
         return cls(
             base_url=d.get("base_url") or None,
             auth_env=d.get("auth_env") or None,
             headers=headers,
+            api=api,
         )
 
     @property
