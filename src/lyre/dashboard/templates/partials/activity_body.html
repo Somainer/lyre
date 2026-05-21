@@ -126,7 +126,7 @@
           <span class="sep-dot">·</span>
           {{ model_pill(e.detail.model) }}
           <span class="sep-dot">·</span>
-          <span><span class="dim">ctx</span> {{ (e.detail.context_peak_pct or 0) | round | int }}%</span>
+          <span><span class="dim">ctx</span> {% if e.detail.context_peak_pct is not none %}{{ e.detail.context_peak_pct | round | int }}%{% else %}—{% endif %}</span>
           {% if e.detail.compaction_count and e.detail.compaction_count > 0 %}
             <span class="sep-dot">·</span><span class="num-warn">compaction ×{{ e.detail.compaction_count }}</span>
           {% endif %}

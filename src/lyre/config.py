@@ -171,6 +171,9 @@ class ModelEntry:
     """User-supplied model registry entry; merges into the shipped registry.
 
     Fields mirror ``model_registry.yaml`` so the same struct shape works.
+    ``context_window`` and ``cost_per_mtok`` are optional — when omitted
+    AND the entry's id matches a shipped registry entry, the shipped
+    values are inherited (see ``runtime.model_registry.merge_user_entries``).
     """
 
     id: str
@@ -181,6 +184,13 @@ class ModelEntry:
     enabled: bool = True
     prefer: list[str] | None = None
     notes: str | None = None
+    # Token count for auto-compact gating + dashboard "ctx N%" display.
+    # Almost no reason to write this in config.toml — the same id in
+    # the shipped registry has a sane value (e.g. 128000 for DeepSeek).
+    # Kept here so users who DO want a custom value have a path.
+    context_window: int | None = None
+    # Per-million-token pricing. Same inheritance story.
+    cost_per_mtok: dict[str, float] | None = None
 
 
 @dataclass(frozen=True)
@@ -312,6 +322,7 @@ class Config:
         models: list[ModelEntry] = []
         for m in models_raw:
             try:
+                cost_raw = m.get("cost_per_mtok")
                 models.append(
                     ModelEntry(
                         id=m["id"],
@@ -322,6 +333,10 @@ class Config:
                         enabled=bool(m.get("enabled", True)),
                         prefer=list(m["prefer"]) if m.get("prefer") else None,
                         notes=m.get("notes"),
+                        context_window=m.get("context_window"),
+                        cost_per_mtok=(
+                            dict(cost_raw) if isinstance(cost_raw, dict) else None
+                        ),
                     )
                 )
             except KeyError as exc:
