@@ -17,7 +17,7 @@ PersonaStatus = Literal["proposed", "approved", "deprecated"]
 SkillStatus = Literal["proposed", "approved", "deprecated"]
 AgentStatus = Literal["idle", "busy", "archived"]
 Urgency = Literal["blocker", "high", "normal", "low"]
-OutboxKind = Literal["mailbox_send", "tier1_notification"]
+OutboxKind = Literal["mailbox_send", "tier1_notification", "channel_publish"]
 
 
 class Agent(BaseModel):

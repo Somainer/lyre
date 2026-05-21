@@ -263,6 +263,19 @@ class MailboxRepository(Protocol):
         Used by `mailbox_get_message` for thread/reply/forward context."""
         ...
 
+    async def set_channel_external_id(
+        self, msg_id: int, channel_name: str, external_id: str,
+    ) -> None:
+        """Persist the external-system message id under
+        ``metadata.channels.<channel_name>.message_id``. Used by the
+        outbox `channel_publish` handler after the channel post
+        succeeds so later replies can resolve threading.
+
+        Implementations must update ONLY that key — other channels'
+        sub-trees and unrelated metadata fields must survive.
+        """
+        ...
+
     async def get_last_auto_triggered_id(self, recipient: str) -> int:
         """Scheduler-side cursor: highest msg_id we've already auto-dispatched
         a 'check inbox' task for. Independent of per-message read_at
