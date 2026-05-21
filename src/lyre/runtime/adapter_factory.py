@@ -18,6 +18,7 @@ import os
 from ..adapter.anthropic import AnthropicAdapter
 from ..adapter.llm_adapter import LLMAdapter
 from ..adapter.openai import OpenAIAdapter
+from ..adapter.openai_responses import OpenAIResponsesAdapter
 from .model_registry import ModelEntry
 
 
@@ -103,9 +104,20 @@ class AdapterFactory:
                 base_url=entry.endpoint.base_url,
                 extra_headers=extra_headers or None,
             )
+        if entry.provider == "openai-responses":
+            # OpenAI's newer Responses API (POST /v1/responses) — picked
+            # by users whose endpoint / proxy exposes `/responses` (e.g.
+            # internal gateways like bytedance's ai-coder). Same auth /
+            # headers / base_url contract as the chat-completions
+            # variant; differs only in API surface.
+            return OpenAIResponsesAdapter(
+                api_key=sdk_api_key,
+                base_url=entry.endpoint.base_url,
+                extra_headers=extra_headers or None,
+            )
         raise AdapterFactoryError(
             f"Unknown provider {entry.provider!r} for model {entry.id!r}. "
-            f"Supported: 'anthropic', 'openai'."
+            f"Supported: 'anthropic', 'openai', 'openai-responses'."
         )
 
 
