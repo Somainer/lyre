@@ -8,7 +8,7 @@ band without losing context.
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
 from ..view_helpers import rel_time
@@ -65,5 +65,36 @@ async def mail_view(
             "last_delivery_rel": last_delivery_rel,
             # base.html header pill
             "unread_count": unread_total,
+        },
+    )
+
+
+@router.get("/mail/{msg_id}", response_class=HTMLResponse)
+async def mail_detail(
+    request: Request, msg_id: int,
+) -> HTMLResponse:
+    """Single-message view with rendered markdown.
+
+    The list view (`/mail`) keeps bodies as fast plain text in a <pre>
+    so tab-switching stays snappy — markdown rendering for every row
+    is synchronous CPU work that adds up. This detail view is where
+    full markdown rendering lives: click a row's title to land here.
+
+    Page exposes the body twice — once rendered (for reading), once
+    raw (for copying via the one-click Copy button) — so the user
+    never has to choose between "looks nice" and "copies clean".
+    """
+    repos = request.app.state.repos
+    msg = await repos.mailbox.get_message(msg_id)
+    if msg is None:
+        raise HTTPException(
+            status_code=404, detail=f"mail #{msg_id} not found"
+        )
+    templates = request.app.state.templates
+    return templates.TemplateResponse(
+        request, "mail_detail.html",
+        {
+            "tab": "mail",
+            "msg": msg,
         },
     )

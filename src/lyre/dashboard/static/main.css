@@ -583,6 +583,16 @@ code, pre, .mono { font-family: var(--font-mono); }
   color: var(--fg-3);
 }
 .mail-row .mail-reply-btn:hover { color: var(--fg-1); background: var(--bg-raised); }
+/* Title is the only navigation target in the row — links to the
+   detail view where markdown-rendered body + Copy-raw button live. */
+.mail-row .mail-title-link {
+  color: inherit;
+  text-decoration: none;
+  border-bottom: 1px solid transparent;
+}
+.mail-row .mail-title-link:hover {
+  border-bottom-color: var(--line-3);
+}
 
 /* =========================================================
    ACTIVITY view — chat-style timeline

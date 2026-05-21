@@ -53,7 +53,11 @@
           <div class="mail-content">
             <div class="mail-title">
               {% if not m.read_at %}<span class="unread-dot" aria-label="unread"></span>{% endif %}
-              {{ m.title or "(no title)" }}
+              {# Title links to the detail view — that's where the
+                 markdown-rendered body + Copy-raw button live. List
+                 rows themselves stay non-link (so body selection
+                 works); only the title is a navigation target. #}
+              <a href="/mail/{{ m.id }}" class="mail-title-link">{{ m.title or "(no title)" }}</a>
             </div>
             {% if m.body %}
               {# Body is shown as PLAIN TEXT in <pre>, not as rendered
