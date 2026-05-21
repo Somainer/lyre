@@ -41,10 +41,16 @@ class AnthropicAdapter:
         api_key: str,
         base_url: str | None = None,
         timeout: float = 600.0,
+        extra_headers: dict[str, str] | None = None,
     ):
         kwargs: dict[str, Any] = {"api_key": api_key, "timeout": timeout}
         if base_url:
             kwargs["base_url"] = base_url
+        # Custom headers (e.g. for a proxy with its own auth scheme)
+        # ride alongside the standard x-api-key header the SDK sets
+        # from `api_key`. The SDK applies these to every request.
+        if extra_headers:
+            kwargs["default_headers"] = extra_headers
         self.client = AsyncAnthropic(**kwargs)
 
     async def stream_turn(

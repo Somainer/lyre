@@ -32,21 +32,49 @@ class AdapterFactory:
     """
 
     def make(self, entry: ModelEntry) -> LLMAdapter:
-        api_key = os.getenv(entry.endpoint.auth_env)
-        if not api_key:
+        # Two auth modes; either or both can be configured per entry:
+        #   1. API key from env var (entry.endpoint.auth_env) — the SDK
+        #      sets Bearer / x-api-key based on its provider.
+        #   2. Custom HTTP headers (entry.endpoint.headers) — sent on
+        #      every request via the SDK's default_headers. Useful for
+        #      proxies/gateways with non-standard auth schemes.
+        api_key: str | None = None
+        if entry.endpoint.auth_env:
+            api_key = os.getenv(entry.endpoint.auth_env)
+            if not api_key:
+                raise AdapterFactoryError(
+                    f"Model {entry.id!r}: env var "
+                    f"{entry.endpoint.auth_env!r} is unset. Set it (or "
+                    f"switch to header-only auth) before dispatching "
+                    f"tasks that may use this model."
+                )
+
+        extra_headers = entry.endpoint.headers_dict
+
+        if not api_key and not extra_headers:
             raise AdapterFactoryError(
-                f"Model {entry.id!r}: env var {entry.endpoint.auth_env!r} is unset. "
-                f"Set it before dispatching tasks that may use this model."
+                f"Model {entry.id!r}: no auth configured. Set either "
+                f"endpoint.auth_env (API-key mode) or endpoint.headers "
+                f"(custom-header mode), or both."
             )
+
+        # SDK constructors require a non-empty api_key string even when
+        # we're authenticating via custom headers — provider SDKs use a
+        # sentinel like "EMPTY" / "PLACEHOLDER" in that case. The actual
+        # auth comes from the custom headers we pass through.
+        sdk_api_key = api_key or "PLACEHOLDER"
+
         if entry.provider == "anthropic":
             return AnthropicAdapter(
-                api_key=api_key,
+                api_key=sdk_api_key,
                 base_url=entry.endpoint.base_url,
+                extra_headers=extra_headers or None,
             )
         if entry.provider == "openai":
             return OpenAIAdapter(
-                api_key=api_key,
+                api_key=sdk_api_key,
                 base_url=entry.endpoint.base_url,
+                extra_headers=extra_headers or None,
             )
         raise AdapterFactoryError(
             f"Unknown provider {entry.provider!r} for model {entry.id!r}. "

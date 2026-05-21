@@ -72,15 +72,27 @@ PROTOCOLS: tuple[ProviderProtocol, ...] = (
 class ModelSpec:
     """The minimal information needed to write one ``[[models]]`` block.
 
-    Built by the wizard from the user's protocol + endpoint + env_var + model
-    answers. Passed to :func:`write_config_toml` so the generated config
-    self-describes exactly what the user picked.
+    Built by the wizard from the user's protocol + endpoint + env_var +
+    model answers. Passed to :func:`write_config_toml` so the generated
+    config self-describes exactly what the user picked.
+
+    Two auth modes are supported:
+      * `auth_env` non-empty + `headers` empty
+            → standard API-key flow; SDK builds the right Authorization
+              header from the env var.
+      * `auth_env` empty + `headers` non-empty
+            → custom-header flow; useful for proxies / gateways with
+              their own auth scheme. Header VALUES may use the
+              ``${VAR}`` form to read from the environment at startup
+              so secrets stay out of config.toml.
+    Both can be set together (API key + extra org/project headers).
     """
 
     id: str            # registry id, e.g. "anthropic.deepseek-v4-flash"
     provider: str      # adapter id, e.g. "anthropic" or "openai"
     endpoint: str      # base_url; "" / None means "use SDK default"
-    auth_env: str
+    auth_env: str      # env-var name; empty string for header-only mode
+    headers: tuple[tuple[str, str], ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -199,12 +211,24 @@ def write_config_toml(
             endpoint_inline_parts.append(
                 f'base_url = "{_toml_escape(model.endpoint)}"'
             )
-        endpoint_inline_parts.append(
-            f'auth_env = "{_toml_escape(model.auth_env)}"'
-        )
-        lines.append(
-            "endpoint = { " + ", ".join(endpoint_inline_parts) + " }"
-        )
+        if model.auth_env:
+            endpoint_inline_parts.append(
+                f'auth_env = "{_toml_escape(model.auth_env)}"'
+            )
+        if endpoint_inline_parts:
+            lines.append(
+                "endpoint = { " + ", ".join(endpoint_inline_parts) + " }"
+            )
+        # Custom headers (header-only mode, or extras stacked on API
+        # key auth). Written as a separate sub-table because inline
+        # TOML can't nest a dict inside a dict cleanly. ${VAR} values
+        # interpolate at registry-load time.
+        if model.headers:
+            lines.append("[models.endpoint.headers]")
+            for name, value in model.headers:
+                lines.append(
+                    f'"{_toml_escape(name)}" = "{_toml_escape(value)}"'
+                )
         # Sensible defaults for capabilities + tier. Edit in config.toml
         # later if you need flagship / cheap distinctions.
         lines.append('capabilities = ["tool_use", "streaming"]')
@@ -507,10 +531,52 @@ def _prompt_for_one_model(
         "  Endpoint URL",
         default=protocol.default_endpoint, show_default=True,
     ).strip()
-    env_var = click.prompt(
-        "  API key env var",
-        default=protocol.default_env_var, show_default=True,
-    ).strip() or protocol.default_env_var
+
+    # Auth mode picker. Default = API key (standard case). Header mode
+    # is for proxies / gateways with their own auth scheme (signed JWT,
+    # mTLS-passthrough token, internal SSO, …). The two are stackable
+    # but the wizard treats them as exclusive — header-mode users
+    # rarely also have an API key, and stacking can be configured by
+    # editing config.toml directly afterwards.
+    click.echo("")
+    click.echo("  How does this endpoint authenticate?")
+    click.echo("    1) API key (env var; standard provider auth)")
+    click.echo("    2) Custom HTTP headers (no API key — proxy / gateway)")
+    auth_mode = click.prompt(
+        "  Choice", type=click.IntRange(1, 2), default=1,
+    )
+
+    env_var = ""
+    headers: list[tuple[str, str]] = []
+    if auth_mode == 1:
+        env_var = click.prompt(
+            "  API key env var",
+            default=protocol.default_env_var, show_default=True,
+        ).strip() or protocol.default_env_var
+    else:
+        click.echo(
+            "  Enter HTTP headers (blank header-name to finish). Values "
+            "may use ${ENV_VAR} to read from the environment at startup."
+        )
+        while True:
+            name = click.prompt(
+                "  Header name", default="", show_default=False,
+            ).strip()
+            if not name:
+                break
+            value = click.prompt(
+                f"  Value for {name}", default="", show_default=False,
+            ).strip()
+            if not value:
+                click.echo("  (empty value — skipped)")
+                continue
+            headers.append((name, value))
+        if not headers:
+            click.echo(
+                "  No headers entered. Falling back to API-key mode."
+            )
+            env_var = protocol.default_env_var
+
     model_name = click.prompt(
         "  Model id (registry-style: <ns>.<model>; ns matches the entry, not"
         " the brand)",
@@ -522,30 +588,42 @@ def _prompt_for_one_model(
         provider=protocol.key,
         endpoint=normalized_endpoint,
         auth_env=env_var,
+        headers=tuple(headers),
     )
 
-    # API key handling — only ask once per unique env var across the loop.
-    already_seen = env_var in api_keys_in_env or env_var in api_keys_written
-    if not already_seen:
-        ok, msg = can_reach_env_var(env_var)
-        click.echo(f"  {msg}")
-        if ok:
-            api_keys_in_env.append(env_var)
-        else:
-            click.echo(
-                f"  How do you want to provide {env_var}?\n"
-                f"    a) I'll export it in my shell before running lyre\n"
-                f"    b) Paste it now; I'll save it to {env_path} (chmod 600)\n"
-                f"    c) Skip"
-            )
-            sub = click.prompt(
-                "Choice", type=click.Choice(["a", "b", "c"]), default="a",
-            )
-            if sub == "b":
-                key = click.prompt(f"Paste {env_var}", hide_input=True).strip()
-                if key:
-                    append_env_line(env_path, env_var, key)
-                    api_keys_written.append(env_var)
-                    click.echo(f"  ✓ wrote {env_path} (chmod 600)")
+    # API key handling — only when API-key mode is selected and only
+    # once per unique env var across the loop.
+    if env_var:
+        already_seen = (
+            env_var in api_keys_in_env or env_var in api_keys_written
+        )
+        if not already_seen:
+            ok, msg = can_reach_env_var(env_var)
+            click.echo(f"  {msg}")
+            if ok:
+                api_keys_in_env.append(env_var)
+            else:
+                click.echo(
+                    f"  How do you want to provide {env_var}?\n"
+                    f"    a) I'll export it in my shell before running lyre\n"
+                    f"    b) Paste it now; I'll save it to {env_path} (chmod 600)\n"
+                    f"    c) Skip"
+                )
+                sub = click.prompt(
+                    "Choice", type=click.Choice(["a", "b", "c"]), default="a",
+                )
+                if sub == "b":
+                    key = click.prompt(
+                        f"Paste {env_var}", hide_input=True,
+                    ).strip()
+                    if key:
+                        append_env_line(env_path, env_var, key)
+                        api_keys_written.append(env_var)
+                        click.echo(f"  ✓ wrote {env_path} (chmod 600)")
+    else:
+        click.echo(
+            f"  ✓ Using header-only auth ({len(headers)} header"
+            f"{'s' if len(headers) != 1 else ''})."
+        )
 
     return spec
