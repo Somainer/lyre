@@ -109,9 +109,11 @@ from .runtime.adapter_factory import entry_reachable as _model_entry_reachable  
     "--dashboard-port", default=8765, show_default=True, type=int,
 )
 @click.option(
-    "--subprocess/--no-subprocess", "use_subprocess", default=False,
+    "--subprocess/--no-subprocess", "use_subprocess", default=True,
     help="Run each task in a fresh `lyre run-task` subprocess (OS-level "
-    "isolation per 铁律 2). Default off — opt-in until production-validated.",
+    "isolation per 铁律 2). Default on — Lyre is a long-running daemon "
+    "and subprocess mode is what unlocks `max_concurrent_tasks` "
+    "parallelism. Pass --no-subprocess for inline debugging.",
 )
 def serve_cmd(
     poll_interval: float,

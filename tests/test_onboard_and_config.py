@@ -190,6 +190,86 @@ def test_bootstrap_runtime_uses_custom_dispatcher_id(
     assert (cfg.memory_path / "facts" / "agent-cassandra-notes.md").is_file()
 
 
+def test_config_max_concurrent_tasks_defaults_to_four(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Default 4 — Lyre is a long-running daemon and subprocess mode
+    is on by default. An old config with no [scheduler] section thus
+    gets parallel scheduling out of the box. Set to 1 explicitly if
+    you want the historical serial behavior."""
+    monkeypatch.setenv("LYRE_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("LYRE_MAX_CONCURRENT_TASKS", raising=False)
+    (tmp_path / "config.toml").write_text(
+        '[owner]\nname = "o"\n', encoding="utf-8",
+    )
+    cfg = Config.from_env()
+    assert cfg.max_concurrent_tasks == 4
+
+
+def test_config_reads_max_concurrent_tasks_from_toml(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LYRE_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("LYRE_MAX_CONCURRENT_TASKS", raising=False)
+    (tmp_path / "config.toml").write_text(
+        '[owner]\nname = "o"\n\n[scheduler]\n'
+        'max_concurrent_tasks = 4\n',
+        encoding="utf-8",
+    )
+    cfg = Config.from_env()
+    assert cfg.max_concurrent_tasks == 4
+
+
+def test_config_env_var_beats_toml_for_max_concurrent_tasks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LYRE_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("LYRE_MAX_CONCURRENT_TASKS", "8")
+    (tmp_path / "config.toml").write_text(
+        '[owner]\nname = "o"\n\n[scheduler]\n'
+        'max_concurrent_tasks = 2\n',
+        encoding="utf-8",
+    )
+    cfg = Config.from_env()
+    assert cfg.max_concurrent_tasks == 8
+
+
+def test_config_max_concurrent_tasks_floors_at_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit 0 / negative value is interpreted as the user
+    asking for serial — clamp to 1, not the default 4. A typo
+    shouldn't silently reactivate parallelism the user tried to
+    disable."""
+    monkeypatch.setenv("LYRE_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("LYRE_MAX_CONCURRENT_TASKS", raising=False)
+    (tmp_path / "config.toml").write_text(
+        '[owner]\nname = "o"\n\n[scheduler]\n'
+        'max_concurrent_tasks = 0\n',
+        encoding="utf-8",
+    )
+    assert Config.from_env().max_concurrent_tasks == 1
+
+
+def test_config_max_concurrent_tasks_falls_back_to_default_on_garbage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-numeric input (typo, accidental string, etc.) is a parse
+    failure rather than a deliberate "I want serial" — fall back to
+    the default 4 rather than crashing the daemon."""
+    monkeypatch.setenv("LYRE_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("LYRE_MAX_CONCURRENT_TASKS", "not-a-number")
+    (tmp_path / "config.toml").write_text(
+        '[owner]\nname = "o"\n', encoding="utf-8",
+    )
+    assert Config.from_env().max_concurrent_tasks == 4
+
+
 def test_config_is_onboarded_reflects_config_toml_presence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -248,6 +248,15 @@ class Config:
     # ---- defaults: runtime knobs added with config.toml ----
     default_dashboard_port: int = 8765
     auto_wake_on_mail: bool = True
+    # How many tasks the scheduler may have in flight at once. Only
+    # honored in subprocess mode — inline mode is single-threaded by
+    # design and ignores this. Default 4 (a sensible single-user
+    # ceiling: dispatcher + a few workers + analyst can all make
+    # progress in parallel without saturating a laptop). SQLite WAL +
+    # 10s busy_timeout cover cross-process write contention; the
+    # ceiling exists for predictable CPU / model-API rate-limit
+    # behavior, not because more would break anything.
+    max_concurrent_tasks: int = 4
 
     @classmethod
     def from_env(cls) -> Config:
@@ -359,6 +368,32 @@ class Config:
         if env_auto is not None:
             auto_wake = env_auto.lower() in ("1", "true", "yes", "on")
 
+        # ---- scheduler concurrency ----
+        # [scheduler] max_concurrent_tasks = N in config.toml; env var
+        # `LYRE_MAX_CONCURRENT_TASKS` wins (matches the existing
+        # env-beats-toml convention for runtime knobs).
+        # Use explicit `is not None` rather than `or` chain — `or`
+        # treats 0 as falsy and falls through to the default, which
+        # would silently reactivate parallelism the user tried to
+        # disable with `max_concurrent_tasks = 0`.
+        scheduler_raw = raw.get("scheduler", {}) or {}
+        env_raw = os.environ.get("LYRE_MAX_CONCURRENT_TASKS")
+        toml_raw = scheduler_raw.get("max_concurrent_tasks")
+        chosen = env_raw if env_raw is not None else toml_raw
+        if chosen is None:
+            max_concurrent = 4
+        else:
+            try:
+                max_concurrent = int(chosen)
+            except (ValueError, TypeError):
+                # Garbage input → default 4 rather than crash startup.
+                max_concurrent = 4
+        if max_concurrent < 1:
+            # Explicit 0 / negative is the user asking for serial —
+            # clamp to 1 (NOT 4), so a deliberate "disable parallelism"
+            # signal is honored.
+            max_concurrent = 1
+
         # ---- bootstrap agent id overrides ----
         bootstrap_raw = raw.get("bootstrap") or {}
         bootstrap = BootstrapConfig(
@@ -386,6 +421,7 @@ class Config:
             bootstrap=bootstrap,
             default_dashboard_port=dashboard_port,
             auto_wake_on_mail=bool(auto_wake),
+            max_concurrent_tasks=max_concurrent,
         )
 
     @property
