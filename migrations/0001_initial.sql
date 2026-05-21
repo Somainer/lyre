@@ -171,6 +171,17 @@ CREATE INDEX IF NOT EXISTS mailbox_messages_broadcast
   ON mailbox_messages(broadcast_id);
 CREATE INDEX IF NOT EXISTS mailbox_messages_unread
   ON mailbox_messages(recipient, urgency, id) WHERE read_at IS NULL;
+-- read_messages_paged + read_messages share the shape
+--   WHERE recipient = ? [AND id <|> ?] ORDER BY id [DESC|ASC] LIMIT ?
+-- The composite (recipient, urgency, id) index above CAN'T short-circuit
+-- that ordering — for a single recipient its entries are sorted by
+-- (urgency, id), so SQLite has to pull every row for the recipient and
+-- sort in memory to pick the top N by id. On a busy mailbox this is
+-- the hottest path on the Mail page (and the MailboxBroadcaster poll).
+-- A plain (recipient, id) index lets SQLite reverse-scan and stop at
+-- LIMIT, which is what we want.
+CREATE INDEX IF NOT EXISTS mailbox_messages_recipient_id
+  ON mailbox_messages(recipient, id);
 -- read_recent_for_audit and Activity-builder span all recipients
 -- filtered by delivered_at >= cutoff. Without this it was a full
 -- table scan every Home / Activity render.
