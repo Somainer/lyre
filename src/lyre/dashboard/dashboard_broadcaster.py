@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import structlog
 
@@ -53,6 +54,16 @@ class _Cursor:
     wakeup_max_ended: str | None = None
     wakeup_active_count: int | None = None
     agent_max_created: str | None = None
+    # Sum of file sizes for every active wakeup's transcript.jsonl.
+    # The DB-side high-water marks above only flip when a wakeup STARTS
+    # or ENDS — they're silent during the long middle of a turn while
+    # the agent writes thinking_delta / content_delta / tool_use rows.
+    # Watching transcript-file growth here is what makes mid-wakeup
+    # SSE refresh actually fire, so the dashboard can stream the
+    # model's reasoning as it happens instead of standing still until
+    # ended_at finally moves. Size (vs mtime) chosen because transcripts
+    # are append-only and ms-resolution mtime is filesystem-dependent.
+    transcript_size_total: int | None = None
 
 
 @dataclass
@@ -176,11 +187,12 @@ class DashboardBroadcaster:
     """
 
     async def _snapshot(self) -> _Cursor:
-        """Read current high-water marks in a single SQL query."""
+        """Read current high-water marks in a single SQL query, plus a
+        cheap stat-walk over any active wakeup's transcript file."""
         async with self.repos.conn.execute(self._SNAPSHOT_SQL) as cur:
             row = await cur.fetchone()
         if row is None:
-            return _Cursor()
+            return _Cursor(transcript_size_total=0)
         return _Cursor(
             mailbox_max_id=row["mailbox_max_id"],
             task_max_updated=row["task_max_updated"],
@@ -188,7 +200,38 @@ class DashboardBroadcaster:
             wakeup_max_ended=row["wakeup_max_ended"],
             wakeup_active_count=row["wakeup_active_count"],
             agent_max_created=row["agent_max_created"],
+            transcript_size_total=await self._transcript_size_total(),
         )
+
+    async def _transcript_size_total(self) -> int:
+        """Sum file sizes for every in-flight wakeup's transcript.
+
+        Returns 0 (not None) when there are no active wakeups so any
+        previous in-flight bytes cleanly clear from the cursor — the
+        cursor uses `!=` for delta detection, and 0→None would
+        spuriously look "changed" forever.
+
+        Cheap: typically zero or one active wakeups, each a single
+        `stat()` syscall. Wrapped in try/except because the file may
+        not yet exist (wakeup just started, agent_loop hasn't written
+        anything) or vanish under us (object store cleanup) — neither
+        is fatal.
+        """
+        try:
+            active = await self.repos.wakeups.list_active()
+        except Exception:  # noqa: BLE001 — never let the watcher crash the loop
+            return 0
+        total = 0
+        for w in active:
+            uri = w.transcript_uri
+            if not uri or not uri.startswith("file://"):
+                continue
+            path = Path(uri[len("file://"):])
+            try:
+                total += path.stat().st_size
+            except OSError:
+                continue  # missing / unreadable — treat as zero
+        return total
 
     async def _detect_changes(self) -> set[str]:
         """Compare a fresh snapshot to the stored cursor; return the set
@@ -212,6 +255,15 @@ class DashboardBroadcaster:
             new_cur.wakeup_active_count != old_cur.wakeup_active_count
         )
         agent_changed = new_cur.agent_max_created != old_cur.agent_max_created
+        # `transcript_size_total` is the mid-wakeup pulse — wakeup_*
+        # cover start / end, this covers everything between. We compare
+        # against `old_cur` but only when it has a value already, so
+        # the very first tick (which always looks "changed") doesn't
+        # storm subscribers right after prime().
+        transcript_changed = (
+            old_cur.transcript_size_total is not None
+            and new_cur.transcript_size_total != old_cur.transcript_size_total
+        )
 
         # Map raw deltas → public event names.
         # stats card: anything that affects the four tiles
@@ -223,13 +275,16 @@ class DashboardBroadcaster:
             or active_changed
         ):
             events.add(EVENT_STATS)
-        # activity timeline: same events drive it
+        # activity timeline: same DB events + the new transcript pulse
+        # so thinking / tool_use / content_delta land in the feed within
+        # one poll tick of being written, not just at wakeup_end.
         if (
             mailbox_changed
             or task_changed
             or wakeup_started_changed
             or wakeup_ended_changed
             or agent_changed
+            or transcript_changed
         ):
             events.add(EVENT_ACTIVITY)
         # topnav agent-status badge (count of running wakeups)

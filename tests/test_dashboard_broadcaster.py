@@ -122,6 +122,60 @@ async def test_wakeup_start_fires_status_and_health(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_transcript_growth_fires_activity_only(tmp_path: Path) -> None:
+    """Mid-wakeup: the agent appends thinking_delta / tool_use rows to
+    the transcript file but the DB high-water marks are quiet. Without
+    transcript-watch the dashboard sat still until the wakeup ended;
+    with it the broadcaster must fire EVENT_ACTIVITY within one poll.
+
+    Other event channels (stats / agent-status / health) MUST NOT fire
+    — transcript growth doesn't change unread counts, running-wakeup
+    count, etc.
+    """
+    conn, repos = await _seed(tmp_path)
+    try:
+        # Set up an active wakeup with a real transcript file path.
+        task_id = await repos.tasks.create(
+            TaskSpec(persona_name="worker", goal="g", acceptance="a")
+        )
+        wakeup_id = await repos.wakeups.start(task_id, "worker")
+        transcript = tmp_path / "object_store" / "wakeups" / wakeup_id / "transcript.jsonl"
+        transcript.parent.mkdir(parents=True, exist_ok=True)
+        transcript.write_text('{"type":"system","ts":1}\n', encoding="utf-8")
+        await repos.wakeups.set_transcript_uri(wakeup_id, f"file://{transcript}")
+
+        bc = DashboardBroadcaster(repos=repos, poll_interval_s=0.05)
+        await bc.prime()
+        await bc.start()
+        try:
+            q = bc.subscribe()
+
+            # Simulate agent_loop appending a thinking_delta line.
+            with transcript.open("a", encoding="utf-8") as fp:
+                fp.write('{"type":"thinking_delta","text":"hmm","ts":2}\n')
+
+            seen: set[str] = set()
+            with _drain_for(q, 1.5) as drain:
+                async for events in drain:
+                    seen.update(events)
+                    if EVENT_ACTIVITY in seen:
+                        break
+            assert EVENT_ACTIVITY in seen, (
+                "transcript file growth must trigger EVENT_ACTIVITY so "
+                "the agent-detail SSE stream refreshes mid-wakeup"
+            )
+            # transcript pulse is activity-only — channels gated on DB
+            # state stay quiet.
+            assert EVENT_STATS not in seen
+            assert EVENT_AGENT_STATUS not in seen
+            assert EVENT_HEALTH not in seen
+        finally:
+            await bc.stop()
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_does_not_replay_pre_existing_state(tmp_path: Path) -> None:
     """`prime()` snapshots the world; rows inserted BEFORE prime must
     not produce a notification AFTER subscribers connect."""
