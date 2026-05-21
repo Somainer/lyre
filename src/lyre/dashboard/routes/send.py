@@ -15,6 +15,7 @@ import uuid
 from fastapi import APIRouter, File, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse
 
+from ...config import BootstrapConfig
 from ...persistence.models import Blob, MailboxMessage
 from ...runtime.identity import (
     compose_id,
@@ -57,22 +58,53 @@ def _personas_for_form() -> list[str]:
     ]
 
 
-_BOOTSTRAP = ("owner", "dispatcher")
+# Persona names whose name input is force-disabled in the form UI — the
+# "send page" treats them as strict singletons (mail goes to the bootstrap
+# agent id from Config.bootstrap, no `<persona>/<name>` composition). Owner
+# and dispatcher are always in this set; analyst / reviewer remain
+# "name-optional" so the owner can still spawn parallel instances via the
+# same form by typing a name.
+_NAME_DISABLED_PERSONAS = ("owner", "dispatcher")
+# Persona names that have a seeded singleton (no name needed; resolves to
+# the configured bootstrap id). Includes analyst / reviewer because their
+# singleton CAN be addressed without a name even though spawning is allowed.
+_SEEDED_SINGLETON_PERSONAS = ("owner", "dispatcher", "analyst", "reviewer")
+
+
+def _bootstrap_singleton_id(persona: str, bootstrap: BootstrapConfig) -> str | None:
+    """Resolve persona name → the configured bootstrap agent id, or None
+    if this persona has no seeded singleton."""
+    if persona == "owner":
+        return "owner"
+    if persona == "dispatcher":
+        return bootstrap.dispatcher_id
+    if persona == "analyst":
+        return bootstrap.analyst_id
+    if persona == "reviewer":
+        return bootstrap.reviewer_id
+    return None
 
 
 async def _ensure_agent(
-    repos, persona: str, name: str, *, parent: str = "owner"
+    repos, persona: str, name: str, bootstrap: BootstrapConfig,
+    *, parent: str = "owner",
 ) -> str | tuple[None, str]:
     """Compose persona/name → agent_id. Create the agent if missing.
 
     Returns the agent_id on success or `(None, error)` on failure.
+
+    For seeded-singleton personas (owner / dispatcher / analyst / reviewer),
+    blank `name` resolves to the configured agent id (e.g. "luna" if the
+    owner customized dispatcher_id via [bootstrap] in config.toml).
     """
-    if persona in _BOOTSTRAP:
-        agent_id = persona  # name ignored for bootstrap
+    singleton_id = _bootstrap_singleton_id(persona, bootstrap)
+    if singleton_id is not None and not name:
+        agent_id = singleton_id
     elif not name:
         return None, (
             f"persona {persona!r} needs a name (e.g. 'refactor-auth'); "
-            f"leave it blank only for bootstrap personas (owner, leader)."
+            f"only seeded-singleton personas (owner, dispatcher, analyst, "
+            f"reviewer) can be addressed without one."
         )
     else:
         agent_id = compose_id(persona, name)
@@ -86,9 +118,9 @@ async def _ensure_agent(
     if await repos.agents.exists(agent_id):
         return agent_id
 
-    # Bootstrap should already exist; if not it's a setup bug, not a
-    # spawn-on-the-fly case.
-    if persona in _BOOTSTRAP:
+    # Bootstrap singleton should already exist; if not it's a setup bug,
+    # not a spawn-on-the-fly case.
+    if singleton_id is not None and agent_id == singleton_id:
         return None, f"bootstrap agent {agent_id!r} missing from DB"
 
     # Validate persona exists & is approved before spawning.
@@ -125,12 +157,13 @@ async def _known_agent_ids(repos) -> list[str]:
     )
 
 
-def _split_preset(preset_to: str) -> tuple[str, str | None]:
+def _split_preset(preset_to: str, default_dispatcher_id: str) -> tuple[str, str | None]:
     """Initial values for the persona+name pair when the form is opened
     with ?to=<existing-agent-id>. Bootstrap stays bare; spawned splits
-    on /. Unknown shapes fall back to dispatcher."""
+    on /. Unknown shapes fall back to the dispatcher's CURRENT agent id
+    (`config.bootstrap.dispatcher_id`, e.g. "luna" if customized)."""
     if not preset_to:
-        return "dispatcher", None
+        return default_dispatcher_id, None
     if is_bootstrap(preset_to):
         return preset_to, None
     persona, name = split_id(preset_to)
@@ -140,18 +173,19 @@ def _split_preset(preset_to: str) -> tuple[str, str | None]:
 @router.get("/send", response_class=HTMLResponse)
 async def send_form(
     request: Request,
-    to: str = "dispatcher",
+    to: str | None = None,
     reply_to: int | None = None,
 ) -> HTMLResponse:
     repos = request.app.state.repos
     templates = request.app.state.templates
+    bootstrap = request.app.state.bootstrap
     reply_ctx = None
-    preset_to = to
+    preset_to = to or bootstrap.dispatcher_id
     if reply_to is not None:
         reply_ctx = await _load_reply_context(repos, reply_to)
         if reply_ctx is not None:
             preset_to = reply_ctx["sender"]
-    preset_persona, preset_name = _split_preset(preset_to)
+    preset_persona, preset_name = _split_preset(preset_to, bootstrap.dispatcher_id)
     return templates.TemplateResponse(
         request, "send.html",
         {
@@ -164,7 +198,7 @@ async def send_form(
             "sender_default": "owner",
             "known_agents": await _known_agent_ids(repos),
             "personas": _personas_for_form(),
-            "bootstrap_personas": list(_BOOTSTRAP),
+            "bootstrap_personas": list(_NAME_DISABLED_PERSONAS),
         },
     )
 
@@ -195,6 +229,7 @@ async def send_post(
     templates = request.app.state.templates
     repos = request.app.state.repos
     blob_store = getattr(request.app.state, "blob_store", None)
+    bootstrap = request.app.state.bootstrap
     spawn = spawn_if_missing in ("1", "on", "true")
 
     async def render_err(msg: str, status: int = 400) -> HTMLResponse:
@@ -202,15 +237,17 @@ async def send_post(
             request, "send.html",
             {
                 "tab": "send",
-                "preset_to": recipient or compose_id(persona or "dispatcher", name or ""),
-                "preset_persona": persona or "dispatcher",
+                "preset_to": recipient or compose_id(
+                    persona or bootstrap.dispatcher_id, name or "",
+                ),
+                "preset_persona": persona or bootstrap.dispatcher_id,
                 "preset_name": name,
                 "reply_to": reply_to,
                 "error": msg,
                 "sender_default": sender or "owner",
                 "known_agents": await _known_agent_ids(repos),
                 "personas": _personas_for_form(),
-                "bootstrap_personas": list(_BOOTSTRAP),
+                "bootstrap_personas": list(_NAME_DISABLED_PERSONAS),
             },
             status_code=status,
         )
@@ -220,9 +257,13 @@ async def send_post(
 
     if persona:
         if spawn:
-            resolved = await _ensure_agent(repos, persona, name or "")
+            resolved = await _ensure_agent(repos, persona, name or "", bootstrap)
         else:
-            agent_id = persona if persona in _BOOTSTRAP else compose_id(persona, name or "")
+            singleton_id = _bootstrap_singleton_id(persona, bootstrap)
+            if singleton_id is not None and not (name or "").strip():
+                agent_id = singleton_id
+            else:
+                agent_id = compose_id(persona, name or "")
             if not is_valid_agent_id(agent_id):
                 resolved = (None, f"invalid agent id {agent_id!r}")
             elif not await repos.agents.exists(agent_id):
@@ -304,7 +345,7 @@ async def send_post(
         + (f" (in reply to #{reply_to})" if reply_to else "")
         + (f" — {len(blob_ids)} attachment(s)" if blob_ids else "")
     )
-    preset_persona, preset_name = _split_preset(final_recipient)
+    preset_persona, preset_name = _split_preset(final_recipient, bootstrap.dispatcher_id)
     return templates.TemplateResponse(
         request, "send.html",
         {
@@ -317,7 +358,7 @@ async def send_post(
             "sender_default": sender or "owner",
             "known_agents": await _known_agent_ids(repos),
             "personas": _personas_for_form(),
-            "bootstrap_personas": list(_BOOTSTRAP),
+            "bootstrap_personas": list(_NAME_DISABLED_PERSONAS),
         },
     )
 

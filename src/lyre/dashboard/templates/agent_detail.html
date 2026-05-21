@@ -17,7 +17,7 @@
             {{ agent_id_pill(agent.parent_agent_id, size='sm') }}
           </a>
         {% endif %}
-        {% if agent.id in ("owner", "dispatcher") %}
+        {% if agent.parent_agent_id is none %}
           <span class="meta-pill dim"><span class="meta-pill-label">bootstrap</span></span>
         {% endif %}
       </div>

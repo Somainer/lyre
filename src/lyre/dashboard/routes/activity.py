@@ -28,6 +28,7 @@ async def activity_page(
     recipients = [a for a in agents if a.id != "owner"]
 
     templates = request.app.state.templates
+    bootstrap = request.app.state.bootstrap
     return templates.TemplateResponse(
         request, "activity.html",
         {
@@ -36,6 +37,7 @@ async def activity_page(
             "active_wakeups": active,
             "window_minutes": minutes,
             "compose_recipients": recipients,
+            "default_recipient": bootstrap.dispatcher_id,
             # SSE stream URL params — global view, but honor the picked
             # time window so the broadcaster renders the same fragment
             # the page initially showed.
