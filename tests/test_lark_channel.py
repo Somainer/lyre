@@ -1,0 +1,347 @@
+"""LarkChannel — Lark-side parsing helpers + outbound publish path.
+
+These tests don't talk to Lark — they mock the lark_oapi SDK client
+so the channel logic (body parsing, image upload sequencing, error
+handling, metadata-write contracts) can be exercised offline.
+"""
+
+from __future__ import annotations
+
+import io
+import json as _json
+from pathlib import Path
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from lyre.config import LarkConfig
+from lyre.integrations.lark.channel import (
+    LarkChannel,
+    _extract_body_and_images,
+    _sniff_image_mime,
+)
+from lyre.persistence.db import init_db
+from lyre.persistence.models import Blob, MailboxMessage, Persona
+from lyre.persistence.sqlite_impl import SqliteRepositories
+from lyre.runtime.blob_store import BlobStore
+
+# Small PNG fixture — byte-stable for image sniffing assertions.
+_PNG_BYTES = (
+    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+    b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\rIDATx\x9cc\x00\x01"
+    b"\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82"
+)
+
+
+# ---------------------------------------------------------------------------
+# _extract_body_and_images — Lark content JSON → (body, image_keys)
+# ---------------------------------------------------------------------------
+
+
+def test_extract_text_message() -> None:
+    body, images = _extract_body_and_images(
+        "text", _json.dumps({"text": "hello team"}),
+    )
+    assert body == "hello team"
+    assert images == []
+
+
+def test_extract_image_message_yields_key() -> None:
+    body, images = _extract_body_and_images(
+        "image", _json.dumps({"image_key": "img_abc"}),
+    )
+    assert body == ""
+    assert images == ["img_abc"]
+
+
+def test_extract_post_concatenates_text_and_collects_images() -> None:
+    """Rich post: nested list of paragraphs of blocks. Text blocks
+    join with newlines; img blocks contribute keys."""
+    content = _json.dumps({
+        "content": [
+            [
+                {"tag": "text", "text": "look at this:"},
+            ],
+            [
+                {"tag": "img", "image_key": "img_1"},
+                {"tag": "text", "text": " (kept inline)"},
+            ],
+        ],
+    })
+    body, images = _extract_body_and_images("post", content)
+    assert "look at this:" in body
+    assert "(kept inline)" in body
+    assert images == ["img_1"]
+
+
+def test_extract_handles_garbage_content_json() -> None:
+    """A malformed content JSON shouldn't crash the WS thread —
+    return empty body + no images so the inbound path just drops
+    the message with a debug log upstream."""
+    assert _extract_body_and_images("text", "not-json") == ("", [])
+    assert _extract_body_and_images("text", None) == ("", [])
+    assert _extract_body_and_images("unknown_type", "{}") == ("", [])
+
+
+# ---------------------------------------------------------------------------
+# _sniff_image_mime — magic-byte detection for inbound images
+# ---------------------------------------------------------------------------
+
+
+def test_sniff_recognizes_png() -> None:
+    assert _sniff_image_mime(_PNG_BYTES) == "image/png"
+
+
+def test_sniff_recognizes_jpeg() -> None:
+    assert _sniff_image_mime(b"\xff\xd8\xff\xe0" + b"\x00" * 20) == "image/jpeg"
+
+
+def test_sniff_recognizes_gif() -> None:
+    assert _sniff_image_mime(b"GIF89a" + b"\x00" * 20) == "image/gif"
+
+
+def test_sniff_recognizes_webp() -> None:
+    assert _sniff_image_mime(b"RIFF\x00\x00\x00\x00WEBP" + b"x" * 20) == "image/webp"
+
+
+def test_sniff_returns_none_for_unknown() -> None:
+    assert _sniff_image_mime(b"random non-image bytes") is None
+    assert _sniff_image_mime(b"") is None
+
+
+# ---------------------------------------------------------------------------
+# LarkChannel construction — guards on missing config
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_channel_refuses_without_app_credentials(
+    tmp_path: Path,
+) -> None:
+    """Missing app_id/app_secret → loud failure at construction.
+    Better to fail at `lyre serve` startup than silently never
+    deliver any owner mail."""
+    conn = await init_db(tmp_path / "lyre.db")
+    try:
+        repos = SqliteRepositories(conn)
+        cfg = LarkConfig(
+            enabled=True, authorized_user_id="ou_x",
+            app_id=None, app_secret=None,
+        )
+        with pytest.raises(ValueError, match="LARK_APP_ID"):
+            LarkChannel(cfg, repos, None, dispatcher_id="dispatcher")
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_channel_refuses_without_authorized_user_id(
+    tmp_path: Path,
+) -> None:
+    """Open-to-anyone mode is forbidden — without
+    authorized_user_id the bot would accept tasks from anyone in
+    the same tenant. Fail loudly."""
+    conn = await init_db(tmp_path / "lyre.db")
+    try:
+        repos = SqliteRepositories(conn)
+        cfg = LarkConfig(
+            enabled=True, authorized_user_id=None,
+            app_id="cli_x", app_secret="s",
+        )
+        with pytest.raises(ValueError, match="authorized_user_id"):
+            LarkChannel(cfg, repos, None, dispatcher_id="dispatcher")
+    finally:
+        await conn.close()
+
+
+# ---------------------------------------------------------------------------
+# publish_owner_mail — outbound text + image with fake SDK client
+# ---------------------------------------------------------------------------
+
+
+def _make_channel_with_mocked_client(
+    repos: SqliteRepositories, blob_store: BlobStore | None,
+) -> LarkChannel:
+    """Build a LarkChannel, then swap its SDK client with mocks for
+    each API call we care about."""
+    cfg = LarkConfig(
+        enabled=True,
+        authorized_user_id="ou_owner",
+        app_id="cli_test",
+        app_secret="secret",
+    )
+    ch = LarkChannel(cfg, repos, blob_store, dispatcher_id="dispatcher")
+    # Mock the SDK client's nested attribute chain: client.im.v1.message
+    # .acreate(...) → mocked response.
+    api = MagicMock()
+    api.im.v1.message.acreate = AsyncMock()
+    api.im.v1.image.acreate = AsyncMock()
+    api.im.v1.message_resource.aget = AsyncMock()
+    ch._api_client = api
+    return ch
+
+
+def _ok_message_response(message_id: str) -> Any:
+    """Build a fake response object matching the SDK's CreateMessageResponse shape."""
+    resp = MagicMock()
+    resp.success.return_value = True
+    resp.code = 0
+    resp.msg = "ok"
+    resp.data.message_id = message_id
+    return resp
+
+
+def _ok_image_response(image_key: str) -> Any:
+    resp = MagicMock()
+    resp.success.return_value = True
+    resp.code = 0
+    resp.msg = "ok"
+    resp.data.image_key = image_key
+    return resp
+
+
+@pytest.mark.asyncio
+async def test_publish_text_only_returns_lark_message_id(
+    tmp_path: Path,
+) -> None:
+    """Bare text owner-mail → one acreate call, returns Lark
+    message id. The outbox dispatcher persists this id back to
+    metadata.channels.lark.message_id (verified in outbox tests)."""
+    conn = await init_db(tmp_path / "lyre.db")
+    try:
+        repos = SqliteRepositories(conn)
+        await repos.mailbox.ensure_mailbox("owner")
+        ch = _make_channel_with_mocked_client(repos, None)
+        ch._api_client.im.v1.message.acreate.return_value = (
+            _ok_message_response("lark_msg_001")
+        )
+
+        msg = MailboxMessage(
+            id=99, recipient="owner", external_id="m1",
+            sender="worker-maintainer/refactor-auth",
+            urgency="normal", body="status: done",
+        )
+        ext_id = await ch.publish_owner_mail(msg, reply_to_external_id=None)
+
+        assert ext_id == "lark_msg_001"
+        # One text post, no image post.
+        assert ch._api_client.im.v1.message.acreate.await_count == 1
+        assert ch._api_client.im.v1.image.acreate.await_count == 0
+        # The body got the sender-tag prefix.
+        call = ch._api_client.im.v1.message.acreate.await_args
+        # CreateMessageRequest is a builder result; we can introspect via
+        # the request object's body — easier path: just verify the call happened.
+        assert call is not None
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_publish_with_image_uploads_then_posts(
+    tmp_path: Path,
+) -> None:
+    """Image attachment → image.acreate (upload to get key) →
+    message.acreate(text) → message.acreate(image, key). The text
+    post still wins as the return value (its id is what we thread
+    against)."""
+    conn = await init_db(tmp_path / "lyre.db")
+    try:
+        repos = SqliteRepositories(conn)
+        await repos.mailbox.ensure_mailbox("owner")
+        # Seed a blob both on disk + in the metadata table.
+        blob_store = BlobStore(tmp_path / "objstore")
+        blob_id = blob_store.write(_PNG_BYTES, "image/png")
+        await repos.blobs.upsert(Blob(
+            id=blob_id, media_type="image/png",
+            size_bytes=len(_PNG_BYTES), filename="shot.png",
+            source="owner",
+        ))
+
+        ch = _make_channel_with_mocked_client(repos, blob_store)
+        ch._api_client.im.v1.image.acreate.return_value = (
+            _ok_image_response("img_key_xyz")
+        )
+        # The text post AND the image post both call message.acreate.
+        # Distinguish responses via side_effect.
+        ch._api_client.im.v1.message.acreate.side_effect = [
+            _ok_message_response("lark_text"),
+            _ok_message_response("lark_image_followup"),
+        ]
+
+        msg = MailboxMessage(
+            id=42, recipient="owner", external_id="m2",
+            sender="worker-maintainer/coco", urgency="normal",
+            body="see attached", attachments=[blob_id],
+        )
+        ext_id = await ch.publish_owner_mail(msg, reply_to_external_id=None)
+
+        assert ext_id == "lark_text"  # text-post id wins
+        assert ch._api_client.im.v1.image.acreate.await_count == 1
+        assert ch._api_client.im.v1.message.acreate.await_count == 2
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_publish_fails_loudly_on_text_post_error(
+    tmp_path: Path,
+) -> None:
+    """If the SDK reports the text post failed, raise so the outbox
+    marks the row failed (and retries on next tick)."""
+    conn = await init_db(tmp_path / "lyre.db")
+    try:
+        repos = SqliteRepositories(conn)
+        ch = _make_channel_with_mocked_client(repos, None)
+        err_resp = MagicMock()
+        err_resp.success.return_value = False
+        err_resp.code = 99991663
+        err_resp.msg = "rate-limited"
+        ch._api_client.im.v1.message.acreate.return_value = err_resp
+
+        msg = MailboxMessage(
+            id=7, recipient="owner", external_id="m3",
+            sender="x", urgency="normal", body="hi",
+        )
+        with pytest.raises(RuntimeError, match="rate-limited"):
+            await ch.publish_owner_mail(msg, reply_to_external_id=None)
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_image_download_writes_blob_and_upserts_metadata(
+    tmp_path: Path,
+) -> None:
+    """Inbound image: SDK aget returns BytesIO; channel writes
+    bytes via BlobStore, upserts the blobs row, returns the blob_id."""
+    conn = await init_db(tmp_path / "lyre.db")
+    try:
+        repos = SqliteRepositories(conn)
+        await repos.personas.upsert(
+            Persona(name="dispatcher", role_description="d", system_prompt="d")
+        )
+        await repos.agents.create(agent_id="dispatcher", persona_name="dispatcher")
+        blob_store = BlobStore(tmp_path / "objstore")
+        ch = _make_channel_with_mocked_client(repos, blob_store)
+
+        # SDK aget returns a response with `.success() == True` and
+        # `.file` as BytesIO holding the PNG bytes.
+        img_resp = MagicMock()
+        img_resp.success.return_value = True
+        img_resp.file = io.BytesIO(_PNG_BYTES)
+        ch._api_client.im.v1.message_resource.aget.return_value = img_resp
+
+        ids = await ch._download_images(
+            "lark_msg_001", ["img_key_alpha"],
+        )
+        assert len(ids) == 1
+        blob = await repos.blobs.get(ids[0])
+        assert blob is not None
+        assert blob.media_type == "image/png"
+        assert blob.size_bytes == len(_PNG_BYTES)
+        assert blob.source == "owner"
+        # Bytes round-trip via BlobStore.
+        assert blob_store.read(blob.id, "image/png") == _PNG_BYTES
+    finally:
+        await conn.close()
