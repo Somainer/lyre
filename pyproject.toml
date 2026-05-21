@@ -37,6 +37,10 @@ dependencies = [
   "markdown-it-py>=3.0",
   # Future mail: cron-expression next-fire computation
   "croniter>=2.0",
+  # External channel: Lark/Feishu bot integration. Official SDK supports
+  # the Long Connection (WebSocket) event subscription mode used by the
+  # LarkBotRunner — no public webhook URL required.
+  "lark-oapi>=1.4.0",
 ]
 
 [project.optional-dependencies]
