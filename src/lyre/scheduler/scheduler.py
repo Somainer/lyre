@@ -42,8 +42,7 @@ from ..runtime.mail_watcher import MailWatcher
 from ..runtime.model_registry import (
     ModelEntry,
     ModelRegistry,
-    default_registry_path,
-    load_registry,
+    load_registry_for_config,
 )
 from ..runtime.model_router import ModelPreference, ModelRouter
 from ..runtime.tools import ToolContext, ToolRegistry
@@ -77,8 +76,16 @@ class Scheduler:
         self.config = config
         self.poll_interval_s = poll_interval_s
         self.tool_registry = tool_registry or build_default_registry()
-        self.registry = registry if registry is not None else load_registry(
-            default_registry_path()
+        # The default MUST honor user [[models]] from config.toml, not
+        # only the shipped registry — otherwise a user with their own
+        # endpoints sees the router pick shipped Anthropic / DeepSeek
+        # entries they never asked for. load_registry_for_config does
+        # the merge (and now-replace: user entries replace shipped
+        # when any are present). Tests + the subprocess runner can
+        # still pass `registry=` explicitly to bypass.
+        self.registry = (
+            registry if registry is not None
+            else load_registry_for_config(self.config)
         )
         self.health = health or HealthTracker()
         self.adapter_factory = adapter_factory or AdapterFactory()
