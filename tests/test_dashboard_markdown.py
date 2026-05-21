@@ -81,32 +81,47 @@ def client_with_mail(tmp_path: Path):
         _asyncio.get_event_loop().run_until_complete(conn.close())
 
 
-def test_mail_renders_markdown_bold_and_list(client_with_mail: TestClient) -> None:
+def test_mail_list_shows_body_as_plain_text(client_with_mail: TestClient) -> None:
+    """Mail list bodies render as PLAIN TEXT in <pre>, not as rendered
+    markdown. Two reasons:
+
+    1. Per-row CommonMark parsing was a hot path that blocked the
+       event loop on busy mailboxes — the user reported tab-switch
+       freezes that pointed here.
+    2. The user's stated goal is *copying body text out*. Plain text
+       in <pre> copies cleanly; rendered markdown HTML pollutes the
+       paste with `<strong>` / `<ul>` tags depending on selection.
+
+    The `markdown` filter is still registered (mail bodies *may* be
+    rendered elsewhere — e.g. a future detail view) — this test just
+    pins the list behavior so the perf fix doesn't regress.
+    """
     r = client_with_mail.get("/mail")
     assert r.status_code == 200
     body = r.text
-    # Bold + list + inline code all rendered
-    assert "<strong>Pi</strong>" in body
-    assert "<ul>" in body and "<li>Skills system</li>" in body
-    assert "<code>~/.lyre/memory/facts/specs-pi-research.md</code>" in body
-    # The raw markdown characters must NOT leak through unrendered
-    assert "**Pi**" not in body
-    # The container class is in place so CSS picks it up
-    assert "md-body" in body
+    # Raw markdown chars survive into the rendered HTML (auto-escaped
+    # by Jinja so they're safe, but visible as authored).
+    assert "**Pi**" in body
+    # The fast-path <pre> container is in place.
+    assert "mail-body-text" in body
+    # And rendered-markdown tags must NOT be there (this list view
+    # never invokes the markdown filter).
+    assert "<strong>Pi</strong>" not in body
+    assert "<li>Skills system</li>" not in body
 
 
 def test_mail_escapes_raw_html_no_script_tag(
     client_with_mail: TestClient,
 ) -> None:
-    """The hostile body contains a <script> tag. Renderer must escape
-    it — only the entity-encoded form may appear, never an actual
-    `<script>` element."""
+    """Whether the body is rendered as markdown HTML or plain `<pre>`
+    text, Jinja's auto-escape (or our explicit escape) must turn raw
+    HTML in the source into entity-encoded text. A hostile
+    `<script>alert("pwned")</script>` body must never appear as a live
+    `<script>` element in the response."""
     r = client_with_mail.get("/mail")
     body = r.text
     # Raw <script> must NOT appear anywhere in the rendered response.
     assert "<script>alert" not in body
-    # Entity-encoded form is what we expect (markdown-it-py with
-    # html=False renders raw HTML as escaped text).
+    # Entity-encoded form is what we expect (Jinja auto-escapes the
+    # body when interpolating into the <pre>).
     assert "&lt;script&gt;" in body or "&lt;script" in body
-    # And the markdown around it still works
-    assert "<strong>bold</strong>" in body

@@ -56,9 +56,19 @@
               {{ m.title or "(no title)" }}
             </div>
             {% if m.body %}
+              {# Body is shown as PLAIN TEXT in <pre>, not as rendered
+                 markdown. Two reasons:
+                 1. CommonMark rendering is synchronous CPU work; doing
+                    it for every row in a long list lock-steps the
+                    event loop (was a meaningful chunk of the
+                    "tab-switch freeze").
+                 2. Rendered markdown HTML is *worse* for the user's
+                    stated goal — copying the body to the clipboard.
+                    `<strong>` / `<ul>` tags pollute the paste; raw
+                    text preserves what the sender wrote. #}
               <details class="mail-body-fold" data-fold-id="mail-{{ m.id }}">
                 <summary class="mail-preview">show body ({{ m.body|length }} chars)</summary>
-                <div class="md-body mail-body-selectable">{{ m.body | markdown }}</div>
+                <pre class="mail-body-text">{{ m.body }}</pre>
               </details>
             {% endif %}
           </div>
