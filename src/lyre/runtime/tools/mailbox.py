@@ -94,6 +94,37 @@ async def _mailbox_send(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any
     if forward_msg_id is not None and not isinstance(forward_msg_id, int):
         raise ToolError("forward_msg_id must be an integer msg_id")
 
+    # Attachments: list of existing blob_ids the agent has seen (via
+    # mail it received). Forwarding-only by construction — the model
+    # can't fabricate a sha256 it hasn't been shown, so an existence
+    # check IS the trust boundary. Verify every id exists in the
+    # blobs table; refuse the whole send if any are missing.
+    raw_attachments = args.get("attachments")
+    attachments: list[str] | None = None
+    if raw_attachments is not None:
+        if (
+            not isinstance(raw_attachments, list)
+            or not all(isinstance(a, str) for a in raw_attachments)
+        ):
+            raise ToolError(
+                "attachments must be a list of blob_id strings"
+            )
+        if raw_attachments:
+            present = {
+                b.id for b in
+                await ctx.repos.blobs.list_ids(list(raw_attachments))
+            }
+            missing = [a for a in raw_attachments if a not in present]
+            if missing:
+                raise ToolError(
+                    f"unknown attachment blob_id(s): {missing}. "
+                    f"Attachments can only reference blobs you've "
+                    f"seen in mail you received — you can't manufacture "
+                    f"new bytes here. Use the blob_id strings from a "
+                    f"prior mailbox_get_message."
+                )
+            attachments = list(raw_attachments)
+
     tool_use_id = args.get("_tool_use_id")
     if not tool_use_id:
         raise ToolError("internal: missing tool_use_id (agent loop bug)")
@@ -146,6 +177,7 @@ async def _mailbox_send(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any
             "broadcast_id": broadcast_id,
             "recipients_all": recipients_all,
             "metadata": metadata,
+            "attachments": attachments,
         }
         rows.append(
             OutboxRow(
@@ -329,7 +361,7 @@ async def _mailbox_get_message(
     msg = await ctx.repos.mailbox.get_message(msg_id)
     if msg is None:
         raise ToolError(f"message id={msg_id} not found")
-    return {
+    out: dict[str, Any] = {
         "id": msg.id,
         "recipient": msg.recipient,
         "sender": msg.sender,
@@ -341,6 +373,47 @@ async def _mailbox_get_message(
         "recipients_all": msg.recipients_all,
         "metadata": msg.metadata,
     }
+    # Attachments: bulk-resolve blob metadata so the caller (agent_loop's
+    # tool-result hydrator) has filename + media_type alongside the
+    # blob_ids. The bytes are NOT inlined here — the loop translates
+    # these into LyreContentBlock(type="image", blob_id=..., ...) which
+    # the adapter then resolves through BlobStore at send-time.
+    if msg.attachments:
+        blob_rows = await ctx.repos.blobs.list_ids(msg.attachments)
+        out["attachments"] = [
+            {
+                "blob_id": b.id,
+                "media_type": b.media_type,
+                "filename": b.filename,
+                "size_bytes": b.size_bytes,
+            }
+            for b in blob_rows
+        ]
+        # Magic key: extra content blocks the agent_loop will append
+        # alongside the tool_result block on the user message it builds
+        # for this turn. This is what makes the model actually SEE the
+        # image rather than just read its metadata. Images and PDFs
+        # become their own typed blocks; anything else (future binary
+        # types) just stays in `attachments` as text/JSON.
+        view_blocks: list[dict[str, Any]] = []
+        for b in blob_rows:
+            if b.media_type.startswith("image/"):
+                view_blocks.append({
+                    "type": "image",
+                    "blob_id": b.id,
+                    "media_type": b.media_type,
+                    "filename": b.filename,
+                })
+            elif b.media_type == "application/pdf":
+                view_blocks.append({
+                    "type": "document",
+                    "blob_id": b.id,
+                    "media_type": b.media_type,
+                    "filename": b.filename,
+                })
+        if view_blocks:
+            out["_lyre_view_blocks"] = view_blocks
+    return out
 
 
 async def _mailbox_read(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
@@ -554,6 +627,21 @@ MAILBOX_SEND = Tool(
                     "Msg id you are forwarding. Your body is your own "
                     "commentary; recipients use mailbox_get_message to read "
                     "the original."
+                ),
+            },
+            "attachments": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Optional list of blob_id strings (sha256 hex) to "
+                    "attach. You can ONLY reference blobs you've "
+                    "already seen — i.e. the blob_id values listed in "
+                    "attachments[] of a mail you read via "
+                    "mailbox_get_message. The tool will reject unknown "
+                    "ids; you cannot manufacture binary content from "
+                    "this end. To share a new image with another "
+                    "agent, ask the owner to upload it via the "
+                    "dashboard /send page."
                 ),
             },
             "metadata": {

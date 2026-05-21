@@ -19,6 +19,7 @@ import aiosqlite
 from .models import (
     Agent,
     Artifact,
+    Blob,
     MailboxMessage,
     OutboxRow,
     Persona,
@@ -1058,8 +1059,9 @@ class SqliteMailboxRepository:
             """
             INSERT INTO mailbox_messages (
               recipient, external_id, sender, urgency, title, body,
-              task_id, parent_msg_id, broadcast_id, recipients_all, metadata
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              task_id, parent_msg_id, broadcast_id, recipients_all,
+              metadata, attachments
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (recipient, external_id) DO NOTHING
             RETURNING id
             """,
@@ -1075,6 +1077,7 @@ class SqliteMailboxRepository:
                 msg.broadcast_id,
                 _json(msg.recipients_all),
                 _json(msg.metadata),
+                _json(msg.attachments) if msg.attachments else None,
             ),
         ) as cur:
             row = await cur.fetchone()
@@ -1140,6 +1143,10 @@ class SqliteMailboxRepository:
             ),
             metadata=_parse_json(row["metadata"]),
             read_at=row["read_at"] if "read_at" in keys else None,
+            attachments=(
+                _parse_json(row["attachments"])
+                if "attachments" in keys else None
+            ),
         )
 
 
@@ -1511,6 +1518,75 @@ class SqliteArtifactRepository:
         return []
 
 
+class SqliteBlobRepository:
+    """Metadata for content-addressed blobs (images, documents).
+
+    Bytes live on disk — this row carries only ``id`` (sha256 hex),
+    ``media_type``, ``size_bytes``, optional ``filename`` and
+    ``source``. ``upsert`` collapses to a no-op on id conflict so
+    re-uploading identical bytes is free.
+    """
+
+    def __init__(self, conn: aiosqlite.Connection):
+        self.conn = conn
+
+    async def upsert(self, blob: Blob) -> None:
+        await self.conn.execute(
+            """
+            INSERT INTO blobs (id, media_type, size_bytes, filename, source)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT (id) DO NOTHING
+            """,
+            (
+                blob.id, blob.media_type, blob.size_bytes,
+                blob.filename, blob.source,
+            ),
+        )
+        await self.conn.commit()
+
+    async def get(self, blob_id: str) -> Blob | None:
+        async with self.conn.execute(
+            "SELECT * FROM blobs WHERE id = ?", (blob_id,)
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        return self._row_to_blob(row)
+
+    async def exists(self, blob_id: str) -> bool:
+        async with self.conn.execute(
+            "SELECT 1 FROM blobs WHERE id = ? LIMIT 1", (blob_id,)
+        ) as cur:
+            return (await cur.fetchone()) is not None
+
+    async def list_ids(self, blob_ids: list[str]) -> list[Blob]:
+        if not blob_ids:
+            return []
+        # Parameterized IN-list; SQLite handles up to 999 params per
+        # query which is well past any realistic mail attachment count.
+        placeholders = ",".join("?" * len(blob_ids))
+        async with self.conn.execute(
+            f"SELECT * FROM blobs WHERE id IN ({placeholders})",
+            tuple(blob_ids),
+        ) as cur:
+            rows = await cur.fetchall()
+        by_id = {r["id"]: self._row_to_blob(r) for r in rows}
+        # Preserve caller's ordering — the mail-detail view renders
+        # attachments in the order they were attached.
+        return [by_id[bid] for bid in blob_ids if bid in by_id]
+
+    @staticmethod
+    def _row_to_blob(r: aiosqlite.Row) -> Blob:
+        return Blob(
+            id=r["id"],
+            media_type=r["media_type"],
+            size_bytes=r["size_bytes"],
+            filename=r["filename"],
+            source=r["source"],
+            created_at=r["created_at"],
+        )
+
+
 # -----------------------------------------------------------------------
 # Aggregate facade
 # -----------------------------------------------------------------------
@@ -1529,3 +1605,4 @@ class SqliteRepositories:
         self.skills = SqliteSkillRepository(conn)
         self.artifacts = SqliteArtifactRepository(conn)
         self.local_hot = SqliteLocalHotRepository(conn)
+        self.blobs = SqliteBlobRepository(conn)

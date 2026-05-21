@@ -17,6 +17,8 @@ from .outbox.dispatcher import OutboxDispatcher
 from .persistence.db import init_db
 from .persistence.models import MailboxMessage, TaskSpec
 from .persistence.sqlite_impl import SqliteRepositories
+from .runtime.adapter_factory import AdapterFactory
+from .runtime.blob_store import BlobStore
 from .scheduler.scheduler import Scheduler
 
 log = structlog.get_logger()
@@ -218,10 +220,17 @@ def serve_cmd(
         try:
             repos = SqliteRepositories(conn)
 
+            # One BlobStore per process — adapter factory resolves
+            # image/document blocks through it at send-time; dashboard
+            # /send route writes uploaded bytes through it and /blobs/
+            # <id> serves them back.
+            blob_store = BlobStore(cfg.object_store_path)
+
             scheduler = Scheduler(
                 repos, cfg,
                 poll_interval_s=poll_interval,
                 spawn_subprocess=use_subprocess,
+                adapter_factory=AdapterFactory(blob_store=blob_store),
             )
             dispatcher = OutboxDispatcher(repos, poll_interval_s=poll_interval)
 
@@ -269,6 +278,7 @@ def serve_cmd(
                             on_ready=_ready,
                             model_context_windows=ctx_windows,
                             owner_name=cfg.owner.name,
+                            blob_store=blob_store,
                         ),
                         name="dashboard",
                     )
@@ -372,11 +382,13 @@ def run_task_cmd(task_id: str) -> None:
                 _shared = MockJsonlAdapter(_P(mock_script))
                 adapter_for_test = lambda _entry: _shared  # noqa: E731
 
+            blob_store = BlobStore(cfg.object_store_path)
             scheduler = Scheduler(
                 repos, cfg,
                 poll_interval_s=1.0,
                 spawn_subprocess=False,  # we ARE the subprocess
                 adapter_for_test=adapter_for_test,
+                adapter_factory=AdapterFactory(blob_store=blob_store),
             )
             await scheduler._run_task_inline(task_id)
         finally:
@@ -424,6 +436,7 @@ def dashboard_cmd(host: str, port: int) -> None:
                 on_ready=lambda url: click.echo(f"Lyre dashboard at {url}"),
                 model_context_windows=ctx_windows,
                 owner_name=cfg.owner.name,
+                blob_store=BlobStore(cfg.object_store_path),
             )
         finally:
             await conn.close()

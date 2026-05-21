@@ -112,6 +112,75 @@ _MAX_SILENT_TURN_NUDGES = 2  # give the model 2 chances before giving up
 _MAX_COMPACTIONS = 3
 
 
+def _take_view_blocks(result: Any) -> list[LyreContentBlock]:
+    """Pop and return any ``_lyre_view_blocks`` carried on a tool
+    result dict, translating each entry into a ``LyreContentBlock``.
+
+    Tools that produce multimodal output (mailbox_get_message when a
+    mail has attachments) tuck this magic key onto their result. The
+    loop drains it so the JSON the model sees stays clean ("here's
+    the mail body and metadata") while the actual image/document
+    blocks ride alongside on the same user message.
+
+    Returns ``[]`` for anything that isn't a dict or has no view
+    blocks — the common case.
+    """
+    if not isinstance(result, dict):
+        return []
+    raw = result.pop("_lyre_view_blocks", None)
+    if not raw:
+        return []
+    out: list[LyreContentBlock] = []
+    for spec in raw:
+        if not isinstance(spec, dict):
+            continue
+        t = spec.get("type")
+        if t in ("image", "document"):
+            out.append(LyreContentBlock(
+                type=t,
+                blob_id=spec.get("blob_id"),
+                media_type=spec.get("media_type"),
+                filename=spec.get("filename"),
+            ))
+    return out
+
+
+def _strip_vision_blocks(messages: list[LyreMessage]) -> list[LyreMessage]:
+    """Rewrite image/document blocks into text placeholders.
+
+    Called per-dispatch when the routed model lacks the ``vision``
+    capability — degrades gracefully so the model still gets useful
+    context ("there was a screenshot attached called shot.png") rather
+    than the adapter raising on a block it can't translate. The
+    original ``messages`` list is left untouched; we return a new
+    list with new ``LyreMessage`` / ``LyreContentBlock`` instances so
+    the message store stays canonical and a later turn with a
+    vision-capable candidate sees the real image again.
+    """
+    out: list[LyreMessage] = []
+    for msg in messages:
+        rewritten = False
+        new_blocks: list[LyreContentBlock] = []
+        for blk in msg.content:
+            if blk.type in ("image", "document"):
+                name = blk.filename or (blk.blob_id[:12] if blk.blob_id else "?")
+                placeholder = (
+                    f"[{blk.type}: {name} — current model lacks vision "
+                    f"capability; route to a vision-capable model to see it]"
+                )
+                new_blocks.append(
+                    LyreContentBlock(type="text", text=placeholder)
+                )
+                rewritten = True
+            else:
+                new_blocks.append(blk)
+        out.append(
+            LyreMessage(role=msg.role, content=new_blocks)
+            if rewritten else msg
+        )
+    return out
+
+
 class AgentLoop:
     """Multi-turn agent loop with tool dispatch + per-turn model fallback."""
 
@@ -275,6 +344,7 @@ class AgentLoop:
                         result, is_error = await self._dispatch_tool(
                             tu["name"], tu["id"], tu["input"]
                         )
+                        view_blocks = _take_view_blocks(result)
                         tool_result_blocks.append(
                             LyreContentBlock(
                                 type="tool_result",
@@ -283,6 +353,7 @@ class AgentLoop:
                                 is_error=is_error,
                             )
                         )
+                        tool_result_blocks.extend(view_blocks)
                         self.transcript.write_tool_result(tu["id"], result, is_error)
                         if tu["name"] == "mailbox_read" and not is_error:
                             silent_close_askers.update(
@@ -375,6 +446,14 @@ class AgentLoop:
                 result, is_error = await self._dispatch_tool(
                     tu["name"], tu["id"], tu["input"]
                 )
+                # Tools that produce multimodal output (today only
+                # mailbox_get_message with attachments) tuck a
+                # `_lyre_view_blocks` list onto the result dict — the
+                # loop extracts those, appends them as their own
+                # LyreContentBlock entries on the same user message,
+                # and strips the magic key from what gets shown to
+                # the model so the JSON tool_result stays clean.
+                view_blocks = _take_view_blocks(result)
                 tool_result_blocks.append(
                     LyreContentBlock(
                         type="tool_result",
@@ -383,6 +462,7 @@ class AgentLoop:
                         is_error=is_error,
                     )
                 )
+                tool_result_blocks.extend(view_blocks)
                 self.transcript.write_tool_result(tu["id"], result, is_error)
                 if tu["name"] == "mailbox_read" and not is_error:
                     silent_close_askers.update(
@@ -713,9 +793,24 @@ class AgentLoop:
             yielded_any = False
             interrupted_mid_stream = False
 
+            # Multimodal degrade-gracefully: if the chosen candidate
+            # lacks the `vision` capability but the message list
+            # contains image/document blocks, rewrite those blocks
+            # into text placeholders so the model still gets a useful
+            # signal ("[image: shot.png — current model lacks vision
+            # capability]") instead of the adapter raising on dispatch.
+            # The router doesn't pre-filter on `needs_vision` because
+            # images typically arrive mid-wakeup (mail tool result),
+            # well after candidate selection.
+            dispatch_messages = (
+                messages
+                if "vision" in candidate.capabilities
+                else _strip_vision_blocks(messages)
+            )
+
             try:
                 stream = adapter.stream_turn(
-                    messages=messages,
+                    messages=dispatch_messages,
                     tools=tool_specs,
                     model=model_name,
                     max_tokens=self.max_tokens,

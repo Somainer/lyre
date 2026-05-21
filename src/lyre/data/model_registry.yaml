@@ -24,12 +24,15 @@
 models:
 
   # -------- Anthropic (real endpoint) --------
+  # Claude 4.x family supports image input on every tier; PDF/document
+  # input is enabled by Anthropic for these models too — tagged `vision`
+  # so the router prefers them when a mail carries image/document blocks.
   - id: anthropic.claude-opus-4-7
     provider: anthropic
     endpoint:
       base_url: null
       auth_env: ANTHROPIC_API_KEY
-    capabilities: [tool_use, streaming, long_context_1M, reasoning]
+    capabilities: [tool_use, streaming, long_context_1M, reasoning, vision]
     tier: flagship
     cost_per_mtok: { input: 15.00, output: 75.00 }
     context_window: 1000000
@@ -40,7 +43,7 @@ models:
     endpoint:
       base_url: null
       auth_env: ANTHROPIC_API_KEY
-    capabilities: [tool_use, streaming, long_context_1M]
+    capabilities: [tool_use, streaming, long_context_1M, vision]
     tier: workhorse
     cost_per_mtok: { input: 3.00, output: 15.00 }
     context_window: 1000000
@@ -51,7 +54,7 @@ models:
     endpoint:
       base_url: null
       auth_env: ANTHROPIC_API_KEY
-    capabilities: [tool_use, streaming]
+    capabilities: [tool_use, streaming, vision]
     tier: cheap
     cost_per_mtok: { input: 1.00, output: 5.00 }
     context_window: 200000
@@ -90,7 +93,7 @@ models:
     endpoint:
       base_url: null              # SDK default = api.openai.com/v1
       auth_env: OPENAI_API_KEY
-    capabilities: [tool_use, streaming, reasoning]
+    capabilities: [tool_use, streaming, reasoning, vision]
     tier: flagship
     cost_per_mtok: { input: 5.00, output: 20.00 }
     context_window: 400000
@@ -101,7 +104,7 @@ models:
     endpoint:
       base_url: null
       auth_env: OPENAI_API_KEY
-    capabilities: [tool_use, streaming]
+    capabilities: [tool_use, streaming, vision]
     tier: workhorse
     cost_per_mtok: { input: 0.25, output: 2.00 }
     context_window: 400000

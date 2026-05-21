@@ -125,6 +125,7 @@ class OutboxDispatcher:
             broadcast_id=payload.get("broadcast_id"),
             recipients_all=payload.get("recipients_all"),
             metadata=payload.get("metadata"),
+            attachments=payload.get("attachments"),
         )
         await self.repos.mailbox.insert_message(msg)
 

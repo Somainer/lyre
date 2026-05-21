@@ -28,9 +28,10 @@ Things NOT supported (and not needed for OAI compat):
 
 from __future__ import annotations
 
+import base64
 import json as _json
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from openai import AsyncOpenAI
 
@@ -47,6 +48,9 @@ from .llm_adapter import (
     TurnComplete,
     Usage,
 )
+
+if TYPE_CHECKING:
+    from ..runtime.blob_store import BlobStore
 
 # OpenAI finish_reason → Lyre stop_reason. OAI doesn't have a "cancelled"
 # variant; "content_filter" is the closest to error-y.
@@ -68,6 +72,7 @@ class OpenAIAdapter:
         base_url: str | None = None,
         timeout: float = 600.0,
         extra_headers: dict[str, str] | None = None,
+        blob_store: BlobStore | None = None,
     ):
         kwargs: dict[str, Any] = {"api_key": api_key, "timeout": timeout}
         if base_url:
@@ -79,6 +84,7 @@ class OpenAIAdapter:
         if extra_headers:
             kwargs["default_headers"] = extra_headers
         self.client = AsyncOpenAI(**kwargs)
+        self._blob_store = blob_store
 
     async def stream_turn(
         self,
@@ -89,7 +95,9 @@ class OpenAIAdapter:
         temperature: float | None = None,
         system: str | None = None,
     ) -> AsyncIterator[StreamEvent]:
-        oai_messages = self._lyre_to_openai_messages(messages, system)
+        oai_messages = self._lyre_to_openai_messages(
+            messages, system, blob_store=self._blob_store,
+        )
         oai_tools = [self._tool_to_openai(t) for t in tools] if tools else None
 
         kwargs: dict[str, Any] = {
@@ -238,7 +246,9 @@ class OpenAIAdapter:
 
     @staticmethod
     def _lyre_to_openai_messages(
-        msgs: list[LyreMessage], system: str | None
+        msgs: list[LyreMessage],
+        system: str | None,
+        blob_store: BlobStore | None = None,
     ) -> list[dict[str, Any]]:
         """Flatten Lyre's `(role, list[block])` messages into the
         sequence OpenAI expects. Key transformations:
@@ -254,6 +264,11 @@ class OpenAIAdapter:
             messages FIRST, then a user text message, since OpenAI
             requires tool messages to immediately follow the assistant
             that called them.
+          - user message with image/document blocks → user msg whose
+            `content` is a LIST `[{type:text,text:...}, {type:image_url,
+            image_url:{url:"data:<media>;base64,..."}}, ...]`. When
+            there are NO image blocks we keep the legacy string form
+            (some compat providers reject the list form for plain text).
         """
         out: list[dict[str, Any]] = []
         if system:
@@ -266,9 +281,10 @@ class OpenAIAdapter:
 
             if m.role == "user":
                 # Split: tool_results become their own role="tool" msgs,
-                # text becomes a user msg.
+                # text + image become a user msg.
                 tool_msgs: list[dict[str, Any]] = []
                 text_parts: list[str] = []
+                image_parts: list[dict[str, Any]] = []
                 for blk in m.content:
                     if blk.type == "text":
                         if blk.text:
@@ -285,10 +301,44 @@ class OpenAIAdapter:
                             "tool_call_id": blk.tool_use_id or "",
                             "content": content,
                         })
+                    elif blk.type == "image":
+                        if blob_store is None or not blk.blob_id or not blk.media_type:
+                            raise ValueError(
+                                "Cannot translate 'image' block: "
+                                "blob_store + blob_id + media_type required"
+                            )
+                        data = blob_store.read(blk.blob_id, blk.media_type)
+                        b64 = base64.b64encode(data).decode("ascii")
+                        image_parts.append({
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{blk.media_type};base64,{b64}",
+                            },
+                        })
+                    # Chat Completions has no first-class document/PDF
+                    # input type — provider feature gap. The router
+                    # gates on `vision` only, not on `documents`; if a
+                    # doc block reaches here we drop it loudly so it
+                    # doesn't silently swallow user intent.
+                    elif blk.type == "document":
+                        raise ValueError(
+                            "OpenAI Chat Completions does not support "
+                            "'document' blocks; route to a provider "
+                            "with PDF input or pre-extract text."
+                        )
                 # tool results must immediately follow the preceding
                 # assistant; emit them first.
                 out.extend(tool_msgs)
-                if text_parts:
+                if image_parts:
+                    # Multimodal user message: content MUST be a list.
+                    content_list: list[dict[str, Any]] = []
+                    if text_parts:
+                        content_list.append({
+                            "type": "text", "text": "".join(text_parts),
+                        })
+                    content_list.extend(image_parts)
+                    out.append({"role": "user", "content": content_list})
+                elif text_parts:
                     out.append({
                         "role": "user", "content": "".join(text_parts),
                     })

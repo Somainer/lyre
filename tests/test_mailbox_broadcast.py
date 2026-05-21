@@ -37,7 +37,10 @@ async def test_initial_schema_has_broadcast_columns(tmp_path: Path) -> None:
             "SELECT version FROM schema_migrations ORDER BY version"
         ) as cur:
             versions = [r["version"] for r in await cur.fetchall()]
-        assert versions == [1]
+        # Fresh init runs every shipped migration. Assert presence,
+        # not exact ordinal — keeps the test stable as new migrations
+        # land (0002_blobs, etc.).
+        assert 1 in versions
     finally:
         await conn.close()
 
@@ -46,14 +49,20 @@ async def test_initial_schema_has_broadcast_columns(tmp_path: Path) -> None:
 async def test_migration_runner_idempotent_on_reinit(tmp_path: Path) -> None:
     db = tmp_path / "lyre.db"
     c1 = await init_db(db)
+    async with c1.execute(
+        "SELECT version FROM schema_migrations ORDER BY version"
+    ) as cur:
+        first_versions = [r["version"] for r in await cur.fetchall()]
     await c1.close()
     c2 = await init_db(db)
     try:
         async with c2.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
         ) as cur:
-            versions = [r["version"] for r in await cur.fetchall()]
-        assert versions == [1]
+            second_versions = [r["version"] for r in await cur.fetchall()]
+        # Re-init must NOT add or duplicate rows — the schema_migrations
+        # table is a fixed-point set per init_db call.
+        assert second_versions == first_versions
     finally:
         await c2.close()
 
@@ -175,6 +184,92 @@ async def test_reply_to_sets_parent_msg_id(ctx: ToolContext) -> None:
     await disp.tick()
     msgs = await ctx.repos.mailbox.read_messages("owner")
     assert msgs[0].parent_msg_id == parent_id
+
+
+@pytest.mark.asyncio
+async def test_mailbox_send_with_attachment_lands_in_recipient_inbox(
+    ctx: ToolContext,
+) -> None:
+    """Owner uploads an image (blob in DB), then mail is sent with
+    that blob_id in attachments. The dispatched mail must carry the
+    same blob_id through to recipient.mailbox_messages.attachments."""
+    from lyre.persistence.models import Blob
+    blob = Blob(
+        id="a" * 64, media_type="image/png", size_bytes=100,
+        filename="shot.png", source="owner",
+    )
+    await ctx.repos.blobs.upsert(blob)
+
+    await MAILBOX_SEND.handler(
+        ctx,
+        {
+            "to": "worker-maintainer",
+            "body": "see this screenshot",
+            "attachments": ["a" * 64],
+            "_tool_use_id": "tu_attach",
+        },
+    )
+    disp = OutboxDispatcher(ctx.repos)
+    delivered = await disp.tick()
+    assert delivered == 1
+    received = await ctx.repos.mailbox.read_messages("worker-maintainer")
+    assert received[0].attachments == ["a" * 64]
+
+
+@pytest.mark.asyncio
+async def test_mailbox_send_rejects_unknown_blob_id(
+    ctx: ToolContext,
+) -> None:
+    """Forwarding-only invariant: an attachment must reference a blob
+    the agent has seen. An unknown blob_id is the failure surface for
+    a model that tried to fabricate one."""
+    with pytest.raises(ToolError, match="unknown attachment"):
+        await MAILBOX_SEND.handler(
+            ctx,
+            {
+                "to": "worker-maintainer",
+                "body": "look",
+                "attachments": ["f" * 64],
+                "_tool_use_id": "tu_fake",
+            },
+        )
+
+
+@pytest.mark.asyncio
+async def test_mailbox_get_message_returns_view_blocks_for_image(
+    ctx: ToolContext,
+) -> None:
+    """A received mail with image attachments must surface them via
+    the magic `_lyre_view_blocks` key so the agent_loop can hydrate
+    them into LyreContentBlock(type='image', ...) entries on the
+    user message that carries the tool_result."""
+    from lyre.persistence.models import Blob
+    from lyre.persistence.models import MailboxMessage as MM
+    await ctx.repos.blobs.upsert(Blob(
+        id="b" * 64, media_type="image/png", size_bytes=50,
+        filename="diagram.png", source="owner",
+    ))
+    await ctx.repos.mailbox.ensure_mailbox("dispatcher")
+    mid = await ctx.repos.mailbox.insert_message(MM(
+        recipient="dispatcher", external_id="m-img",
+        sender="owner", urgency="normal", body="see attached",
+        attachments=["b" * 64],
+    ))
+    out = await MAILBOX_GET_MESSAGE.handler(ctx, {"msg_id": mid})
+    # Top-level structured attachments — visible to the model as JSON.
+    assert out["attachments"] == [
+        {
+            "blob_id": "b" * 64, "media_type": "image/png",
+            "filename": "diagram.png", "size_bytes": 50,
+        }
+    ]
+    # The magic key the agent_loop pops to build image LyreContentBlocks.
+    assert out["_lyre_view_blocks"] == [
+        {
+            "type": "image", "blob_id": "b" * 64,
+            "media_type": "image/png", "filename": "diagram.png",
+        }
+    ]
 
 
 @pytest.mark.asyncio
