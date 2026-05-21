@@ -83,24 +83,42 @@ async def run_dashboard(
         on_ready(f"http://{host}:{port}")
 
     async def _watch_stop() -> None:
-        if stop_event is None:
-            return
-        await stop_event.wait()
-        server.should_exit = True
+        """Wake SSE subscribers the moment shutdown begins.
 
-    watcher: asyncio.Task | None = None
-    if stop_event is not None:
-        watcher = asyncio.create_task(_watch_stop(), name="dashboard_stop_watch")
+        Polls both `stop_event` (set by `lyre serve` on Ctrl-C) and
+        uvicorn's own `server.should_exit` (set by uvicorn's signal
+        handler when run standalone via `lyre dashboard`). Whichever
+        trips first, we immediately stop the broadcasters so they push
+        the None sentinel to every subscribed SSE handler. Without
+        this, uvicorn's graceful shutdown blocks waiting for handlers
+        to notice via their 2s queue.get timeout — a visible 2-5s
+        pause on exit.
+        """
+        while not server.should_exit:
+            if stop_event is not None and stop_event.is_set():
+                server.should_exit = True
+                break
+            await asyncio.sleep(0.1)
+        # Shutdown begun — wake subscribers so they exit cleanly.
+        # broadcaster.stop() is idempotent, so the finally below
+        # remains safe.
+        await broadcaster.stop()
+        await dashboard_bc.stop()
+
+    watcher = asyncio.create_task(_watch_stop(), name="dashboard_stop_watch")
 
     try:
         await server.serve()
     finally:
-        if watcher is not None:
-            watcher.cancel()
-            try:
-                await watcher
-            except (asyncio.CancelledError, Exception):
-                pass
+        watcher.cancel()
+        try:
+            await watcher
+        except (asyncio.CancelledError, Exception):
+            pass
+        # Idempotent — already called from the watcher when shutdown
+        # was detected. This handles the rare case where serve() exits
+        # without the watcher having noticed (e.g. unhandled exception
+        # from uvicorn itself).
         await broadcaster.stop()
         await dashboard_bc.stop()
 

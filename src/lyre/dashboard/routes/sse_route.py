@@ -56,6 +56,11 @@ async def sse_mailbox(request: Request, recipient: str = "owner"):
                 except TimeoutError:
                     yield ": keepalive\n\n"
                     continue
+                # Sentinel published by broadcaster.stop() during
+                # shutdown — exit the drain loop immediately so uvicorn
+                # can finish graceful shutdown without waiting on us.
+                if msg is None:
+                    break
                 if msg.recipient != recipient:
                     continue
                 payload = {
@@ -253,17 +258,30 @@ async def sse_dashboard(
                 except TimeoutError:
                     yield ": keepalive\n\n"
                     continue
+                # Sentinel published by broadcaster.stop() during
+                # shutdown. Exit immediately so uvicorn's graceful
+                # shutdown doesn't wait on us.
+                if events is None:
+                    break
                 # Coalesce a burst into one render pass. If the
                 # broadcaster fires 5 ticks while we were rendering the
                 # previous batch, drain them all into a union set —
                 # rendering each event ONCE instead of five times. This
                 # is the second half of the "stale handler causes a
                 # query storm" fix.
+                stop_signaled = False
                 while not queue.empty():
                     try:
-                        events = events | queue.get_nowait()
+                        more = queue.get_nowait()
                     except asyncio.QueueEmpty:
                         break
+                    if more is None:
+                        # Mid-drain sentinel: render what we've already
+                        # coalesced, then exit on the next outer-loop
+                        # iteration.
+                        stop_signaled = True
+                        break
+                    events = events | more
                 # Cooperative yield so any pending non-SSE request gets a
                 # turn on aiosqlite before we queue 5-10 queries.
                 await asyncio.sleep(0)
@@ -281,6 +299,8 @@ async def sse_dashboard(
                         yield _sse_format(event, html)
                     except Exception:  # noqa: BLE001
                         continue
+                if stop_signaled:
+                    break
         finally:
             bc.unsubscribe(queue)
 
