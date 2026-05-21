@@ -76,6 +76,15 @@ CREATE TABLE IF NOT EXISTS tasks (
 CREATE INDEX IF NOT EXISTS tasks_status_lease ON tasks(status, lease_until);
 CREATE INDEX IF NOT EXISTS tasks_parent ON tasks(parent_task_id);
 CREATE INDEX IF NOT EXISTS tasks_agent_status ON tasks(agent_id, status);
+-- Dashboard hot paths:
+--   * find_recent ORDER BY created_at DESC
+--   * find_recently_changed WHERE updated_at >= ? + MAX(updated_at) in
+--     the broadcaster snapshot
+--   * count_completed_since WHERE status='completed' AND completed_at >= ?
+CREATE INDEX IF NOT EXISTS tasks_created ON tasks(created_at);
+CREATE INDEX IF NOT EXISTS tasks_updated ON tasks(updated_at);
+CREATE INDEX IF NOT EXISTS tasks_completed
+  ON tasks(completed_at) WHERE status = 'completed';
 
 ------------------------------------------------------------
 -- Wakeups (cold-archive index)
@@ -107,6 +116,19 @@ CREATE TABLE IF NOT EXISTS wakeups (
 
 CREATE INDEX IF NOT EXISTS wakeups_task ON wakeups(task_id, started_at);
 CREATE INDEX IF NOT EXISTS wakeups_agent ON wakeups(agent_id, started_at);
+-- Hot paths used by the dashboard broadcaster (every 1s when subscribers
+-- exist) and every activity/home page render:
+--   * list_active() filters WHERE ended_at IS NULL — partial index over
+--     just the active wakeups (tiny in a busy system; most have ended).
+--   * list_recent / list_since / sum_tokens_since / MAX(started_at) /
+--     ORDER BY started_at DESC — covered by an outright started_at index.
+--   * MAX(ended_at) in the broadcaster snapshot — ended index.
+-- Without these, py-spy showed the dashboard pegged 28/28s inside the
+-- aiosqlite worker thread doing full table scans on wakeups.
+CREATE INDEX IF NOT EXISTS wakeups_active ON wakeups(started_at)
+  WHERE ended_at IS NULL;
+CREATE INDEX IF NOT EXISTS wakeups_started ON wakeups(started_at);
+CREATE INDEX IF NOT EXISTS wakeups_ended ON wakeups(ended_at);
 
 ------------------------------------------------------------
 -- Mailboxes + messages + outbox
@@ -149,6 +171,11 @@ CREATE INDEX IF NOT EXISTS mailbox_messages_broadcast
   ON mailbox_messages(broadcast_id);
 CREATE INDEX IF NOT EXISTS mailbox_messages_unread
   ON mailbox_messages(recipient, urgency, id) WHERE read_at IS NULL;
+-- read_recent_for_audit and Activity-builder span all recipients
+-- filtered by delivered_at >= cutoff. Without this it was a full
+-- table scan every Home / Activity render.
+CREATE INDEX IF NOT EXISTS mailbox_messages_delivered
+  ON mailbox_messages(delivered_at);
 
 CREATE TABLE IF NOT EXISTS outbox (
   id                 INTEGER PRIMARY KEY AUTOINCREMENT,
