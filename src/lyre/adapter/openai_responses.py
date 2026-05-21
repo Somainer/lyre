@@ -184,7 +184,7 @@ class OpenAIResponsesAdapter:
                 if buf is not None and delta:
                     buf["args_chunks"].append(delta)
                     yield ToolUseDelta(
-                        id=buf["call_id"], args_chunk=delta,
+                        id=buf["call_id"], input_partial=delta,
                     )
                 continue
 
