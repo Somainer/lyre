@@ -64,7 +64,7 @@
       <span class="seg"><span class="seg-n">{{ last_wakeup_tok_in }}</span><span>tokens in/out 24h</span></span>
       <span class="seg"><span class="seg-n">{{ last_wakeup_tok_out }}</span><span>out</span></span>
       <span class="seg"><span class="seg-n">{{ last_wakeup_wall }}</span><span>wall</span></span>
-      <span class="seg"><span class="seg-n{% if last_wakeup_ctx_pct and last_wakeup_ctx_pct >= 80 %} num-warn{% endif %}">{{ last_wakeup_ctx_pct or 0 }}%</span><span>ctx peak</span></span>
+      <span class="seg"><span class="seg-n{% if last_wakeup_ctx_pct and last_wakeup_ctx_pct >= 80 %} num-warn{% endif %}">{% if last_wakeup_ctx_pct is not none %}{{ last_wakeup_ctx_pct }}%{% else %}—{% endif %}</span><span>ctx peak</span></span>
     </div>
   {% else %}
     <div class="stat-num dim">—</div>

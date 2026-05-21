@@ -249,7 +249,8 @@ def merge_user_entries(
     """Resolve the effective model registry from shipped defaults +
     the user's ``Config.models`` (config.toml ``[[models]]`` blocks).
 
-    Semantics: **explicit beats shipped**.
+    Semantics: **explicit beats shipped**, with field-level fallback
+    for same-id entries.
 
       * No ``user_entries`` (fresh install, no config.toml yet) →
         the shipped registry is returned unchanged. This keeps the
@@ -258,24 +259,46 @@ def merge_user_entries(
         Shipped defaults are dropped entirely. If the user wants a
         shipped entry, they list it explicitly in their config —
         otherwise the router won't even consider it as a candidate.
+      * **Same-id field-level fallback**: when a user entry's ``id``
+        matches a shipped entry, optional fields the user didn't
+        specify (``context_window``, ``cost_per_mtok``) fall back to
+        the shipped value. This is what lets the operator repoint
+        ``base_url`` without re-typing the model's context window —
+        and is the fix for the "ctx 0%, compaction never fires"
+        symptom that hits any user whose config.toml omits the
+        field (the typical case after ``lyre onboard``).
 
-    The previous behavior appended user entries onto the shipped
-    defaults, which surprised users who'd configured a custom proxy
-    and then found the router ranking shipped Anthropic / DeepSeek
-    entries above theirs (and crashing on missing env vars). Drop
-    that.
+    Field-level merge applies ONLY to optional fields. List-shaped
+    fields (``capabilities``) and required ones (``tier``,
+    ``provider``, ``endpoint``) are NOT silently inherited —
+    explicitly listing them is a user intent we shouldn't override.
     """
     if not user_entries:
         return base
+    by_id = {e.id: e for e in base.entries}
     return ModelRegistry(
-        entries=[_user_entry_to_runtime(raw) for raw in user_entries]
+        entries=[
+            _user_entry_to_runtime(raw, shipped=by_id.get(_user_entry_id(raw)))
+            for raw in user_entries
+        ]
     )
 
 
-def _user_entry_to_runtime(raw: Any) -> ModelEntry:
+def _user_entry_id(raw: Any) -> str:
+    """Pluck the id off either a dict or a typed config.ModelEntry."""
+    return raw["id"] if isinstance(raw, dict) else raw.id
+
+
+def _user_entry_to_runtime(
+    raw: Any, shipped: ModelEntry | None = None,
+) -> ModelEntry:
     """Convert a ``config.ModelEntry`` (or duck-typed equivalent) into the
-    runtime dataclass. Accepts either the typed object or a dict shape so
-    callers can stay flexible."""
+    runtime dataclass.
+
+    When ``shipped`` is provided (the registry entry with the same id),
+    optional fields the user didn't specify fall back to the shipped
+    value. See ``merge_user_entries`` for the full inheritance contract.
+    """
     if isinstance(raw, dict):
         d = raw
     else:
@@ -286,15 +309,31 @@ def _user_entry_to_runtime(raw: Any) -> ModelEntry:
             "capabilities": list(raw.capabilities),
             "tier": raw.tier,
             "status": "enabled" if getattr(raw, "enabled", True) else "disabled",
+            "context_window": getattr(raw, "context_window", None),
+            "cost_per_mtok": getattr(raw, "cost_per_mtok", None),
         }
     _validate_entry(d, idx=-1)
+
+    # Field-level fallback: user wins when present, shipped fills in
+    # otherwise. None / missing is the "not present" signal — explicit
+    # 0 or empty dict still counts as user intent.
+    ctx_window = d.get("context_window")
+    if ctx_window is None and shipped is not None:
+        ctx_window = shipped.context_window
+
+    cost_raw = d.get("cost_per_mtok")
+    if cost_raw is None and shipped is not None:
+        cost = shipped.cost_per_mtok
+    else:
+        cost = ModelCost.from_dict(cost_raw)
+
     return ModelEntry(
         id=d["id"],
         provider=d["provider"],
         endpoint=ModelEndpoint.from_dict(d.get("endpoint")),
         capabilities=tuple(d["capabilities"]),
         tier=d["tier"],
-        cost_per_mtok=ModelCost.from_dict(d.get("cost_per_mtok")),
-        context_window=d.get("context_window"),
+        cost_per_mtok=cost,
+        context_window=ctx_window,
         status=d.get("status", "enabled"),
     )

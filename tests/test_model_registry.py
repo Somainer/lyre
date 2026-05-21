@@ -6,9 +6,15 @@ from pathlib import Path
 
 import pytest
 
+from lyre.config import ModelEntry as ConfigModelEntry
 from lyre.runtime.model_registry import (
+    ModelCost,
+    ModelEndpoint,
+    ModelEntry,
+    ModelRegistry,
     default_registry_path,
     load_registry,
+    merge_user_entries,
     parse_registry,
 )
 
@@ -156,3 +162,129 @@ def test_load_default_registry_yaml() -> None:
 def test_load_registry_raises_on_missing_file(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError):
         load_registry(tmp_path / "nope.yaml")
+
+
+# ---------------------------------------------------------------------------
+# merge_user_entries — same-id field-level fallback to shipped defaults.
+# Fix for the "ctx 0%, compaction never fires" symptom: a user config that
+# REPLACES a shipped entry by id (typical onboard output) used to lose the
+# shipped context_window / cost_per_mtok wholesale.
+# ---------------------------------------------------------------------------
+
+
+def _shipped_registry() -> ModelRegistry:
+    """Compact shipped registry stub — only what these tests need."""
+    return ModelRegistry(entries=[
+        ModelEntry(
+            id="deepseek.deepseek-v4-pro",
+            provider="anthropic",
+            endpoint=ModelEndpoint(
+                base_url="https://api.deepseek.com/anthropic",
+                auth_env="DEEPSEEK_API_KEY",
+            ),
+            capabilities=("tool_use", "streaming"),
+            tier="workhorse",
+            cost_per_mtok=ModelCost(input=0.27, output=1.10),
+            context_window=128000,
+            status="enabled",
+        ),
+    ])
+
+
+def test_user_entry_inherits_context_window_from_shipped_on_id_match() -> None:
+    """The fix: a user entry that omits context_window AND shares an id
+    with a shipped entry inherits the shipped value. Without this the
+    auto-compact gate (turn_input >= threshold * ctx_window) silently
+    never fires."""
+    user = ConfigModelEntry(
+        id="deepseek.deepseek-v4-pro",
+        provider="anthropic",
+        endpoint={
+            "base_url": "https://api.deepseek.com/anthropic",
+            "auth_env": "DEEPSEEK_API_KEY",
+        },
+        capabilities=["tool_use", "streaming"],
+        tier="workhorse",
+        # NOTE: no context_window, no cost_per_mtok — the bug case.
+    )
+    merged = merge_user_entries(_shipped_registry(), [user])
+    e = merged.by_id("deepseek.deepseek-v4-pro")
+    assert e is not None
+    assert e.context_window == 128000  # inherited!
+    assert e.cost_per_mtok.input == 0.27
+    assert e.cost_per_mtok.output == 1.10
+
+
+def test_user_entry_explicit_override_wins_over_shipped() -> None:
+    """When the user DOES specify context_window, theirs is used —
+    inheritance is fallback-only, not silent merge that the user
+    can't escape."""
+    user = ConfigModelEntry(
+        id="deepseek.deepseek-v4-pro",
+        provider="anthropic",
+        endpoint={"auth_env": "DEEPSEEK_API_KEY"},
+        capabilities=["tool_use"],
+        tier="workhorse",
+        context_window=64000,  # explicitly halved
+        cost_per_mtok={"input": 0.50, "output": 2.00},
+    )
+    e = merge_user_entries(_shipped_registry(), [user]).by_id(
+        "deepseek.deepseek-v4-pro",
+    )
+    assert e is not None
+    assert e.context_window == 64000
+    assert e.cost_per_mtok.input == 0.50
+    assert e.cost_per_mtok.output == 2.00
+
+
+def test_user_entry_with_no_shipped_match_keeps_none() -> None:
+    """A genuinely new id (no shipped peer) doesn't get magic
+    inheritance from elsewhere. context_window stays None and the
+    dashboard cleanly shows '—' for ctx%."""
+    user = ConfigModelEntry(
+        id="my-custom.gpt-fake",
+        provider="openai",
+        endpoint={"auth_env": "OPENAI_API_KEY"},
+        capabilities=["tool_use"],
+        tier="workhorse",
+    )
+    e = merge_user_entries(_shipped_registry(), [user]).by_id(
+        "my-custom.gpt-fake",
+    )
+    assert e is not None
+    assert e.context_window is None
+    # ModelCost.from_dict(None) yields (None, None), not None — the
+    # downstream consumers all handle that shape uniformly. Asserting
+    # both leaves are None pins the contract.
+    assert e.cost_per_mtok.input is None
+    assert e.cost_per_mtok.output is None
+
+
+def test_user_entry_partial_cost_does_not_inherit_other_half() -> None:
+    """If the user specifies cost_per_mtok at all, their dict wins
+    wholesale — we don't try to merge per-field (input vs output)
+    because that gets surprising fast. Inheritance is "whole field
+    or nothing"."""
+    user = ConfigModelEntry(
+        id="deepseek.deepseek-v4-pro",
+        provider="anthropic",
+        endpoint={"auth_env": "DEEPSEEK_API_KEY"},
+        capabilities=["tool_use"],
+        tier="workhorse",
+        cost_per_mtok={"input": 0.10},  # only input; output omitted
+    )
+    e = merge_user_entries(_shipped_registry(), [user]).by_id(
+        "deepseek.deepseek-v4-pro",
+    )
+    assert e is not None
+    assert e.cost_per_mtok.input == 0.10
+    # Output is NOT 1.10 from shipped — user-intent wins, even partial.
+    assert e.cost_per_mtok.output is None
+
+
+def test_merge_user_entries_empty_returns_shipped_unchanged() -> None:
+    """No config.toml [[models]] (fresh install) → shipped registry
+    passes through untouched. Regression guard."""
+    shipped = _shipped_registry()
+    merged = merge_user_entries(shipped, [])
+    assert merged is shipped
