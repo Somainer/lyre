@@ -1,0 +1,89 @@
+{% extends "base.html" %}
+{% from "_macros.html" import glyph, agent_id_pill, urgency_chip %}
+{% block content %}
+<div class="page" style="max-width:840px;">
+  <div class="page-header">
+    <div>
+      <h1 class="page-title">
+        <a href="/mail" class="btn ghost sm" style="vertical-align:middle;">← Mail</a>
+        {{ msg.title or "(no title)" }}
+      </h1>
+      <div class="page-subtitle">
+        {{ urgency_chip(msg.urgency) }}
+        <span class="mono dim" style="margin-left:6px;">#{{ msg.id }}</span>
+        <span class="dim" style="margin:0 6px;">·</span>
+        {{ agent_id_pill(msg.sender, size='sm') }}
+        <span style="color:var(--fg-4);">→</span>
+        {{ agent_id_pill(msg.recipient, size='sm') }}
+        <span class="dim" style="margin:0 6px;">·</span>
+        <span class="mono">{{ msg.delivered_at | rel_time }}</span>
+      </div>
+    </div>
+    <div class="row">
+      <button type="button"
+              class="btn ghost sm"
+              id="mail-copy-btn"
+              data-target="mail-raw-body"
+              aria-label="Copy raw body to clipboard">
+        {{ glyph("sheet", 12) }} <span>Copy raw</span>
+      </button>
+      <a class="btn primary" href="/send?reply_to={{ msg.id }}">
+        {{ glyph("reply", 12) }} Reply
+      </a>
+    </div>
+  </div>
+
+  {# Rendered markdown for reading. CSS picks up `.md-body` (the same
+     selector the design system uses for any prose block). #}
+  <div class="card" style="padding:var(--s-5);">
+    <div class="md-body">{{ msg.body | markdown }}</div>
+  </div>
+
+  {# Raw text in a <pre> so the user can scroll the full original
+     verbatim and the Copy button has something to grab. Hidden from
+     normal flow until expanded — most users want the rendered view. #}
+  <details style="margin-top:var(--s-4);">
+    <summary style="cursor:pointer;color:var(--fg-3);font-size:var(--t-meta);padding:var(--s-2) 0;">
+      Show raw body ({{ msg.body|length }} chars)
+    </summary>
+    <pre id="mail-raw-body" class="mail-body-text" style="max-height:none;">{{ msg.body }}</pre>
+  </details>
+
+  <div class="card" style="margin-top:var(--s-5);padding:var(--s-4);">
+    <div style="font-size:var(--t-micro);text-transform:uppercase;letter-spacing:0.06em;color:var(--fg-3);margin-bottom:var(--s-2);">Raw metadata</div>
+    <pre class="mail-raw">{{- "" -}}
+external_id:   {{ msg.external_id }}
+delivered_at:  {{ msg.delivered_at }}
+read_at:       {{ msg.read_at or "null" }}
+task_id:       {{ msg.task_id or "null" }}
+parent_msg_id: {{ msg.parent_msg_id or "null" }}
+broadcast_id:  {{ msg.broadcast_id or "null" }}</pre>
+  </div>
+</div>
+
+<script>
+  (function () {
+    const btn = document.getElementById('mail-copy-btn');
+    if (!btn) return;
+    btn.addEventListener('click', async () => {
+      const target = document.getElementById(btn.dataset.target);
+      if (!target) return;
+      try {
+        await navigator.clipboard.writeText(target.textContent);
+        const span = btn.querySelector('span');
+        const original = span.textContent;
+        span.textContent = 'Copied';
+        setTimeout(() => { span.textContent = original; }, 1500);
+      } catch (_) {
+        // Older browsers / non-HTTPS contexts — fall back to selecting
+        // the <pre> so the user can ⌘C themselves.
+        const range = document.createRange();
+        range.selectNodeContents(target);
+        const sel = window.getSelection();
+        sel.removeAllRanges();
+        sel.addRange(range);
+      }
+    });
+  })();
+</script>
+{% endblock %}

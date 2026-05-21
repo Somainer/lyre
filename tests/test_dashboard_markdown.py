@@ -125,3 +125,45 @@ def test_mail_escapes_raw_html_no_script_tag(
     # Entity-encoded form is what we expect (Jinja auto-escapes the
     # body when interpolating into the <pre>).
     assert "&lt;script&gt;" in body or "&lt;script" in body
+
+
+def test_mail_detail_renders_markdown(client_with_mail: TestClient) -> None:
+    """/mail/<id> is the detail view that re-introduces full markdown
+    rendering. The list view (/mail) keeps bodies as fast plain
+    <pre>; this route is where the user lands when they click a row
+    title and wants formatted output (or to copy the raw body via the
+    one-click button)."""
+    # The fixture seeds two messages — md-rich (markdown content) and
+    # md-xss (hostile content). The list is newest-first, so we can't
+    # just take the first href; find the link sitting under the
+    # "Pi research summary" title instead.
+    import re
+    list_resp = client_with_mail.get("/mail")
+    # The title link sits next to the title text; match the href whose
+    # text content is the rich title.
+    match = re.search(
+        r'href="/mail/(\d+)"[^>]*>Pi research summary',
+        list_resp.text,
+    )
+    assert match is not None, (
+        "list page must link rows to /mail/<id> with the title as text"
+    )
+    msg_id = int(match.group(1))
+
+    r = client_with_mail.get(f"/mail/{msg_id}")
+    assert r.status_code == 200
+    body = r.text
+    # Rendered markdown — same assertions the list test used to hold.
+    assert "<strong>Pi</strong>" in body
+    assert "<ul>" in body and "<li>Skills system</li>" in body
+    assert "<code>~/.lyre/memory/facts/specs-pi-research.md</code>" in body
+    # Copy-raw button + the raw <pre> it targets must both exist.
+    assert "mail-copy-btn" in body
+    assert 'id="mail-raw-body"' in body
+    # Reply link points back at the sender via the standard reply_to flow.
+    assert f"/send?reply_to={msg_id}" in body
+
+
+def test_mail_detail_404_for_unknown_id(client_with_mail: TestClient) -> None:
+    r = client_with_mail.get("/mail/999999")
+    assert r.status_code == 404
