@@ -329,6 +329,11 @@ async def test_scheduler_subprocess_mode_dispatches_and_completes(
 
         try:
             await scheduler._tick()
+            # Subprocess spawn is now non-blocking (one reaper task per
+            # child). Wait for the in-flight reaper to finish before
+            # asserting on terminal status; otherwise the assertion
+            # fires while the subprocess is still booting.
+            await scheduler._drain_subprocesses()
             t = await repos.tasks.get(task_id)
             assert t is not None
             assert t.status == "completed", f"status was {t.status}"
@@ -337,5 +342,228 @@ async def test_scheduler_subprocess_mode_dispatches_and_completes(
             for k in env:
                 if k not in {"PATH", "HOME", "USER", "LOGNAME"}:
                     os.environ.pop(k, None)
+    finally:
+        await conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Concurrency: max_concurrent_tasks > 1
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_scheduler_runs_two_tasks_concurrently(
+    sandbox: dict,
+) -> None:
+    """With max_concurrent_tasks=2 the scheduler must spawn TWO
+    subprocesses in a single tick when two tasks are pending. Each
+    subprocess opens its own SQLite connection (WAL serializes
+    writes); both tasks complete and update their rows correctly."""
+    conn = await init_db(sandbox["db"])
+    try:
+        repos = SqliteRepositories(conn)
+        await _seed(repos)
+        await repos.agents.create(
+            agent_id="worker-a", persona_name="worker-maintainer",
+        )
+        await repos.agents.create(
+            agent_id="worker-b", persona_name="worker-maintainer",
+        )
+        tid_a = await repos.tasks.create(TaskSpec(
+            agent_id="worker-a", persona_name="worker-maintainer",
+            goal="a", acceptance="a",
+        ))
+        tid_b = await repos.tasks.create(TaskSpec(
+            agent_id="worker-b", persona_name="worker-maintainer",
+            goal="b", acceptance="b",
+        ))
+
+        script_path = sandbox["tmp"] / "s.jsonl"
+        _write_jsonl_script(script_path, [
+            [
+                {"type": "content_delta", "text": "done"},
+                {"type": "turn_complete", "stop_reason": "end_turn"},
+            ],
+        ])
+        env = {**sandbox["env"], "LYRE_MOCK_ADAPTER_SCRIPT": str(script_path)}
+
+        cfg = Config(
+            db_path=sandbox["db"],
+            object_store_path=sandbox["obj"],
+            memory_path=sandbox["mem"],
+            anthropic_api_key="fake",
+            anthropic_base_url=None,
+            default_model="m",
+            model_override=None,
+            max_concurrent_tasks=2,
+        )
+        scheduler = Scheduler(
+            repos, cfg, poll_interval_s=0.05, spawn_subprocess=True,
+        )
+        for k, v in env.items():
+            os.environ[k] = v
+        try:
+            await scheduler._tick()
+            # Both tasks should be in flight in the same tick — proves
+            # the cap is respected and tick doesn't block on first
+            # subprocess.
+            assert len(scheduler._active_subprocesses) == 2, (
+                f"expected 2 in-flight, got "
+                f"{list(scheduler._active_subprocesses.keys())}"
+            )
+            await scheduler._drain_subprocesses()
+            ta = await repos.tasks.get(tid_a)
+            tb = await repos.tasks.get(tid_b)
+            assert ta and ta.status == "completed", f"a: {ta.status if ta else 'gone'}"
+            assert tb and tb.status == "completed", f"b: {tb.status if tb else 'gone'}"
+        finally:
+            for k in env:
+                if k not in {"PATH", "HOME", "USER", "LOGNAME"}:
+                    os.environ.pop(k, None)
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_scheduler_respects_max_concurrent_cap(
+    sandbox: dict,
+) -> None:
+    """With max_concurrent_tasks=1 (default), a second pending task
+    must wait — only one subprocess in flight at any time. Two ticks
+    are needed to clear two pending tasks."""
+    conn = await init_db(sandbox["db"])
+    try:
+        repos = SqliteRepositories(conn)
+        await _seed(repos)
+        await repos.agents.create(
+            agent_id="worker-a", persona_name="worker-maintainer",
+        )
+        await repos.agents.create(
+            agent_id="worker-b", persona_name="worker-maintainer",
+        )
+        tid_a = await repos.tasks.create(TaskSpec(
+            agent_id="worker-a", persona_name="worker-maintainer",
+            goal="a", acceptance="a",
+        ))
+        tid_b = await repos.tasks.create(TaskSpec(
+            agent_id="worker-b", persona_name="worker-maintainer",
+            goal="b", acceptance="b",
+        ))
+
+        script_path = sandbox["tmp"] / "s.jsonl"
+        _write_jsonl_script(script_path, [
+            [
+                {"type": "content_delta", "text": "done"},
+                {"type": "turn_complete", "stop_reason": "end_turn"},
+            ],
+        ])
+        env = {**sandbox["env"], "LYRE_MOCK_ADAPTER_SCRIPT": str(script_path)}
+
+        cfg = Config(
+            db_path=sandbox["db"],
+            object_store_path=sandbox["obj"],
+            memory_path=sandbox["mem"],
+            anthropic_api_key="fake",
+            anthropic_base_url=None,
+            default_model="m",
+            model_override=None,
+            max_concurrent_tasks=1,
+        )
+        scheduler = Scheduler(
+            repos, cfg, poll_interval_s=0.05, spawn_subprocess=True,
+        )
+        for k, v in env.items():
+            os.environ[k] = v
+        try:
+            await scheduler._tick()
+            # Cap == 1 → exactly one in flight after first tick.
+            assert len(scheduler._active_subprocesses) == 1
+            await scheduler._drain_subprocesses()
+            # Second tick picks up the other.
+            await scheduler._tick()
+            assert len(scheduler._active_subprocesses) == 1
+            await scheduler._drain_subprocesses()
+            ta = await repos.tasks.get(tid_a)
+            tb = await repos.tasks.get(tid_b)
+            assert ta and ta.status == "completed"
+            assert tb and tb.status == "completed"
+        finally:
+            for k in env:
+                if k not in {"PATH", "HOME", "USER", "LOGNAME"}:
+                    os.environ.pop(k, None)
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_subprocess_writes_dont_corrupt_db(
+    sandbox: dict,
+) -> None:
+    """The real concurrency-safety claim: two subprocesses writing
+    to the same SQLite DB at the same time must both succeed (WAL +
+    busy_timeout). We check this end-to-end by spawning two real
+    subprocesses concurrently and verifying both their wakeup rows
+    landed cleanly."""
+    conn = await init_db(sandbox["db"])
+    try:
+        repos = SqliteRepositories(conn)
+        await _seed(repos)
+        await repos.agents.create(
+            agent_id="worker-a", persona_name="worker-maintainer",
+        )
+        await repos.agents.create(
+            agent_id="worker-b", persona_name="worker-maintainer",
+        )
+        tid_a = await repos.tasks.create(TaskSpec(
+            agent_id="worker-a", persona_name="worker-maintainer",
+            goal="a", acceptance="a",
+        ))
+        tid_b = await repos.tasks.create(TaskSpec(
+            agent_id="worker-b", persona_name="worker-maintainer",
+            goal="b", acceptance="b",
+        ))
+
+        script_path = sandbox["tmp"] / "s.jsonl"
+        _write_jsonl_script(script_path, [
+            [
+                {"type": "content_delta", "text": "done"},
+                {"type": "turn_complete", "stop_reason": "end_turn"},
+            ],
+        ])
+        env = {**sandbox["env"], "LYRE_MOCK_ADAPTER_SCRIPT": str(script_path)}
+
+        # Spawn the two CLI subprocesses concurrently — bypasses the
+        # scheduler so we isolate the "two writers, same DB" claim.
+        async def _spawn(tid: str) -> tuple[int, bytes]:
+            argv = [sys.executable, "-m", "lyre.main", "run-task", tid]
+            proc = await asyncio.create_subprocess_exec(
+                *argv, env=env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await proc.communicate()
+            rc = proc.returncode if proc.returncode is not None else -1
+            return rc, stderr or b""
+
+        (rc_a, err_a), (rc_b, err_b) = await asyncio.gather(
+            _spawn(tid_a), _spawn(tid_b),
+        )
+        assert rc_a == 0, f"subprocess a crashed (rc={rc_a}): {err_a[-512:]!r}"
+        assert rc_b == 0, f"subprocess b crashed (rc={rc_b}): {err_b[-512:]!r}"
+
+        # Both tasks completed and have at least one wakeup row each.
+        ta = await repos.tasks.get(tid_a)
+        tb = await repos.tasks.get(tid_b)
+        assert ta and ta.status == "completed"
+        assert tb and tb.status == "completed"
+
+        async with conn.execute(
+            "SELECT task_id, COUNT(*) as n FROM wakeups "
+            "GROUP BY task_id ORDER BY task_id"
+        ) as cur:
+            rows = await cur.fetchall()
+        counts = {r["task_id"]: r["n"] for r in rows}
+        assert counts.get(tid_a, 0) >= 1, f"task a wakeups: {counts}"
+        assert counts.get(tid_b, 0) >= 1, f"task b wakeups: {counts}"
     finally:
         await conn.close()

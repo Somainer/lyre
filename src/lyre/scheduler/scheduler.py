@@ -104,9 +104,58 @@ class Scheduler:
         self.auto_wake_on_mail = auto_wake_on_mail
         self.adapter_for_test = adapter_for_test
         self._stop_event = asyncio.Event()
+        # Concurrency state (subprocess mode only). Maps task_id →
+        # (Process, reaper_task). The reaper is a background asyncio
+        # task that awaits proc.communicate(), logs the result, and
+        # pops itself off this dict. Inline mode ignores this — it
+        # stays strictly serial.
+        self._active_subprocesses: dict[
+            str, tuple[asyncio.subprocess.Process, asyncio.Task[None]]
+        ] = {}
+        # Cap from config; only consulted in subprocess mode. inline
+        # is single-threaded by design so the cap doesn't apply.
+        self._max_concurrent = max(1, self.config.max_concurrent_tasks)
 
     def request_stop(self) -> None:
         self._stop_event.set()
+
+    async def _drain_subprocesses(self, timeout_s: float = 30.0) -> None:
+        """Wait for all in-flight subprocesses to finish.
+
+        Called from ``run`` after the main tick loop exits so a
+        graceful shutdown lets running tasks complete rather than
+        SIGKILL'ing them mid-wakeup. If a subprocess wedges past
+        ``timeout_s`` we cancel its reaper, which terminates the
+        process and its lease will be recovered after expiry on the
+        next process' boot.
+        """
+        if not self._active_subprocesses:
+            return
+        log.info(
+            "scheduler_draining_subprocesses",
+            count=len(self._active_subprocesses),
+            timeout_s=timeout_s,
+        )
+        reapers = [t for _, t in self._active_subprocesses.values()]
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*reapers, return_exceptions=True),
+                timeout=timeout_s,
+            )
+        except TimeoutError:
+            log.warning(
+                "scheduler_drain_timeout",
+                stuck=list(self._active_subprocesses.keys()),
+            )
+            # Cancel hung reapers — each handles CancelledError by
+            # terminating + killing its child.
+            for _, t in self._active_subprocesses.values():
+                if not t.done():
+                    t.cancel()
+            # Best-effort: wait once more for the cancellations to
+            # propagate. Anything still stuck after this falls to the
+            # OS to reap when the parent exits.
+            await asyncio.gather(*reapers, return_exceptions=True)
 
     async def run(self) -> None:
         log.info(
@@ -114,6 +163,8 @@ class Scheduler:
             poll_interval_s=self.poll_interval_s,
             registry_entries=len(self.registry.entries),
             override=self.config.model_override,
+            max_concurrent_tasks=self._max_concurrent,
+            spawn_subprocess=self.spawn_subprocess,
         )
         while not self._stop_event.is_set():
             try:
@@ -124,6 +175,11 @@ class Scheduler:
                 await asyncio.wait_for(self._stop_event.wait(), timeout=self.poll_interval_s)
             except TimeoutError:
                 pass
+        # Let in-flight subprocess tasks finish (or time out) before
+        # returning. Without this, `lyre serve` shutdown would orphan
+        # children that the OS later reaps with no logging.
+        if self.spawn_subprocess:
+            await self._drain_subprocesses()
         log.info("scheduler_stopped")
 
     async def _tick(self) -> None:
@@ -152,19 +208,51 @@ class Scheduler:
                     persona=parent.persona_name,
                 )
 
-        # Phase 2 (chaos recovery): pick up any task whose lease has expired
+        # Phase 2 (chaos recovery): pick up tasks whose lease has expired
         # (process died, SIGKILL, etc.) BEFORE looking for new pending work.
-        expired = await self.repos.tasks.find_expired_leases(limit=1)
-        if expired:
-            log.info("scheduler_recovering_expired_lease", task_id=expired[0].id)
-            await self._run_task(expired[0].id)
-            return
+        # Skip any task already covered by an in-flight subprocess —
+        # avoids a transient double-spawn during the window between
+        # subprocess crash and DB lease expiry (the crashed proc is
+        # gone but the new reaper hasn't fired yet because we just
+        # started the recovery one).
+        slots = self._available_slots()
+        if slots > 0:
+            expired = await self.repos.tasks.find_expired_leases(limit=slots)
+            expired = [t for t in expired if t.id not in self._active_subprocesses]
+            for t in expired[:slots]:
+                log.info("scheduler_recovering_expired_lease", task_id=t.id)
+                await self._run_task(t.id)
+                slots = self._available_slots()
+                if slots <= 0:
+                    break
 
-        # Phase 3: new pending work.
-        pending = await self.repos.tasks.find_pending(limit=1)
-        if not pending:
+        # Phase 3: new pending work — up to the remaining slot budget.
+        slots = self._available_slots()
+        if slots <= 0:
             return
-        await self._run_task(pending[0].id)
+        pending = await self.repos.tasks.find_pending(limit=slots)
+        pending = [t for t in pending if t.id not in self._active_subprocesses]
+        for t in pending[:slots]:
+            await self._run_task(t.id)
+            if self._available_slots() <= 0:
+                break
+
+    def _available_slots(self) -> int:
+        """How many fresh tasks we can take on right now.
+
+        Inline mode: serial-by-design, so 0 if any inline task is
+        currently running (we naturally enforce this because
+        ``_run_task_inline`` is awaited synchronously inside ``_tick``,
+        but expose the count as 1 here — the gate is the caller's own
+        single-threadedness). Subprocess mode: ``max_concurrent_tasks
+        - len(active)``.
+        """
+        if not self.spawn_subprocess:
+            # Inline: ``_run_task_inline`` blocks the tick; ``_tick``
+            # only spawns one before returning, so returning 1 is
+            # fine — the loop body itself is the gate.
+            return 1
+        return max(0, self._max_concurrent - len(self._active_subprocesses))
 
     # Phase 0 task goal/acceptance: cache-friendly split.
     # The first 2 strings are byte-identical across all wakeups (cached
@@ -420,12 +508,24 @@ class Scheduler:
             await self._run_task_inline(task_id)
 
     async def _run_task_in_subprocess(self, task_id: str) -> None:
-        """Spawn `lyre run-task <task_id>` as a subprocess. The subprocess
-        opens its own DB connection (SQLite WAL handles multi-process),
-        runs the inline pipeline, and writes all state back via the DB.
-        Parent only monitors exit code; on non-zero exit, the lease the
-        subprocess held expires after `lease_duration_s` and the normal
-        recovery path re-runs the task."""
+        """Spawn `lyre run-task <task_id>` as a subprocess and return
+        IMMEDIATELY without waiting for exit.
+
+        Why non-blocking: per `config.max_concurrent_tasks` we may have
+        N tasks in flight at once. A background reaper task (see
+        ``_reap_subprocess``) drains stdout/stderr and logs the exit
+        code asynchronously so the OS pipe buffers don't fill and
+        block the child. The scheduler tick reads
+        ``self._active_subprocesses`` to decide whether to pick more
+        pending work this round.
+
+        Each subprocess opens its OWN aiosqlite connection — SQLite
+        WAL + 10s busy_timeout on every connection (see
+        persistence/db.py) cover cross-process write contention. The
+        lease's atomic UPDATE is the final dedup guard: even if the
+        scheduler accidentally spawned two subprocesses for the same
+        task, only one's claim_lease succeeds; the other no-ops.
+        """
         argv = self.subprocess_argv or [
             sys.executable, "-m", "lyre.main", "run-task"
         ]
@@ -454,7 +554,33 @@ class Scheduler:
             await self.repos.tasks.update_status(task_id, "failed")
             return
 
-        stdout, stderr = await proc.communicate()
+        reaper = asyncio.create_task(
+            self._reap_subprocess(task_id, proc),
+            name=f"reaper:{task_id}",
+        )
+        self._active_subprocesses[task_id] = (proc, reaper)
+
+    async def _reap_subprocess(
+        self, task_id: str, proc: asyncio.subprocess.Process,
+    ) -> None:
+        """Wait for ``proc`` to exit, drain its pipes, log the result,
+        and remove from ``_active_subprocesses``. One reaper per
+        spawned subprocess; fires concurrently with the scheduler
+        tick so multiple subprocesses can be in flight."""
+        try:
+            stdout, stderr = await proc.communicate()
+        except asyncio.CancelledError:
+            # Shutdown path — the parent is going down. Kill the
+            # child rather than leave it orphaned; its lease will
+            # expire after lease_duration_s and the next process'
+            # Phase 2 recovery picks it up.
+            proc.terminate()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5.0)
+            except TimeoutError:
+                proc.kill()
+            raise
+
         rc = proc.returncode if proc.returncode is not None else -1
         log.info(
             "scheduler_subprocess_exited",
@@ -464,15 +590,19 @@ class Scheduler:
             stderr_bytes=len(stderr or b""),
         )
         if rc != 0:
-            # Subprocess crashed / SIGKILL'd. Task may be left in_progress
-            # with lease held — the next find_expired_leases tick will
-            # recover. Don't touch DB here.
+            # Subprocess crashed / SIGKILL'd. Task may be left
+            # in_progress with lease held — the next
+            # find_expired_leases tick will recover. Don't touch DB
+            # here.
             log.warning(
                 "scheduler_subprocess_abnormal_exit",
                 task_id=task_id,
                 returncode=rc,
                 stderr_tail=(stderr or b"").decode("utf-8", "replace")[-512:],
             )
+        # Pop AFTER logging so a fast follow-up tick that sees the
+        # task still in `_active_subprocesses` won't double-spawn.
+        self._active_subprocesses.pop(task_id, None)
 
     async def _run_task_inline(self, task_id: str) -> None:
         task = await self.repos.tasks.get(task_id)

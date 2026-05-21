@@ -248,6 +248,13 @@ class Config:
     # ---- defaults: runtime knobs added with config.toml ----
     default_dashboard_port: int = 8765
     auto_wake_on_mail: bool = True
+    # How many tasks the scheduler may have in flight at once. Only
+    # honored in subprocess mode — inline mode is single-threaded by
+    # design and ignores this. Default 1 preserves the historical
+    # serial behavior; raise it (3-4 is plenty for personal use) to
+    # let agents work in parallel. SQLite WAL + 10s busy_timeout
+    # cover cross-process write contention.
+    max_concurrent_tasks: int = 1
 
     @classmethod
     def from_env(cls) -> Config:
@@ -359,6 +366,25 @@ class Config:
         if env_auto is not None:
             auto_wake = env_auto.lower() in ("1", "true", "yes", "on")
 
+        # ---- scheduler concurrency ----
+        # [scheduler] max_concurrent_tasks = N in config.toml; env var
+        # `LYRE_MAX_CONCURRENT_TASKS` wins (matches the existing
+        # env-beats-toml convention for runtime knobs).
+        scheduler_raw = raw.get("scheduler", {}) or {}
+        try:
+            max_concurrent = int(
+                os.environ.get("LYRE_MAX_CONCURRENT_TASKS")
+                or scheduler_raw.get("max_concurrent_tasks")
+                or 1
+            )
+        except (ValueError, TypeError):
+            max_concurrent = 1
+        if max_concurrent < 1:
+            # Treat 0 / negative as "disabled, fall back to 1" rather
+            # than failing startup — a typo in config shouldn't stop
+            # the daemon.
+            max_concurrent = 1
+
         # ---- bootstrap agent id overrides ----
         bootstrap_raw = raw.get("bootstrap") or {}
         bootstrap = BootstrapConfig(
@@ -386,6 +412,7 @@ class Config:
             bootstrap=bootstrap,
             default_dashboard_port=dashboard_port,
             auto_wake_on_mail=bool(auto_wake),
+            max_concurrent_tasks=max_concurrent,
         )
 
     @property

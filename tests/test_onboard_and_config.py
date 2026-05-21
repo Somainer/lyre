@@ -190,6 +190,71 @@ def test_bootstrap_runtime_uses_custom_dispatcher_id(
     assert (cfg.memory_path / "facts" / "agent-cassandra-notes.md").is_file()
 
 
+def test_config_max_concurrent_tasks_defaults_to_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Backcompat: an old config with no [scheduler] section keeps the
+    historical serial behavior (1 task at a time)."""
+    monkeypatch.setenv("LYRE_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("LYRE_MAX_CONCURRENT_TASKS", raising=False)
+    (tmp_path / "config.toml").write_text(
+        '[owner]\nname = "o"\n', encoding="utf-8",
+    )
+    cfg = Config.from_env()
+    assert cfg.max_concurrent_tasks == 1
+
+
+def test_config_reads_max_concurrent_tasks_from_toml(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LYRE_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("LYRE_MAX_CONCURRENT_TASKS", raising=False)
+    (tmp_path / "config.toml").write_text(
+        '[owner]\nname = "o"\n\n[scheduler]\n'
+        'max_concurrent_tasks = 4\n',
+        encoding="utf-8",
+    )
+    cfg = Config.from_env()
+    assert cfg.max_concurrent_tasks == 4
+
+
+def test_config_env_var_beats_toml_for_max_concurrent_tasks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LYRE_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("LYRE_MAX_CONCURRENT_TASKS", "8")
+    (tmp_path / "config.toml").write_text(
+        '[owner]\nname = "o"\n\n[scheduler]\n'
+        'max_concurrent_tasks = 2\n',
+        encoding="utf-8",
+    )
+    cfg = Config.from_env()
+    assert cfg.max_concurrent_tasks == 8
+
+
+def test_config_max_concurrent_tasks_floors_at_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """0 / negative / garbage in config must not crash startup or
+    silently disable the scheduler — clamp to 1 (the original
+    serial behavior)."""
+    monkeypatch.setenv("LYRE_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("LYRE_MAX_CONCURRENT_TASKS", raising=False)
+    (tmp_path / "config.toml").write_text(
+        '[owner]\nname = "o"\n\n[scheduler]\n'
+        'max_concurrent_tasks = 0\n',
+        encoding="utf-8",
+    )
+    assert Config.from_env().max_concurrent_tasks == 1
+
+    monkeypatch.setenv("LYRE_MAX_CONCURRENT_TASKS", "not-a-number")
+    assert Config.from_env().max_concurrent_tasks == 1
+
+
 def test_config_is_onboarded_reflects_config_toml_presence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
