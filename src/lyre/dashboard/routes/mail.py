@@ -36,9 +36,13 @@ async def mail_view(
     request: Request, u: str = "all", before_id: int | None = None,
 ) -> HTMLResponse:
     repos = request.app.state.repos
-    # Read up to 100 most recent mail; let the chip filter then narrow.
+    # 50-row default — each row markdown-renders its body, and 200 of
+    # those would lock the event loop for a noticeable beat on a busy
+    # mailbox. Mail's primary use is scanning recent items + copying
+    # text out; the filter chips narrow within the page, and
+    # ?before_id= paginates for archive browsing.
     msgs = await repos.mailbox.read_messages_paged(
-        "owner", before_id=before_id, limit=200,
+        "owner", before_id=before_id, limit=50,
     )
     counts = {k: len([m for m in msgs if m.urgency in band])
               for k, band in _FILTER_BANDS.items()}

@@ -164,11 +164,33 @@ _RENDERERS = {
 }
 
 
+_DEFAULT_EVENTS = frozenset(_RENDERERS.keys())
+
+
+def _parse_events(events_qs: str | None) -> frozenset[str]:
+    """Parse `?events=foo,bar` into a set, falling back to all events.
+
+    Pages declare which fragments they actually display via their
+    sse_events template var, which flows into the sse-connect URL.
+    The Mail / Runs / Agents / Send pages only have the topnav widgets,
+    so they declare only `agent-status,health` — saving the heavy
+    `stats` (10+ queries) and `activity` (4 queries + 400-row sort)
+    renders on every broadcaster tick.
+    """
+    if not events_qs:
+        return _DEFAULT_EVENTS
+    return frozenset(
+        e.strip() for e in events_qs.split(",")
+        if e.strip() in _DEFAULT_EVENTS
+    )
+
+
 @router.get("/sse/dashboard")
 async def sse_dashboard(
     request: Request,
     agent_id: str | None = None,
     minutes: int = 30,
+    events: str | None = None,
 ):
     """Push rendered HTML fragments whenever the relevant tables change.
 
@@ -186,8 +208,13 @@ async def sse_dashboard(
                    global cross-agent overview.
       minutes    — activity window in minutes (default 30). Matches the
                    /partials/activity contract.
+      events     — CSV subset of event names the caller subscribes to
+                   ({"stats", "activity", "agent-status", "health"}).
+                   Pages opt OUT of fragments they don't display so the
+                   handler doesn't render fragments the DOM will discard.
     """
     bc = getattr(request.app.state, "dashboard_broadcaster", None)
+    wanted = _parse_events(events)
 
     async def event_stream():
         # Fire one immediate keepalive comment so the browser sees the
@@ -204,26 +231,29 @@ async def sse_dashboard(
         # full initial render was. The expensive fragments
         # (stats / activity) skip this path: they're only shown on
         # their own pages and the page route already inlines them.
-        try:
-            repos = request.app.state.repos
-            active = await list_active_wakeups(repos)
-            templates = request.app.state.templates
-            yield _sse_format(
-                EVENT_HEALTH,
-                templates.get_template("partials/health.html").render(
-                    active_count=len(active),
-                ),
-            )
-            yield _sse_format(
-                EVENT_AGENT_STATUS,
-                templates.get_template("partials/agent_status.html").render(
-                    active_wakeups=active,
-                ),
-            )
-        except Exception:  # noqa: BLE001
-            # Don't tear the stream down for a single broken initial
-            # render — the subsequent change events will repopulate.
-            pass
+        if (EVENT_HEALTH in wanted) or (EVENT_AGENT_STATUS in wanted):
+            try:
+                repos = request.app.state.repos
+                active = await list_active_wakeups(repos)
+                templates = request.app.state.templates
+                if EVENT_HEALTH in wanted:
+                    yield _sse_format(
+                        EVENT_HEALTH,
+                        templates.get_template("partials/health.html").render(
+                            active_count=len(active),
+                        ),
+                    )
+                if EVENT_AGENT_STATUS in wanted:
+                    yield _sse_format(
+                        EVENT_AGENT_STATUS,
+                        templates.get_template(
+                            "partials/agent_status.html"
+                        ).render(active_wakeups=active),
+                    )
+            except Exception:  # noqa: BLE001
+                # Don't tear the stream down for a single broken initial
+                # render — the subsequent change events will repopulate.
+                pass
 
         # No broadcaster attached (tests / minimal embedding) — just
         # keepalive until the client disconnects.
@@ -291,6 +321,11 @@ async def sse_dashboard(
                         # client is gone, even if we still had events
                         # queued — those renders would just be wasted.
                         return
+                    if event not in wanted:
+                        # Page didn't subscribe to this event kind —
+                        # skip the render so we don't burn DB queries
+                        # producing HTML the DOM would discard.
+                        continue
                     renderer = _RENDERERS.get(event)
                     if renderer is None:
                         continue

@@ -40,6 +40,9 @@ async def activity_page(
             # time window so the broadcaster renders the same fragment
             # the page initially showed.
             "sse_minutes": minutes,
+            # Activity page only needs the activity timeline + topnav.
+            # No stats grid on this page.
+            "sse_events": "activity,agent-status,health",
         },
     )
 

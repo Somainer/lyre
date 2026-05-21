@@ -175,6 +175,10 @@ async def home(request: Request) -> HTMLResponse:
             "recent_feed": recent_feed_msgs,
             "unread_count": unread_count,
             "needs_input_count": needs_input_count,
+            # Home renders the stats grid + the recent-blockers card.
+            # It needs `stats` push (chip counts move) plus the
+            # always-on topnav widgets.
+            "sse_events": "stats,agent-status,health",
             **ctx,
         },
     )
