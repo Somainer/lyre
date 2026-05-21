@@ -193,6 +193,48 @@ class PersonaOverride:
 
 
 @dataclass(frozen=True)
+class LarkConfig:
+    """Lark/Feishu bot channel integration.
+
+    The bot becomes the owner's mailbox over IM: agent→owner mail
+    surfaces in Lark; messages from ``authorized_user_id`` become
+    mail to agents (default recipient `bootstrap.dispatcher_id`,
+    overridable with `@<agent_id>` prefix or by replying in an
+    existing thread).
+
+    Secrets (``app_id`` / ``app_secret``) live in ``~/.lyre/.env``,
+    not in config.toml — same convention as model API keys. Only the
+    non-sensitive identifying info goes in toml.
+    """
+
+    enabled: bool = False
+    # Lark user_id (e.g. "ou_abc...") whose messages the bot treats
+    # as coming from the owner. Anyone else's messages are silently
+    # ignored — prevents random tenant members from injecting tasks.
+    authorized_user_id: str | None = None
+    # Lark app credentials from .env (LARK_APP_ID / LARK_APP_SECRET).
+    # Populated by Config.from_env() reading the env vars; NOT loaded
+    # from config.toml so secrets stay out of group-readable files.
+    app_id: str | None = None
+    app_secret: str | None = None
+
+
+@dataclass(frozen=True)
+class IntegrationsConfig:
+    """Top-level holder for external channel configs.
+
+    Each external IM/chat channel that can act as the owner's
+    mailbox surface gets a sub-config here. The runtime composes a
+    `ChannelRegistry` from the enabled ones; downstream code (outbox
+    dispatcher, owner-mail enqueuer) is channel-agnostic — it sees
+    the registry, not individual channel types.
+    """
+
+    lark: LarkConfig = field(default_factory=LarkConfig)
+    # Future: slack: SlackConfig, discord: DiscordConfig, etc.
+
+
+@dataclass(frozen=True)
 class BootstrapConfig:
     """Customizable agent identities for the bootstrap-seeded agents.
 
@@ -244,6 +286,7 @@ class Config:
     models: list[ModelEntry] = field(default_factory=list)
     persona_overrides: dict[str, PersonaOverride] = field(default_factory=dict)
     bootstrap: BootstrapConfig = field(default_factory=BootstrapConfig)
+    integrations: IntegrationsConfig = field(default_factory=IntegrationsConfig)
 
     # ---- defaults: runtime knobs added with config.toml ----
     default_dashboard_port: int = 8765
@@ -402,6 +445,20 @@ class Config:
             reviewer_id=str(bootstrap_raw.get("reviewer_id", "reviewer-1")),
         )
 
+        # ---- external channel integrations ----
+        # config.toml carries non-sensitive identifiers + the enable
+        # flag; secrets (app_id/app_secret) come from .env so they
+        # don't leak into group-readable files.
+        integrations_raw = raw.get("integrations") or {}
+        lark_raw = integrations_raw.get("lark") or {}
+        lark_cfg = LarkConfig(
+            enabled=bool(lark_raw.get("enabled", False)),
+            authorized_user_id=lark_raw.get("authorized_user_id") or None,
+            app_id=os.environ.get("LARK_APP_ID") or None,
+            app_secret=os.environ.get("LARK_APP_SECRET") or None,
+        )
+        integrations = IntegrationsConfig(lark=lark_cfg)
+
         return cls(
             db_path=db_path,
             object_store_path=object_store_path,
@@ -419,6 +476,7 @@ class Config:
             models=models,
             persona_overrides=persona_overrides,
             bootstrap=bootstrap,
+            integrations=integrations,
             default_dashboard_port=dashboard_port,
             auto_wake_on_mail=bool(auto_wake),
             max_concurrent_tasks=max_concurrent,
