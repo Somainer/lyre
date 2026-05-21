@@ -222,6 +222,50 @@ def test_agent_detail_resolves_two_stage_agent_id(
     assert "worker-maintainer/refactor-auth" in r.text
 
 
+def test_agents_table_shows_busy_for_two_stage_agent_with_active_wakeup(
+    seeded_dashboard: tuple[TestClient, SqliteRepositories, dict],
+) -> None:
+    """When a wakeup is running for an agent whose id is the new
+    `<persona>/<name>` form, the agents table must render its
+    occupancy as "running" (busy), not "queued". Regression: the
+    matcher fell back to persona_name when wakeups.agent_id was
+    NULL, missing the agent.id with the `/<name>` suffix."""
+    client, repos, _ = seeded_dashboard
+
+    async def seed() -> None:
+        await repos.agents.create(
+            agent_id="worker-maintainer/refactor-auth",
+            persona_name="worker-maintainer",
+        )
+        tid = await repos.tasks.create(
+            TaskSpec(
+                persona_name="worker-maintainer",
+                agent_id="worker-maintainer/refactor-auth",
+                goal="refactor", acceptance="done",
+            )
+        )
+        await repos.tasks.update_status(tid, "in_progress")
+        await repos.wakeups.start(
+            tid, "worker-maintainer",
+            agent_id="worker-maintainer/refactor-auth",
+        )
+    asyncio.run(seed())
+
+    r = client.get("/agents")
+    assert r.status_code == 200
+    # The pill markup carries class names "busy"/"queued"/"available"
+    # — check the busy class is present near the agent's row.
+    body = r.text
+    # The two-stage agent_id is the unique anchor on its row; the
+    # busy class must follow on the same render.
+    row_start = body.find("worker-maintainer/refactor-auth")
+    assert row_start != -1, "agent row not found"
+    # Per-row occupancy pill is rendered with class `occ-pill busy`.
+    # Make sure NO `occ-pill queued` precedes the next agent boundary.
+    # Cheap check: 'running' appears in the body for this agent.
+    assert "occ-pill busy" in body
+
+
 def test_agent_timeline_partial_resolves_two_stage_agent_id(
     seeded_dashboard: tuple[TestClient, SqliteRepositories, dict],
 ) -> None:

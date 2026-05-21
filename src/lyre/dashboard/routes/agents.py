@@ -59,16 +59,47 @@ async def _in_flight_by_agent(repos) -> dict[str, int]:
     return counts
 
 
-def _derive_occupancy_status(agent, busy_ids: set[str]) -> str:
+def _derive_occupancy_status(
+    agent,
+    busy_agent_ids: set[str],
+    busy_legacy_personas: set[str],
+) -> str:
     """Reflect "running a wakeup right now" back into the Agent record.
     Without this, agent.status (which only flips on idle/busy/archived
     transitions written by the runtime) lags the reality the dashboard
-    sees via list_active_wakeups. occupancy_pill() reads .status."""
+    sees via list_active_wakeups. occupancy_pill() reads .status.
+
+    Two match passes:
+      * ``busy_agent_ids`` — exact `<persona>/<name>` match for wakeups
+        whose ``agent_id`` column is set (the post-rework normal case).
+      * ``busy_legacy_personas`` — fallback for wakeups with NULL
+        ``agent_id`` (rows written before WakeupsRepo.start persisted
+        agent_id, or by tests). Matches any agent of that persona by
+        ``agent.persona_name``. Overmarks when a persona has multiple
+        live instances, but legacy NULL rows imply pre-multi-instance
+        usage so the ambiguity is unreachable in practice.
+    """
     if agent.status == "archived":
         return "archived"
-    if agent.id in busy_ids:
+    if agent.id in busy_agent_ids:
+        return "busy"
+    if (
+        busy_legacy_personas
+        and getattr(agent, "persona_name", None) in busy_legacy_personas
+    ):
         return "busy"
     return "idle"
+
+
+def _busy_sets(active_wakeups) -> tuple[set[str], set[str]]:
+    """Split active wakeups into the two match sets used by
+    ``_derive_occupancy_status``."""
+    exact = {w.agent_id for w in active_wakeups if w.agent_id}
+    legacy = {
+        w.persona_name for w in active_wakeups
+        if not w.agent_id and w.persona_name
+    }
+    return exact, legacy
 
 
 @router.get("/agents", response_class=HTMLResponse)
@@ -81,14 +112,19 @@ async def agents_list(
     archived = [a for a in agents_all if a.status == "archived"]
 
     active_wakeups = await list_active_wakeups(repos)
-    busy_ids = {w.agent_id or w.persona_name for w in active_wakeups}
+    busy_exact, busy_legacy = _busy_sets(active_wakeups)
     in_flight = await _in_flight_by_agent(repos)
 
     live_views = [
-        _AgentView.of(a, _derive_occupancy_status(a, busy_ids)) for a in live
+        _AgentView.of(
+            a, _derive_occupancy_status(a, busy_exact, busy_legacy)
+        )
+        for a in live
     ]
     archived_views = [
-        _AgentView.of(a, _derive_occupancy_status(a, busy_ids))
+        _AgentView.of(
+            a, _derive_occupancy_status(a, busy_exact, busy_legacy)
+        )
         for a in archived
     ]
 
@@ -143,16 +179,20 @@ async def agent_detail(
         ),
     )
     active = await list_active_wakeups(repos)
-    busy_ids = {w.agent_id or w.persona_name for w in active}
+    busy_exact, busy_legacy = _busy_sets(active)
     in_flight = await _in_flight_by_agent(repos)
-    agent_view = _AgentView.of(agent, _derive_occupancy_status(agent, busy_ids))
+    agent_view = _AgentView.of(
+        agent, _derive_occupancy_status(agent, busy_exact, busy_legacy)
+    )
 
     children_raw = [
         a for a in await repos.agents.list_all(include_archived=False)
         if a.parent_agent_id == agent_id
     ]
     children_views = [
-        _AgentView.of(c, _derive_occupancy_status(c, busy_ids))
+        _AgentView.of(
+            c, _derive_occupancy_status(c, busy_exact, busy_legacy)
+        )
         for c in children_raw
     ]
 

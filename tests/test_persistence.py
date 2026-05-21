@@ -201,6 +201,64 @@ async def test_local_hot_round_trip(repos: SqliteRepositories) -> None:
 
 
 @pytest.mark.asyncio
+async def test_wakeup_start_persists_agent_id(
+    repos: SqliteRepositories,
+) -> None:
+    """Without this column being written, the dashboard's per-agent
+    "running" detection misses two-stage agent_ids and shows them as
+    queued instead of busy. The column has always existed in schema —
+    the regression was that WakeupsRepo.start never set it."""
+    await repos.personas.upsert(
+        Persona(name="worker-maintainer", role_description="w", system_prompt="w")
+    )
+    await repos.agents.create(
+        agent_id="worker-maintainer/refactor-auth",
+        persona_name="worker-maintainer",
+    )
+    task_id = await repos.tasks.create(
+        TaskSpec(
+            persona_name="worker-maintainer",
+            agent_id="worker-maintainer/refactor-auth",
+            goal="g", acceptance="a",
+        )
+    )
+    wakeup_id = await repos.wakeups.start(
+        task_id, "worker-maintainer",
+        agent_id="worker-maintainer/refactor-auth",
+    )
+
+    async with repos.conn.execute(
+        "SELECT agent_id, persona_name FROM wakeups WHERE id = ?",
+        (wakeup_id,),
+    ) as cur:
+        row = await cur.fetchone()
+    assert row is not None
+    assert row["agent_id"] == "worker-maintainer/refactor-auth"
+    assert row["persona_name"] == "worker-maintainer"
+
+
+@pytest.mark.asyncio
+async def test_wakeup_start_agent_id_optional_for_backcompat(
+    repos: SqliteRepositories,
+) -> None:
+    """Callers that haven't been updated (most tests, bootstrap paths)
+    still work — agent_id defaults to NULL and the row is created."""
+    await repos.personas.upsert(
+        Persona(name="w", role_description="w", system_prompt="w")
+    )
+    task_id = await repos.tasks.create(
+        TaskSpec(persona_name="w", goal="g", acceptance="a")
+    )
+    wakeup_id = await repos.wakeups.start(task_id, "w")
+    async with repos.conn.execute(
+        "SELECT agent_id FROM wakeups WHERE id = ?", (wakeup_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    assert row is not None
+    assert row["agent_id"] is None
+
+
+@pytest.mark.asyncio
 async def test_wakeup_end_records_metering(repos: SqliteRepositories) -> None:
     await repos.personas.upsert(
         Persona(name="w", role_description="w", system_prompt="w")
