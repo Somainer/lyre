@@ -233,24 +233,46 @@ async def sse_dashboard(
         # Subscribe AND drain the queue. No rendering happens here
         # until the broadcaster publishes a change — the page route
         # already shipped the heavy fragments (stats, activity).
+        #
+        # Disconnect detection: we poll request.is_disconnected() between
+        # iterations on a 2s budget (not 15s). That bounds how long a
+        # stale handler can sit subscribed after the browser navigates
+        # away. Without this, fast tab-switching accumulates several
+        # zombie handlers all subscribed to the broadcaster, all
+        # rendering fragments on every change event — N× DB load on the
+        # shared aiosqlite connection. (Yield-side disconnect also
+        # propagates: writing to a closed connection raises on the
+        # `yield` and the finally cleans up.)
         queue = bc.subscribe()
         try:
             while True:
                 if await request.is_disconnected():
                     break
                 try:
-                    events = await asyncio.wait_for(queue.get(), timeout=15.0)
+                    events = await asyncio.wait_for(queue.get(), timeout=2.0)
                 except TimeoutError:
                     yield ": keepalive\n\n"
                     continue
-                # Yield to other coroutines BEFORE we start rendering
-                # — gives any pending non-SSE request a chance to run on
-                # the same aiosqlite connection before we queue 5-10
-                # queries of our own.
+                # Coalesce a burst into one render pass. If the
+                # broadcaster fires 5 ticks while we were rendering the
+                # previous batch, drain them all into a union set —
+                # rendering each event ONCE instead of five times. This
+                # is the second half of the "stale handler causes a
+                # query storm" fix.
+                while not queue.empty():
+                    try:
+                        events = events | queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                # Cooperative yield so any pending non-SSE request gets a
+                # turn on aiosqlite before we queue 5-10 queries.
                 await asyncio.sleep(0)
                 for event in events:
                     if await request.is_disconnected():
-                        break
+                        # Bail mid-batch the moment we notice the
+                        # client is gone, even if we still had events
+                        # queued — those renders would just be wasted.
+                        return
                     renderer = _RENDERERS.get(event)
                     if renderer is None:
                         continue
