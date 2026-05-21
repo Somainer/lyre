@@ -490,7 +490,14 @@ class Scheduler:
             await self.repos.tasks.update_status(task_id, "failed")
             return
 
-        wakeup_id = await self.repos.wakeups.start(task_id, persona.name)
+        # Only write agent_id to the wakeup row when the FK actually
+        # resolves — tasks created with a bare persona name (legacy
+        # tests, pre-A3 callers) leave agent=None and the FK
+        # `wakeups.agent_id REFERENCES agents(id)` would fail.
+        wakeup_id = await self.repos.wakeups.start(
+            task_id, persona.name,
+            agent_id=agent.id if agent is not None else None,
+        )
         claimed = await self.repos.tasks.claim_lease(
             task_id, wakeup_id, duration_sec=task.lease_duration_s
         )

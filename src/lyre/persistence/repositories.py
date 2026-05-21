@@ -144,7 +144,12 @@ class TaskRepository(Protocol):
 
 
 class WakeupRepository(Protocol):
-    async def start(self, task_id: str, persona_name: str) -> str: ...
+    async def start(
+        self,
+        task_id: str,
+        persona_name: str,
+        agent_id: str | None = None,
+    ) -> str: ...
     async def end(
         self,
         wakeup_id: str,

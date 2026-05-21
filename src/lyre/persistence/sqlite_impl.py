@@ -660,11 +660,23 @@ class SqliteWakeupRepository:
     def __init__(self, conn: aiosqlite.Connection):
         self.conn = conn
 
-    async def start(self, task_id: str, persona_name: str) -> str:
+    async def start(
+        self,
+        task_id: str,
+        persona_name: str,
+        agent_id: str | None = None,
+    ) -> str:
+        # agent_id is the 2-stage `<persona>/<name>` id from the addressing
+        # rework. We persist it so the dashboard's "currently running"
+        # detection can match an exact agent — without it, occupancy_pill
+        # falls back to persona_name and misses agents whose id has a
+        # `/<name>` suffix, rendering them as "queued" while a wakeup of
+        # theirs is actively running.
         wakeup_id = _uuid7()
         await self.conn.execute(
-            "INSERT INTO wakeups (id, task_id, persona_name) VALUES (?, ?, ?)",
-            (wakeup_id, task_id, persona_name),
+            "INSERT INTO wakeups (id, task_id, persona_name, agent_id) "
+            "VALUES (?, ?, ?, ?)",
+            (wakeup_id, task_id, persona_name, agent_id),
         )
         await self.conn.commit()
         return wakeup_id
