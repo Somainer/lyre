@@ -121,7 +121,11 @@ async def agents_list(
     )
 
 
-@router.get("/agents/{agent_id}", response_class=HTMLResponse)
+# `:path` converter — agent_ids carry a real `/` (persona/name), so
+# the route must accept multi-segment values. Without this, `/agents/
+# worker-maintainer/coco-skills-import` becomes a 4-segment URL that
+# doesn't match a single-segment template.
+@router.get("/agents/{agent_id:path}", response_class=HTMLResponse)
 async def agent_detail(
     request: Request, agent_id: str, minutes: int = 60,
 ) -> HTMLResponse:
@@ -178,7 +182,8 @@ async def agent_detail(
 
 
 @router.get(
-    "/partials/agents/{agent_id}/timeline", response_class=HTMLResponse
+    "/partials/agents/{agent_id:path}/timeline",
+    response_class=HTMLResponse,
 )
 async def agent_timeline_partial(
     request: Request, agent_id: str, minutes: int = 60,

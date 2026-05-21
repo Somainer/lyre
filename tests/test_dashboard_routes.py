@@ -198,6 +198,50 @@ def test_agent_detail_404_for_unknown_agent(
     assert r.status_code == 404
 
 
+def test_agent_detail_resolves_two_stage_agent_id(
+    seeded_dashboard: tuple[TestClient, SqliteRepositories, dict],
+) -> None:
+    """Agent IDs are `<persona>/<name>` after the addressing rework,
+    so the URL `/agents/worker-maintainer/refactor-auth` is genuinely
+    4-segment. Route must use FastAPI's `:path` converter — without
+    it Starlette returns 404 because `{agent_id}` only captures a
+    single segment."""
+    client, repos, _ = seeded_dashboard
+
+    async def seed() -> None:
+        await repos.agents.create(
+            agent_id="worker-maintainer/refactor-auth",
+            persona_name="worker-maintainer",
+        )
+    asyncio.run(seed())
+
+    r = client.get("/agents/worker-maintainer/refactor-auth")
+    assert r.status_code == 200
+    # The pill title carries the full id verbatim — sanity-check it
+    # made it through the template untouched.
+    assert "worker-maintainer/refactor-auth" in r.text
+
+
+def test_agent_timeline_partial_resolves_two_stage_agent_id(
+    seeded_dashboard: tuple[TestClient, SqliteRepositories, dict],
+) -> None:
+    """Same `:path`-converter dependency for the SSE/HTMX partial that
+    drives the per-agent timeline refresh."""
+    client, repos, _ = seeded_dashboard
+
+    async def seed() -> None:
+        await repos.agents.create(
+            agent_id="worker-maintainer/refactor-auth",
+            persona_name="worker-maintainer",
+        )
+    asyncio.run(seed())
+
+    r = client.get(
+        "/partials/agents/worker-maintainer/refactor-auth/timeline"
+    )
+    assert r.status_code == 200
+
+
 def test_activity_partial_returns_same_event_kinds(
     seeded_dashboard: tuple[TestClient, SqliteRepositories, dict],
 ) -> None:
