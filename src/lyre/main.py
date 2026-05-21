@@ -75,11 +75,11 @@ def onboard_cmd() -> None:
         f" <{plan.owner_email}>" if plan.owner_email else ""
     ))
     if plan.models:
+        from .onboard import _model_summary_line
         click.echo(f"  Models configured ({len(plan.models)}):")
         for m in plan.models:
-            endpoint_label = m.endpoint or "(SDK default)"
             mark = " (default)" if m.id == plan.default_model else ""
-            click.echo(f"    • {m.id}  →  {endpoint_label}  [${m.auth_env}]{mark}")
+            click.echo(f"    • {_model_summary_line(m)}{mark}")
     click.echo("")
     click.echo("Next:")
     click.echo("  lyre serve                 # start the runtime + dashboard")

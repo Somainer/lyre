@@ -186,6 +186,123 @@ def test_write_config_toml_minimal(tmp_path: Path) -> None:
     assert "[[models]]" not in active
 
 
+def test_write_config_toml_header_only_auth(tmp_path: Path) -> None:
+    """Header-only auth mode: no auth_env, just [models.endpoint.headers].
+    Verifies the wizard's output round-trips through tomllib + the
+    ModelEndpoint loader so a real lyre serve picks up the headers."""
+    import tomllib
+
+    from lyre.config import Config
+    from lyre.runtime.model_registry import ModelEndpoint
+
+    cfg = tmp_path / "config.toml"
+    spec = ModelSpec(
+        id="internal.claude",
+        provider="anthropic",
+        endpoint="https://proxy.internal/anthropic",
+        auth_env="",  # header-only mode
+        headers=(("X-Internal-JWT", "${INTERNAL_JWT}"),),
+    )
+    write_config_toml(
+        cfg, owner_name="Owner", owner_email=None,
+        models=[spec], default_model=spec.id,
+    )
+    text = cfg.read_text(encoding="utf-8")
+
+    # The header sub-table is emitted; auth_env is NOT.
+    assert "[models.endpoint.headers]" in text
+    assert '"X-Internal-JWT" = "${INTERNAL_JWT}"' in text
+    assert "auth_env" not in _strip_comments(text)
+
+    # Round-trip: parse → load via Config → runtime ModelEndpoint.
+    monkeypatch_env_for_loader = {"LYRE_HOME": str(tmp_path)}
+    import os as _os
+    saved = dict(_os.environ)
+    _os.environ.update(monkeypatch_env_for_loader)
+    _os.environ["INTERNAL_JWT"] = "secret-token"
+    try:
+        loaded = Config.from_env()
+        assert len(loaded.models) == 1
+        m = loaded.models[0]
+        assert m.id == "internal.claude"
+        ep = ModelEndpoint.from_dict(m.endpoint)
+        assert ep.auth_env is None
+        assert dict(ep.headers)["X-Internal-JWT"] == "secret-token"
+        # And the raw parse path matches.
+        with cfg.open("rb") as f:
+            raw = tomllib.load(f)
+        assert raw["models"][0]["endpoint"]["headers"] == {
+            "X-Internal-JWT": "${INTERNAL_JWT}",
+        }
+    finally:
+        _os.environ.clear()
+        _os.environ.update(saved)
+
+
+def test_write_config_toml_stacked_auth(tmp_path: Path) -> None:
+    """API key + extra headers — the OpenAI org/project pattern."""
+    cfg = tmp_path / "config.toml"
+    spec = ModelSpec(
+        id="openai.gpt",
+        provider="openai",
+        endpoint="",
+        auth_env="OPENAI_API_KEY",
+        headers=(
+            ("OpenAI-Organization", "org-abc"),
+            ("OpenAI-Project", "proj-123"),
+        ),
+    )
+    write_config_toml(
+        cfg, owner_name="Owner", owner_email=None,
+        models=[spec], default_model=spec.id,
+    )
+    active = _strip_comments(cfg.read_text(encoding="utf-8"))
+    assert 'auth_env = "OPENAI_API_KEY"' in active
+    assert "[models.endpoint.headers]" in active
+    assert '"OpenAI-Organization" = "org-abc"' in active
+    assert '"OpenAI-Project" = "proj-123"' in active
+
+
+def test_model_summary_line_adapts_to_auth_mode() -> None:
+    """The wizard's summary helper labels each entry with its actual
+    auth shape — no empty `[$]` placeholders for header-only entries."""
+    from lyre.onboard import _model_summary_line
+
+    api_only = ModelSpec(
+        id="a", provider="anthropic", endpoint="", auth_env="K",
+    )
+    assert "key:$K" in _model_summary_line(api_only)
+
+    header_only = ModelSpec(
+        id="b", provider="anthropic", endpoint="", auth_env="",
+        headers=(("X-Auth", "x"), ("X-Other", "y")),
+    )
+    line = _model_summary_line(header_only)
+    assert "2 custom header(s)" in line
+    assert "$" not in line  # no `[$]` placeholder bug
+
+    stacked = ModelSpec(
+        id="c", provider="openai", endpoint="", auth_env="K",
+        headers=(("X-Auth", "x"),),
+    )
+    assert "key:$K + 1 header(s)" in _model_summary_line(stacked)
+
+
+def test_is_valid_header_name_accepts_real_and_rejects_garbage() -> None:
+    from lyre.onboard import _is_valid_header_name
+
+    assert _is_valid_header_name("Authorization")
+    assert _is_valid_header_name("X-API-Key")
+    assert _is_valid_header_name("OpenAI-Organization")
+    assert _is_valid_header_name("X_Custom")
+
+    assert not _is_valid_header_name("")
+    assert not _is_valid_header_name(" Has-Space")
+    assert not _is_valid_header_name("Has Space")  # typo: space in middle
+    assert not _is_valid_header_name("1-starts-with-digit")
+    assert not _is_valid_header_name("中文")  # only ascii letters
+
+
 def test_write_config_toml_with_one_model_default_endpoint(tmp_path: Path) -> None:
     cfg = tmp_path / "config.toml"
     spec = ModelSpec(
