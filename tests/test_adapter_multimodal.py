@@ -229,3 +229,76 @@ def test_responses_image_only_message_emits_message_item(
     msg_items = [x for x in out if x.get("type") == "message"]
     assert len(msg_items) == 1
     assert any(p.get("type") == "input_image" for p in msg_items[0]["content"])
+
+
+# ---------------------------------------------------------------------------
+# Vision degrade-gracefully — agent_loop strips image blocks before
+# dispatching to a non-vision-capable model so the request still flies.
+# ---------------------------------------------------------------------------
+
+
+def test_strip_vision_blocks_replaces_image_with_text_placeholder(
+    blob_store: tuple[BlobStore, str],
+) -> None:
+    from lyre.runtime.agent_loop import _strip_vision_blocks
+
+    _, blob_id = blob_store
+    msgs = [
+        LyreMessage(
+            role="user",
+            content=[
+                LyreContentBlock(type="text", text="look:"),
+                LyreContentBlock(
+                    type="image", blob_id=blob_id,
+                    media_type="image/png", filename="shot.png",
+                ),
+            ],
+        ),
+    ]
+    out = _strip_vision_blocks(msgs)
+    assert len(out) == 1
+    blocks = out[0].content
+    assert blocks[0].type == "text" and blocks[0].text == "look:"
+    assert blocks[1].type == "text"
+    assert "shot.png" in (blocks[1].text or "")
+    assert "vision" in (blocks[1].text or "")
+
+
+def test_strip_vision_blocks_leaves_text_only_messages_untouched(
+    blob_store: tuple[BlobStore, str],
+) -> None:
+    """No image present → return the SAME list/messages, not copies.
+    Cheap fast path: 99% of turns have no image blocks."""
+    from lyre.runtime.agent_loop import _strip_vision_blocks
+
+    msgs = [
+        LyreMessage(
+            role="user",
+            content=[LyreContentBlock(type="text", text="plain text")],
+        ),
+    ]
+    out = _strip_vision_blocks(msgs)
+    # Same object identity — proves no copy was made when not needed.
+    assert out[0] is msgs[0]
+
+
+def test_strip_vision_blocks_uses_blob_id_prefix_when_no_filename(
+    blob_store: tuple[BlobStore, str],
+) -> None:
+    """Filename is optional. When absent, the placeholder shows a
+    short blob-id prefix so the operator can still match it to a
+    specific upload in the dashboard."""
+    from lyre.runtime.agent_loop import _strip_vision_blocks
+
+    _, blob_id = blob_store
+    msgs = [
+        LyreMessage(
+            role="user",
+            content=[LyreContentBlock(
+                type="image", blob_id=blob_id, media_type="image/png",
+            )],
+        ),
+    ]
+    out = _strip_vision_blocks(msgs)
+    text = out[0].content[0].text or ""
+    assert blob_id[:12] in text
