@@ -554,15 +554,28 @@ code, pre, .mono { font-family: var(--font-mono); }
   font-variant-numeric: tabular-nums;
 }
 .mail-row .mail-content { min-width: 0; }
-/* Body fold — selectable plain content. The summary is the click
-   target (toggle expand); cursor is default elsewhere so dragging
-   actually selects. */
+/* Body fold — plain text, copy-friendly. The <pre> preserves the
+   sender's whitespace, the user-select keeps the cursor on text-mode
+   so click-drag selects (not navigates). */
 .mail-row .mail-body-fold > summary { cursor: pointer; }
-.mail-row .mail-body-fold > .md-body { cursor: text; user-select: text; }
-.mail-row .mail-body-selectable {
+.mail-row .mail-body-text {
+  margin: var(--s-3) 0 0;
+  padding: var(--s-3);
+  background: var(--bg-sunken);
+  border: 1px solid var(--line-1);
+  border-radius: var(--r-2);
+  font-family: var(--font-mono);
+  font-size: var(--t-meta);
+  color: var(--fg-1);
+  line-height: 1.55;
   white-space: pre-wrap;
   word-break: break-word;
   user-select: text;
+  cursor: text;
+  /* Keep long bodies bounded in the list — full-body view is the
+     reply / detail page. */
+  max-height: 360px;
+  overflow-y: auto;
 }
 .mail-row .mail-reply-btn {
   align-self: start;

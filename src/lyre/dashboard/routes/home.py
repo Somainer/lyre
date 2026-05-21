@@ -24,25 +24,32 @@ async def _home_card_context(repos, model_context_windows) -> dict:
     since_24h = utc_iso_hours_ago(24)
     since_1h = utc_iso_hours_ago(1)
 
-    all_tasks = await repos.tasks.find_recent(limit=200)
+    # All four `limit=` values were 200-500 before. The values are
+    # only used for chip COUNTS and 12-bucket sparklines — neither
+    # needs more than ~100 rows of resolution. Iterating 500
+    # MailboxMessage Pydantic models just to count by urgency was a
+    # noticeable hot spot during tab-switching (the home stats card
+    # re-renders on every change event). Cutting these in half halves
+    # the Python iteration cost AND the rows over the wire.
+    all_tasks = await repos.tasks.find_recent(limit=100)
     in_progress = sum(1 for t in all_tasks if t.status == "in_progress")
     pending = sum(1 for t in all_tasks if t.status == "pending")
     needs_input = sum(1 for t in all_tasks if t.status == "needs_input")
     completed_24h = await repos.tasks.count_completed_since(since_24h)
 
     recent_tasks = await repos.tasks.find_recently_changed(
-        utc_iso_hours_ago(12), limit=200
+        utc_iso_hours_ago(12), limit=100
     )
     tasks_spark = bucket_into(recent_tasks, buckets=12)
     tasks_in_flight = in_progress + pending + needs_input
 
-    unread_msgs = await repos.mailbox.read_unread("owner", limit=500)
+    unread_msgs = await repos.mailbox.read_unread("owner", limit=200)
     blockers_unread = sum(1 for m in unread_msgs if m.urgency == "blocker")
     high_unread = sum(1 for m in unread_msgs if m.urgency == "high")
     normal_unread = sum(1 for m in unread_msgs if m.urgency == "normal")
     unread_total = len(unread_msgs)
     recent_mail = await repos.mailbox.read_recent_for_audit(
-        utc_iso_hours_ago(12), limit=200
+        utc_iso_hours_ago(12), limit=100
     )
     mail_spark = bucket_into(
         [m for m in recent_mail if m.recipient == "owner"], buckets=12
@@ -62,7 +69,7 @@ async def _home_card_context(repos, model_context_windows) -> dict:
         tok_rate += (w.token_input or 0) / seconds
     tok_rate_label = f"{int(tok_rate):,} tok/s in" if tok_rate else "0 tok/s"
 
-    wakeup_history = await repos.wakeups.list_since(since_24h, limit=200)
+    wakeup_history = await repos.wakeups.list_since(since_24h, limit=100)
     wakeup_spark = bucket_into(wakeup_history, buckets=12)
 
     last_wakeup = wakeup_history[0] if wakeup_history else None
