@@ -201,3 +201,55 @@ def test_factory_header_only_with_anthropic_provider(
     from lyre.adapter.anthropic import AnthropicAdapter
     assert isinstance(adapter, AnthropicAdapter)
     assert adapter.client.default_headers.get("X-Proxy-Token") == "abc123"
+
+
+# ---------------------------------------------------------------------------
+# `lyre serve` startup reachability check — regression for the
+# `os.getenv(None)` TypeError that hit users with header-only configs
+# before this fix.
+# ---------------------------------------------------------------------------
+
+
+def test_serve_reachability_api_key_mode(monkeypatch) -> None:
+    from lyre.main import _model_entry_reachable
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-set")
+    e = fake_entry(provider="openai", auth_env="OPENAI_API_KEY")
+    assert _model_entry_reachable(e) is True
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    assert _model_entry_reachable(e) is False
+
+
+def test_serve_reachability_header_only_mode(monkeypatch) -> None:
+    """Was crashing before — `os.getenv(None)` raises TypeError.
+    Header-only entries should be reachable iff headers are set."""
+    from lyre.main import _model_entry_reachable
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    with_headers = fake_entry(
+        provider="openai",
+        auth_env=None,
+        headers=(("X-Custom-Auth", "token"),),
+    )
+    assert _model_entry_reachable(with_headers) is True
+
+    no_auth = fake_entry(provider="openai", auth_env=None, headers=())
+    assert _model_entry_reachable(no_auth) is False
+
+
+def test_serve_reachability_stacked_mode_needs_api_key(monkeypatch) -> None:
+    """Stacked auth — the API key is still required (headers can't
+    substitute for the key the SDK builds Authorization from)."""
+    from lyre.main import _model_entry_reachable
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    e = fake_entry(
+        provider="openai",
+        auth_env="OPENAI_API_KEY",
+        headers=(("OpenAI-Organization", "org-x"),),
+    )
+    # Headers present but key missing → still not reachable.
+    assert _model_entry_reachable(e) is False
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-set")
+    assert _model_entry_reachable(e) is True

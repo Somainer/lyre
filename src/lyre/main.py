@@ -8,6 +8,7 @@ import os
 import signal
 import sys
 from datetime import UTC
+from typing import Any
 
 import click
 import structlog
@@ -90,6 +91,31 @@ def onboard_cmd() -> None:
 # lyre serve
 # ----------------------------------------------------------------------
 
+def _model_entry_reachable(entry: Any) -> bool:
+    """An enabled model entry is "reachable" — usable at startup — when
+    its auth config is actually satisfied at this moment:
+
+      * API-key mode (auth_env set): the named env var has a value.
+      * Header-only mode (auth_env None, headers set): at least one
+        header is configured. We don't try to verify the proxy
+        actually accepts it — that would mean issuing a real request
+        at startup, which is too slow and noisy.
+      * Stacked mode (both set): the API key path still has to pass;
+        headers alone can't substitute for the key the SDK expects.
+      * Neither set: not reachable. Adapter factory will refuse this
+        entry at dispatch time too.
+
+    Lifted to module scope (out of serve_cmd) so it's unit-testable —
+    auth_env being Optional was a sharp edge that previously caused a
+    `TypeError: str expected, not NoneType` at `os.getenv(None)` for
+    users running a header-only model config.
+    """
+    auth_env = entry.endpoint.auth_env
+    if auth_env:
+        return bool(os.getenv(auth_env))
+    return bool(entry.endpoint.headers)
+
+
 @cli.command("serve")
 @click.option("--poll-interval", default=1.0, type=float, help="Seconds between polls")
 @click.option(
@@ -120,10 +146,11 @@ def serve_cmd(
         from .runtime.model_registry import load_registry_for_config
 
         cfg = Config.from_env()
-        # Each model entry declares its own auth_env. Validate that at least
-        # one enabled entry (or the override entry, if set) is reachable
-        # before starting — gives a fast, actionable error instead of failing
-        # silently on the first dispatched task.
+        # Each model entry has its own auth config — either an `auth_env`
+        # holding an API key, custom HTTP headers (proxy / gateway mode),
+        # or both stacked. Validate that at least one enabled entry can
+        # actually authenticate before starting, so we fail loudly here
+        # instead of silently on the first dispatched task.
         registry = load_registry_for_config(cfg)
         candidates = registry.enabled()
         if cfg.model_override:
@@ -135,19 +162,36 @@ def serve_cmd(
                     err=True,
                 )
                 sys.exit(1)
-        reachable = [
-            e for e in candidates if os.getenv(e.endpoint.auth_env)
-        ]
+
+        reachable = [e for e in candidates if _model_entry_reachable(e)]
         if not reachable:
-            needed = sorted({e.endpoint.auth_env for e in candidates})
-            click.echo(
-                "ERROR: no LLM API key found in env for any enabled model "
-                "in model_registry.yaml.\n"
-                "Set ONE of: " + ", ".join(needed) + "\n"
-                "Or set LYRE_MODEL_OVERRIDE=<id> to a model whose auth_env "
-                "you have, e.g. deepseek.deepseek-v4-flash with DEEPSEEK_API_KEY.",
-                err=True,
+            # Build a human-actionable hint listing what's missing.
+            needed_env_vars = sorted({
+                e.endpoint.auth_env for e in candidates if e.endpoint.auth_env
+            })
+            header_entries = [
+                e.id for e in candidates if not e.endpoint.auth_env
+            ]
+            msg_parts = [
+                "ERROR: no enabled model entry can authenticate.",
+            ]
+            if needed_env_vars:
+                msg_parts.append(
+                    "API-key entries need one of these env vars set: "
+                    + ", ".join(needed_env_vars)
+                )
+            if header_entries:
+                msg_parts.append(
+                    "Header-only entries with no headers configured: "
+                    + ", ".join(header_entries)
+                    + " (edit ~/.lyre/config.toml [models.endpoint.headers]"
+                    + " sub-table)"
+                )
+            msg_parts.append(
+                "Or set LYRE_MODEL_OVERRIDE=<id> to pin to a model whose "
+                "auth you have."
             )
+            click.echo("\n".join(msg_parts), err=True)
             sys.exit(1)
         click.echo(
             f"LLM reachable for {len(reachable)}/{len(candidates)} model "
@@ -1257,7 +1301,16 @@ def model_list_cmd() -> None:
         f"{'ID':40s} {'TIER':10s} {'PROVIDER':12s} {'AUTH':6s} {'CAPS'}"
     )
     for e in registry.entries:
-        auth = "✓" if os.environ.get(e.endpoint.auth_env) else "✗"
+        # Auth column reflects what's actually configured for the entry:
+        #   ✓     API-key env var set (or in stacked mode, key + headers)
+        #   hdr   header-only mode, headers configured
+        #   ✗     misconfigured (neither auth path resolves)
+        if e.endpoint.auth_env:
+            auth = "✓" if os.environ.get(e.endpoint.auth_env) else "✗"
+        elif e.endpoint.headers:
+            auth = "hdr"
+        else:
+            auth = "✗"
         click.echo(
             f"{e.id:40s} {e.tier:10s} {e.provider:12s} {auth:6s} "
             f"{','.join(e.capabilities)}"
