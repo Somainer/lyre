@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
@@ -25,6 +26,7 @@ from .dashboard_broadcaster import DashboardBroadcaster
 from .routes import (
     activity,
     agents,
+    blobs,
     home,
     mail,
     runs,
@@ -67,6 +69,7 @@ def create_app(
     dashboard_broadcaster: DashboardBroadcaster | None = None,
     model_context_windows: dict[str, int] | None = None,
     owner_name: str | None = None,
+    blob_store: Any = None,
 ) -> FastAPI:
     """`model_context_windows` is a `{model_id_or_alias: context_window_tokens}`
     map used by the activity feed to compute "context usage %" for each
@@ -91,6 +94,10 @@ def create_app(
     app.state.dashboard_broadcaster = dashboard_broadcaster
     app.state.model_context_windows = model_context_windows or {}
     app.state.owner_name = owner_name
+    # Multimodal: optional BlobStore used by /send (upload) and the
+    # mail-detail / /blobs/<id> routes. None disables those features
+    # gracefully — useful for tests that don't exercise multimodal.
+    app.state.blob_store = blob_store
     app.state.templates = Jinja2Templates(directory=str(TEMPLATE_DIR))
     env = app.state.templates.env
     env.filters["markdown"] = _render_markdown
@@ -109,6 +116,7 @@ def create_app(
     app.include_router(home.router)
     app.include_router(activity.router)
     app.include_router(agents.router)
+    app.include_router(blobs.router)
     app.include_router(mail.router)
     app.include_router(runs.router)
     app.include_router(send.router)

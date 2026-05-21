@@ -46,7 +46,7 @@
     </div>
   {% endif %}
 
-  <form class="form" method="post" action="/send">
+  <form class="form" method="post" action="/send" enctype="multipart/form-data">
     {% if reply_to %}<input type="hidden" name="reply_to" value="{{ reply_to }}"/>{% endif %}
     <input type="hidden" name="sender" value="{{ sender_default }}"/>
 
@@ -118,6 +118,19 @@
       <label class="field-label">Body <span class="dim">(markdown)</span></label>
       <textarea class="field-textarea" name="body" required autofocus
         placeholder="What should this agent do?&#10;&#10;Use markdown — code blocks, lists, links all render in the recipient's mailbox view."></textarea>
+    </div>
+
+    <div class="field-block">
+      <label class="field-label">
+        Attachments
+        <span class="dim">(optional · PNG/JPG/GIF/WebP/HEIC/PDF · ≤10 MiB each)</span>
+      </label>
+      <input class="field-input" type="file" name="attachments" multiple
+             accept="image/png,image/jpeg,image/gif,image/webp,image/heic,image/heif,application/pdf"/>
+      <div class="dim" style="font-size:var(--t-micro);margin-top:var(--s-1);">
+        Only vision-capable models (Claude 4.x, GPT-5) will see images.
+        Routed to a text-only model? The image becomes a placeholder.
+      </div>
     </div>
 
     <div class="row between">

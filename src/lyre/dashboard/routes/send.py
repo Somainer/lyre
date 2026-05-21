@@ -12,16 +12,34 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, Form, Request
+from fastapi import APIRouter, File, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse
 
-from ...persistence.models import MailboxMessage
+from ...persistence.models import Blob, MailboxMessage
 from ...runtime.identity import (
     compose_id,
     is_bootstrap,
     is_valid_agent_id,
     split_id,
 )
+
+# Hard cap on a single upload. The model burns vision tokens by
+# image area, the dashboard SSE wakes up on every mail insert, and
+# `mailbox_messages.attachments` is a JSON column on the row — a
+# 50MB attachment would bloat all three. 10 MiB is large enough for
+# any reasonable screenshot or document; if the owner needs to send
+# more they can split or compress.
+_MAX_BLOB_BYTES = 10 * 1024 * 1024
+
+# Recognized upload types. Restricting the whitelist matters less for
+# correctness (the adapter only knows what to do with images + PDFs)
+# than for stopping accidental .zip / executable uploads that would
+# pollute the blob store without ever being usable.
+_ACCEPTED_MEDIA_TYPES: frozenset[str] = frozenset({
+    "image/png", "image/jpeg", "image/jpg",
+    "image/gif", "image/webp", "image/heic", "image/heif",
+    "application/pdf",
+})
 
 router = APIRouter()
 
@@ -166,9 +184,17 @@ async def send_post(
     name: str | None = Form(None),
     recipient: str | None = Form(None),
     spawn_if_missing: str | None = Form(None),
+    # Multimodal upload — accepts 0..N files. Each uploaded file is
+    # hashed (sha256) and written via BlobStore; the resulting
+    # blob_ids ride alongside the mail in `attachments`. The File()
+    # default-arg is FastAPI's idiomatic declaration for a form field
+    # (ruff B008 is a false positive against this pattern — the call
+    # builds a parameter descriptor, not a shared mutable default).
+    attachments: list[UploadFile] = File(default=[]),  # noqa: B008
 ) -> HTMLResponse:
     templates = request.app.state.templates
     repos = request.app.state.repos
+    blob_store = getattr(request.app.state, "blob_store", None)
     spawn = spawn_if_missing in ("1", "on", "true")
 
     async def render_err(msg: str, status: int = 400) -> HTMLResponse:
@@ -223,6 +249,43 @@ async def send_post(
         return await render_err(resolved[1])
     final_recipient = resolved
 
+    # Process file uploads BEFORE inserting the mail row so a bad
+    # upload aborts the whole send rather than silently dropping the
+    # attachment and confusing the recipient.
+    blob_ids: list[str] = []
+    for upload in attachments or []:
+        if not upload or not upload.filename:
+            continue  # empty form field
+        if blob_store is None:
+            return await render_err(
+                "attachments require BlobStore — pass blob_store= when "
+                "creating the app, or restart lyre serve."
+            )
+        media_type = upload.content_type or "application/octet-stream"
+        if media_type not in _ACCEPTED_MEDIA_TYPES:
+            return await render_err(
+                f"unsupported attachment type {media_type!r} "
+                f"({upload.filename}). Allowed: images (PNG/JPG/GIF/"
+                f"WebP/HEIC) and PDF."
+            )
+        data = await upload.read()
+        if len(data) > _MAX_BLOB_BYTES:
+            return await render_err(
+                f"attachment {upload.filename!r} is "
+                f"{len(data) // 1024} KiB; cap is "
+                f"{_MAX_BLOB_BYTES // 1024 // 1024} MiB. Compress or "
+                f"split."
+            )
+        blob_id = blob_store.write(data, media_type)
+        await repos.blobs.upsert(Blob(
+            id=blob_id,
+            media_type=media_type,
+            size_bytes=len(data),
+            filename=upload.filename,
+            source=sender or "owner",
+        ))
+        blob_ids.append(blob_id)
+
     await repos.mailbox.ensure_mailbox(final_recipient)
     msg = MailboxMessage(
         recipient=final_recipient,
@@ -232,12 +295,14 @@ async def send_post(
         title=title.strip() or None,
         body=body,
         parent_msg_id=reply_to,
+        attachments=blob_ids or None,
     )
     msg_id = await repos.mailbox.insert_message(msg)
 
     success = (
         f"sent [{msg_id}] {urgency} from {sender} → {final_recipient}"
         + (f" (in reply to #{reply_to})" if reply_to else "")
+        + (f" — {len(blob_ids)} attachment(s)" if blob_ids else "")
     )
     preset_persona, preset_name = _split_preset(final_recipient)
     return templates.TemplateResponse(

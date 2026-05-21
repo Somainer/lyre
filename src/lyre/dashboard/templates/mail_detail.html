@@ -39,6 +39,38 @@
     <div class="md-body">{{ msg.body | markdown }}</div>
   </div>
 
+  {# Attachments — content-addressed blobs served via /blobs/<id>.
+     Images render inline; PDFs / unknown types show as a download
+     link with media type + size. #}
+  {% if attachments %}
+  <div class="card" style="margin-top:var(--s-4);padding:var(--s-4);">
+    <div style="font-size:var(--t-micro);text-transform:uppercase;letter-spacing:0.06em;color:var(--fg-3);margin-bottom:var(--s-3);">
+      Attachments · {{ attachments|length }}
+    </div>
+    <div class="attachments-grid" style="display:flex;flex-direction:column;gap:var(--s-3);">
+      {% for a in attachments %}
+        <div class="attachment-row">
+          {% if a.media_type.startswith('image/') %}
+            <a href="/blobs/{{ a.id }}" target="_blank" rel="noopener">
+              <img src="/blobs/{{ a.id }}"
+                   alt="{{ a.filename or a.id }}"
+                   style="max-width:100%;max-height:480px;border-radius:6px;border:1px solid var(--border);"/>
+            </a>
+          {% else %}
+            <a href="/blobs/{{ a.id }}" class="btn ghost sm" target="_blank" rel="noopener">
+              {{ a.filename or a.id }}
+            </a>
+          {% endif %}
+          <div class="dim mono" style="font-size:var(--t-micro);margin-top:var(--s-1);">
+            {{ a.media_type }} · {{ (a.size_bytes / 1024) | round(1) }} KiB
+            {% if a.filename %}· {{ a.filename }}{% endif %}
+          </div>
+        </div>
+      {% endfor %}
+    </div>
+  </div>
+  {% endif %}
+
   {# Raw text in a <pre> so the user can scroll the full original
      verbatim and the Copy button has something to grab. Hidden from
      normal flow until expanded — most users want the rendered view. #}

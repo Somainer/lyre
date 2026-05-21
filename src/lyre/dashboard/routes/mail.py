@@ -90,11 +90,18 @@ async def mail_detail(
         raise HTTPException(
             status_code=404, detail=f"mail #{msg_id} not found"
         )
+    # Resolve attachment blob metadata for the inline preview. Bulk
+    # call to avoid N+1; preserves the order in msg.attachments.
+    attachments = (
+        await repos.blobs.list_ids(msg.attachments)
+        if msg.attachments else []
+    )
     templates = request.app.state.templates
     return templates.TemplateResponse(
         request, "mail_detail.html",
         {
             "tab": "mail",
             "msg": msg,
+            "attachments": attachments,
         },
     )
