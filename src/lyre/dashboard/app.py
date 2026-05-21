@@ -66,6 +66,7 @@ def create_app(
     *,
     dashboard_broadcaster: DashboardBroadcaster | None = None,
     model_context_windows: dict[str, int] | None = None,
+    owner_name: str | None = None,
 ) -> FastAPI:
     """`model_context_windows` is a `{model_id_or_alias: context_window_tokens}`
     map used by the activity feed to compute "context usage %" for each
@@ -89,6 +90,7 @@ def create_app(
     app.state.broadcaster = broadcaster
     app.state.dashboard_broadcaster = dashboard_broadcaster
     app.state.model_context_windows = model_context_windows or {}
+    app.state.owner_name = owner_name
     app.state.templates = Jinja2Templates(directory=str(TEMPLATE_DIR))
     env = app.state.templates.env
     env.filters["markdown"] = _render_markdown

@@ -32,6 +32,7 @@ async def run_dashboard(
     poll_interval_s: float = 0.5,
     on_ready: Callable[[str], None] | None = None,
     model_context_windows: dict[str, int] | None = None,
+    owner_name: str | None = None,
 ) -> None:
     """Start the broadcaster + uvicorn server until `stop_event` is set
     (or the server otherwise exits). Designed for two callers:
@@ -62,6 +63,7 @@ async def run_dashboard(
         repos, broadcaster,
         dashboard_broadcaster=dashboard_bc,
         model_context_windows=model_context_windows,
+        owner_name=owner_name,
     )
     # lifespan="off": we don't use ASGI lifespan messages (the handler in
     # app.py is a no-op `yield`). With it on, Starlette's lifespan task
