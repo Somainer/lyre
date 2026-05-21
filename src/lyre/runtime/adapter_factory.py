@@ -14,11 +14,13 @@ Supported providers:
 from __future__ import annotations
 
 import os
+from typing import Any
 
 from ..adapter.anthropic import AnthropicAdapter
 from ..adapter.llm_adapter import LLMAdapter
 from ..adapter.openai import OpenAIAdapter
 from ..adapter.openai_responses import OpenAIResponsesAdapter
+from .blob_store import BlobStore
 from .model_registry import ModelEntry
 
 
@@ -57,7 +59,15 @@ class AdapterFactory:
     """Stateless: cache-free instantiation. The SDKs (Anthropic / OpenAI) each
     manage their own connection pools, so creating one client per wakeup is
     fine.
+
+    ``blob_store`` (optional) is forwarded to each constructed adapter
+    so it can resolve ``image`` / ``document`` content blocks at
+    send-time. Leave unset in contexts that never dispatch multimodal
+    content (most unit tests).
     """
+
+    def __init__(self, blob_store: BlobStore | None = None) -> None:
+        self._blob_store = blob_store
 
     def make(self, entry: ModelEntry) -> LLMAdapter:
         # Two auth modes; either or both can be configured per entry:
@@ -97,6 +107,7 @@ class AdapterFactory:
                 api_key=sdk_api_key,
                 base_url=entry.endpoint.base_url,
                 extra_headers=extra_headers or None,
+                blob_store=self._blob_store,
             )
         if entry.provider == "openai":
             # Within the OpenAI family the `endpoint.api` field picks
@@ -104,10 +115,11 @@ class AdapterFactory:
             # default, what OpenRouter / Together / vLLM-OAI expose)
             # or `responses` (OpenAI's newer surface, also some
             # internal corporate gateways like bytedance ai-coder).
-            common_kwargs = {
+            common_kwargs: dict[str, Any] = {
                 "api_key": sdk_api_key,
                 "base_url": entry.endpoint.base_url,
                 "extra_headers": extra_headers or None,
+                "blob_store": self._blob_store,
             }
             if entry.endpoint.api == "responses":
                 return OpenAIResponsesAdapter(**common_kwargs)

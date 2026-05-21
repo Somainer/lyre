@@ -47,9 +47,10 @@ What is NOT implemented (yet):
 
 from __future__ import annotations
 
+import base64
 import json as _json
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from openai import AsyncOpenAI
 
@@ -67,6 +68,9 @@ from .llm_adapter import (
     Usage,
 )
 
+if TYPE_CHECKING:
+    from ..runtime.blob_store import BlobStore
+
 
 class OpenAIResponsesAdapter:
     """Wraps AsyncOpenAI's `client.responses.create(...)` with Lyre's
@@ -78,6 +82,7 @@ class OpenAIResponsesAdapter:
         base_url: str | None = None,
         timeout: float = 600.0,
         extra_headers: dict[str, str] | None = None,
+        blob_store: BlobStore | None = None,
     ):
         kwargs: dict[str, Any] = {"api_key": api_key, "timeout": timeout}
         if base_url:
@@ -88,6 +93,7 @@ class OpenAIResponsesAdapter:
         if extra_headers:
             kwargs["default_headers"] = extra_headers
         self.client = AsyncOpenAI(**kwargs)
+        self._blob_store = blob_store
 
     async def stream_turn(
         self,
@@ -98,7 +104,9 @@ class OpenAIResponsesAdapter:
         temperature: float | None = None,
         system: str | None = None,
     ) -> AsyncIterator[StreamEvent]:
-        input_items = self._lyre_to_responses_input(messages)
+        input_items = self._lyre_to_responses_input(
+            messages, blob_store=self._blob_store,
+        )
         responses_tools = (
             [self._tool_to_responses(t) for t in tools] if tools else None
         )
@@ -282,6 +290,7 @@ class OpenAIResponsesAdapter:
     @staticmethod
     def _lyre_to_responses_input(
         msgs: list[LyreMessage],
+        blob_store: BlobStore | None = None,
     ) -> list[dict[str, Any]]:
         """Convert Lyre's `(role, list[block])` messages into the
         Responses-API `input` array.
@@ -299,6 +308,8 @@ class OpenAIResponsesAdapter:
             re-derives reasoning each turn; we don't echo it back).
           * user `text` blocks → input items
                 {type:"message", role:"user", content:[{type:"input_text", text}]}
+          * user `image` blocks → content parts on the user message
+                {type:"input_image", image_url:"data:<media>;base64,..."}
           * user `tool_result` blocks → input items
                 {type:"function_call_output", call_id, output}
         """
@@ -311,8 +322,9 @@ class OpenAIResponsesAdapter:
 
             if m.role == "user":
                 # Split: tool_results become function_call_output items;
-                # text becomes a single user message.
+                # text + image become a single user message.
                 text_parts: list[str] = []
+                image_parts: list[dict[str, Any]] = []
                 for blk in m.content:
                     if blk.type == "text" and blk.text:
                         text_parts.append(blk.text)
@@ -330,13 +342,38 @@ class OpenAIResponsesAdapter:
                             "call_id": blk.tool_use_id or "",
                             "output": content,
                         })
-                if text_parts:
+                    elif blk.type == "image":
+                        if blob_store is None or not blk.blob_id or not blk.media_type:
+                            raise ValueError(
+                                "Cannot translate 'image' block: "
+                                "blob_store + blob_id + media_type required"
+                            )
+                        data = blob_store.read(blk.blob_id, blk.media_type)
+                        b64 = base64.b64encode(data).decode("ascii")
+                        image_parts.append({
+                            "type": "input_image",
+                            "image_url": (
+                                f"data:{blk.media_type};base64,{b64}"
+                            ),
+                        })
+                    elif blk.type == "document":
+                        raise ValueError(
+                            "OpenAI Responses adapter does not yet "
+                            "translate 'document' blocks; route PDFs "
+                            "to Anthropic or pre-extract text."
+                        )
+                if text_parts or image_parts:
+                    content_parts: list[dict[str, Any]] = []
+                    if text_parts:
+                        content_parts.append({
+                            "type": "input_text",
+                            "text": "\n".join(text_parts),
+                        })
+                    content_parts.extend(image_parts)
                     out.append({
                         "type": "message",
                         "role": "user",
-                        "content": [
-                            {"type": "input_text", "text": "\n".join(text_parts)},
-                        ],
+                        "content": content_parts,
                     })
                 continue
 

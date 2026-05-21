@@ -6,8 +6,9 @@ local Anthropic-compatible servers etc. (AGENT_RUNTIME.md §2.3).
 
 from __future__ import annotations
 
+import base64
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from anthropic import AsyncAnthropic
 from anthropic.types import (
@@ -32,6 +33,9 @@ from .llm_adapter import (
     Usage,
 )
 
+if TYPE_CHECKING:
+    from ..runtime.blob_store import BlobStore
+
 
 class AnthropicAdapter:
     """Wraps AsyncAnthropic with Lyre's standardized streaming interface."""
@@ -42,6 +46,7 @@ class AnthropicAdapter:
         base_url: str | None = None,
         timeout: float = 600.0,
         extra_headers: dict[str, str] | None = None,
+        blob_store: BlobStore | None = None,
     ):
         kwargs: dict[str, Any] = {"api_key": api_key, "timeout": timeout}
         if base_url:
@@ -52,6 +57,10 @@ class AnthropicAdapter:
         if extra_headers:
             kwargs["default_headers"] = extra_headers
         self.client = AsyncAnthropic(**kwargs)
+        # Multimodal: resolves blob_id → bytes at send-time. None means
+        # the adapter raises if it encounters an image/document block —
+        # tests that don't touch multimodal can leave it unset.
+        self._blob_store = blob_store
 
     async def stream_turn(
         self,
@@ -62,7 +71,9 @@ class AnthropicAdapter:
         temperature: float | None = None,
         system: str | None = None,
     ) -> AsyncIterator[StreamEvent]:
-        anth_messages = self._lyre_to_anthropic_messages(messages)
+        anth_messages = self._lyre_to_anthropic_messages(
+            messages, blob_store=self._blob_store,
+        )
         anth_tools = [self._tool_to_anthropic(t) for t in tools]
 
         kwargs: dict[str, Any] = {
@@ -127,7 +138,10 @@ class AnthropicAdapter:
         }
 
     @staticmethod
-    def _lyre_to_anthropic_messages(msgs: list[LyreMessage]) -> list[dict[str, Any]]:
+    def _lyre_to_anthropic_messages(
+        msgs: list[LyreMessage],
+        blob_store: BlobStore | None = None,
+    ) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
         for m in msgs:
             if m.role == "system":
@@ -169,6 +183,30 @@ class AnthropicAdapter:
                         "tool_use_id": blk.tool_use_id or "",
                         "content": content,
                         "is_error": blk.is_error,
+                    })
+                elif blk.type in ("image", "document"):
+                    # Anthropic's image/document shape:
+                    #   {"type": "image", "source":
+                    #       {"type": "base64",
+                    #        "media_type": "image/png", "data": "..."}}
+                    # Document blocks (PDFs) are identical except the
+                    # outer type. We load bytes via BlobStore and
+                    # base64-encode here at the adapter boundary so
+                    # the rest of the runtime never has to materialize
+                    # binary content in messages it logs / persists.
+                    if blob_store is None or not blk.blob_id or not blk.media_type:
+                        raise ValueError(
+                            f"Cannot translate {blk.type!r} block: "
+                            f"blob_store + blob_id + media_type all required"
+                        )
+                    data = blob_store.read(blk.blob_id, blk.media_type)
+                    anth_content.append({
+                        "type": blk.type,
+                        "source": {
+                            "type": "base64",
+                            "media_type": blk.media_type,
+                            "data": base64.b64encode(data).decode("ascii"),
+                        },
                     })
             # Anthropic doesn't have role="tool"; tool results live under role="user"
             role = "user" if m.role == "tool" else m.role
