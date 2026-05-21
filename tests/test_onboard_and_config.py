@@ -473,11 +473,16 @@ def test_append_env_line_adds_new_key_alongside_existing(tmp_path: Path) -> None
 # ---------------------------------------------------------------------------
 
 
-def test_protocols_cover_two_compatible_protocols() -> None:
-    """Two slots: Anthropic-compatible and OpenAI-compatible. Anything else
-    is just a custom endpoint over one of these."""
+def test_protocols_cover_three_compatible_protocols() -> None:
+    """Three slots:
+      * Anthropic-compatible — /v1/messages shape (Claude API et al.)
+      * OpenAI Chat Completions — /v1/chat/completions (OpenAI proper,
+        DeepSeek-OAI, OpenRouter, vLLM-OAI, …)
+      * OpenAI Responses API — /v1/responses (newer surface, internal
+        corporate gateways like bytedance ai-coder)
+    Anything else is just a custom endpoint over one of these."""
     keys = {p.key for p in PROTOCOLS}
-    assert keys == {"anthropic", "openai"}
+    assert keys == {"anthropic", "openai", "openai-responses"}
 
 
 def test_can_reach_env_var_detects_missing(

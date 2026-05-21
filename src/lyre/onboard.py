@@ -61,10 +61,17 @@ PROTOCOLS: tuple[ProviderProtocol, ...] = (
     ),
     ProviderProtocol(
         key="openai",
-        display="OpenAI-compatible (OpenAI API, OpenRouter, Together, DeepSeek-OAI, vLLM-OAI, …)",
+        display="OpenAI Chat Completions (OpenAI API, OpenRouter, Together, DeepSeek-OAI, vLLM-OAI, …)",
         default_endpoint="https://api.openai.com/v1",
         default_env_var="OPENAI_API_KEY",
         default_model="gpt-4o",
+    ),
+    ProviderProtocol(
+        key="openai-responses",
+        display="OpenAI Responses API (POST /v1/responses — newer surface; some corporate gateways)",
+        default_endpoint="https://api.openai.com/v1",
+        default_env_var="OPENAI_API_KEY",
+        default_model="gpt-5",
     ),
 )
 

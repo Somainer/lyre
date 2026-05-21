@@ -268,3 +268,145 @@ def test_serve_reachability_stacked_mode_needs_api_key(monkeypatch) -> None:
     assert _model_entry_reachable(e) is False
     monkeypatch.setenv("OPENAI_API_KEY", "sk-set")
     assert _model_entry_reachable(e) is True
+
+
+# ---------------------------------------------------------------------------
+# openai-responses provider — Responses API (/v1/responses) surface
+# ---------------------------------------------------------------------------
+
+
+def test_factory_makes_openai_responses_adapter(monkeypatch) -> None:
+    """provider='openai-responses' routes to OpenAIResponsesAdapter —
+    covers OpenAI's newer /v1/responses surface and corporate
+    proxies that mirror it."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-fake")
+    entry = fake_entry(
+        provider="openai-responses",
+        auth_env="OPENAI_API_KEY",
+        base_url="https://internal-proxy.example/responses",
+    )
+    adapter = AdapterFactory().make(entry)
+    from lyre.adapter.openai_responses import OpenAIResponsesAdapter
+    assert isinstance(adapter, OpenAIResponsesAdapter)
+
+
+def test_factory_openai_responses_header_only(monkeypatch) -> None:
+    """Header-only auth path works with the Responses adapter too —
+    that's the actual production setup for bytedance / similar
+    internal gateways."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    entry = fake_entry(
+        provider="openai-responses",
+        auth_env=None,
+        headers=(("Authorization", "Bearer abc"),),
+        base_url="https://gateway.internal/responses",
+    )
+    adapter = AdapterFactory().make(entry)
+    from lyre.adapter.openai_responses import OpenAIResponsesAdapter
+    assert isinstance(adapter, OpenAIResponsesAdapter)
+    assert adapter.client.default_headers.get("Authorization") == "Bearer abc"
+
+
+def test_responses_adapter_input_conversion_text_only() -> None:
+    """User+assistant text messages become Responses `input` items with
+    the right `input_text` / `output_text` content-part types. System
+    messages drop here — they ride on `instructions` instead."""
+    from lyre.adapter.llm_adapter import LyreContentBlock, LyreMessage
+    from lyre.adapter.openai_responses import OpenAIResponsesAdapter
+
+    msgs = [
+        LyreMessage(
+            role="system",
+            content=[LyreContentBlock(type="text", text="be helpful")],
+        ),
+        LyreMessage(
+            role="user",
+            content=[LyreContentBlock(type="text", text="hi")],
+        ),
+        LyreMessage(
+            role="assistant",
+            content=[LyreContentBlock(type="text", text="hello there")],
+        ),
+    ]
+    out = OpenAIResponsesAdapter._lyre_to_responses_input(msgs)
+    assert len(out) == 2  # system dropped
+    assert out[0] == {
+        "type": "message", "role": "user",
+        "content": [{"type": "input_text", "text": "hi"}],
+    }
+    assert out[1] == {
+        "type": "message", "role": "assistant",
+        "content": [{"type": "output_text", "text": "hello there"}],
+    }
+
+
+def test_responses_adapter_input_conversion_tool_use_round_trip() -> None:
+    """assistant `tool_use` → `function_call` input item;
+       user `tool_result` → `function_call_output` input item.
+    The call_id round-trips so the upstream model can match results
+    to calls."""
+    from lyre.adapter.llm_adapter import LyreContentBlock, LyreMessage
+    from lyre.adapter.openai_responses import OpenAIResponsesAdapter
+
+    msgs = [
+        LyreMessage(
+            role="assistant",
+            content=[
+                LyreContentBlock(type="text", text="checking"),
+                LyreContentBlock(
+                    type="tool_use",
+                    tool_use_id="call_abc",
+                    tool_name="lookup",
+                    tool_input={"key": "x"},
+                ),
+            ],
+        ),
+        LyreMessage(
+            role="user",
+            content=[
+                LyreContentBlock(
+                    type="tool_result",
+                    tool_use_id="call_abc",
+                    tool_result={"found": True},
+                ),
+            ],
+        ),
+    ]
+    out = OpenAIResponsesAdapter._lyre_to_responses_input(msgs)
+    assert len(out) == 3
+    # Assistant text message
+    assert out[0]["role"] == "assistant"
+    # function_call item next
+    assert out[1] == {
+        "type": "function_call",
+        "call_id": "call_abc",
+        "name": "lookup",
+        "arguments": '{"key": "x"}',
+    }
+    # User tool_result becomes function_call_output
+    assert out[2] == {
+        "type": "function_call_output",
+        "call_id": "call_abc",
+        "output": '{"found": true}',
+    }
+
+
+def test_responses_adapter_tool_spec_is_flat() -> None:
+    """Responses API tools are flat ({type, name, description,
+    parameters}) — no nested `function` wrapper like Chat Completions."""
+    from lyre.adapter.llm_adapter import LyreToolSpec
+    from lyre.adapter.openai_responses import OpenAIResponsesAdapter
+
+    t = LyreToolSpec(
+        name="greet",
+        description="say hi",
+        input_schema={"type": "object", "properties": {}},
+    )
+    out = OpenAIResponsesAdapter._tool_to_responses(t)
+    assert out == {
+        "type": "function",
+        "name": "greet",
+        "description": "say hi",
+        "parameters": {"type": "object", "properties": {}},
+    }
+    assert "function" not in out  # no nested wrapper
