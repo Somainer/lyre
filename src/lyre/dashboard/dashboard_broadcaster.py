@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from datetime import datetime
 
 import structlog
 
@@ -136,6 +135,14 @@ class DashboardBroadcaster:
                 break  # stop_event was set during the wait
             except TimeoutError:
                 pass
+            # Skip the snapshot entirely when no one's listening. py-spy
+            # showed the dashboard spending ~all its time in aiosqlite's
+            # worker thread; the broadcaster polling every second
+            # regardless of subscribers was a significant contributor.
+            # Snapshots and event-detect only run when ≥1 SSE handler
+            # is subscribed.
+            if not self._subscribers:
+                continue
             try:
                 events = await self._detect_changes()
                 if events:
@@ -148,49 +155,39 @@ class DashboardBroadcaster:
     # Change detection
     # ------------------------------------------------------------------
 
+    # All high-water-mark probes fit in a single SQL via correlated
+    # subqueries. The original implementation called five separate repo
+    # methods, each loading FULL Pydantic models (including a list_all
+    # over the agents table) just to extract one scalar — py-spy
+    # confirmed this was a noticeable share of aiosqlite worker time.
+    # One SQL = one round-trip on the shared connection, one row
+    # returned. SQLite optimizes the SELECT MAX() against indexed
+    # columns to ~O(1) per subquery.
+    _SNAPSHOT_SQL = """
+        SELECT
+            (SELECT MAX(id) FROM mailbox_messages
+                WHERE recipient='owner')                       AS mailbox_max_id,
+            (SELECT MAX(updated_at) FROM tasks)                AS task_max_updated,
+            (SELECT MAX(started_at) FROM wakeups)              AS wakeup_max_started,
+            (SELECT MAX(ended_at)   FROM wakeups)              AS wakeup_max_ended,
+            (SELECT COUNT(*) FROM wakeups WHERE ended_at IS NULL)
+                                                               AS wakeup_active_count,
+            (SELECT MAX(created_at) FROM agents)               AS agent_max_created
+    """
+
     async def _snapshot(self) -> _Cursor:
-        """Read current high-water marks from each watched table."""
-        mailbox_recent = await self.repos.mailbox.read_messages_paged(
-            "owner", before_id=None, limit=1
-        )
-        mailbox_max = (
-            mailbox_recent[0].id if mailbox_recent else None
-        )
-
-        # tasks: max updated_at — use find_recent and pick the freshest.
-        recent_tasks = await self.repos.tasks.find_recent(limit=1)
-        task_updated = (
-            _iso(recent_tasks[0].updated_at) if recent_tasks else None
-        )
-
-        # wakeups: track both started_at (new wakeup begun) and ended_at
-        # (terminal status fired). Plus active count so the health pill
-        # updates when something finishes (the count drops).
-        recent_wakeups = await self.repos.wakeups.list_recent(limit=1)
-        wakeup_started = (
-            _iso(recent_wakeups[0].started_at) if recent_wakeups else None
-        )
-        wakeup_ended = (
-            _iso(recent_wakeups[0].ended_at)
-            if recent_wakeups and recent_wakeups[0].ended_at
-            else None
-        )
-        active_wakeups = await self.repos.wakeups.list_active()
-        active_count = len(active_wakeups)
-
-        agents = await self.repos.agents.list_all(include_archived=True)
-        agent_max = max(
-            (_iso(a.created_at) for a in agents if a.created_at),
-            default=None,
-        )
-
+        """Read current high-water marks in a single SQL query."""
+        async with self.repos.conn.execute(self._SNAPSHOT_SQL) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return _Cursor()
         return _Cursor(
-            mailbox_max_id=mailbox_max,
-            task_max_updated=task_updated,
-            wakeup_max_started=wakeup_started,
-            wakeup_max_ended=wakeup_ended,
-            wakeup_active_count=active_count,
-            agent_max_created=agent_max,
+            mailbox_max_id=row["mailbox_max_id"],
+            task_max_updated=row["task_max_updated"],
+            wakeup_max_started=row["wakeup_max_started"],
+            wakeup_max_ended=row["wakeup_max_ended"],
+            wakeup_active_count=row["wakeup_active_count"],
+            agent_max_created=row["agent_max_created"],
         )
 
     async def _detect_changes(self) -> set[str]:
@@ -265,12 +262,3 @@ class DashboardBroadcaster:
                     pass
 
 
-def _iso(v: object) -> str | None:
-    """Normalize a timestamp value (datetime or string) to ISO string,
-    or None. Used to make cursor comparisons cheap (string equality
-    instead of datetime comparisons that have to handle None / tz)."""
-    if v is None:
-        return None
-    if isinstance(v, datetime):
-        return v.isoformat()
-    return str(v)

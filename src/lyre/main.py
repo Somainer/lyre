@@ -214,6 +214,7 @@ def serve_cmd(
                             stop_event=stop_event,
                             on_ready=_ready,
                             model_context_windows=ctx_windows,
+                            owner_name=cfg.owner.name,
                         ),
                         name="dashboard",
                     )
@@ -368,6 +369,7 @@ def dashboard_cmd(host: str, port: int) -> None:
                 stop_event=stop_event,
                 on_ready=lambda url: click.echo(f"Lyre dashboard at {url}"),
                 model_context_windows=ctx_windows,
+                owner_name=cfg.owner.name,
             )
         finally:
             await conn.close()
