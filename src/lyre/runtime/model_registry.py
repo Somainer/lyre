@@ -72,22 +72,28 @@ class ModelEndpoint:
         return {k: v for k, v in self.headers if k and v}
 
 
-# ${VAR} interpolation for header values. Pattern is intentionally
-# narrow: must be the WHOLE value (not a substring), and references a
-# single env var. This avoids ambiguity with header values that
-# legitimately contain $ characters.
-_ENV_INTERPOLATE_RE = re.compile(r"^\$\{([A-Z_][A-Z0-9_]*)\}$")
+# ${VAR} interpolation — shell-style. Each occurrence of `${NAME}`
+# in a header value is replaced with the value of env var NAME (or
+# empty if unset). Standard pattern: `Authorization = "Bearer ${TOKEN}"`
+# resolves to `Authorization: Bearer <actual-token>`. Literal `$`
+# survives because the regex requires the `${`/`}` braces.
+_ENV_INTERPOLATE_RE = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)\}")
 
 
 def _interpolate_env(value: str) -> str:
-    """If `value` is exactly `${VAR_NAME}`, replace with env value. The
-    env var is read once at registry load — Lyre re-loads the registry
-    on startup, so rotating a token via env var requires a restart.
-    Plain strings are returned unchanged."""
-    match = _ENV_INTERPOLATE_RE.match(value)
-    if match is None:
-        return value
-    return os.environ.get(match.group(1), "")
+    """Substitute every `${NAME}` occurrence in `value` with the env
+    var's current value. Unset vars resolve to empty string —
+    consistent with shell behavior; surfaces as an auth failure at
+    request time rather than a startup crash, so the operator can fix
+    by exporting the var without restarting the whole process.
+
+    Env vars are read once at registry-load time, so rotating a token
+    via env var requires a `lyre serve` restart.
+    """
+    return _ENV_INTERPOLATE_RE.sub(
+        lambda m: os.environ.get(m.group(1), ""),
+        value,
+    )
 
 
 @dataclass(frozen=True)
