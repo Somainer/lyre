@@ -250,11 +250,13 @@ class Config:
     auto_wake_on_mail: bool = True
     # How many tasks the scheduler may have in flight at once. Only
     # honored in subprocess mode — inline mode is single-threaded by
-    # design and ignores this. Default 1 preserves the historical
-    # serial behavior; raise it (3-4 is plenty for personal use) to
-    # let agents work in parallel. SQLite WAL + 10s busy_timeout
-    # cover cross-process write contention.
-    max_concurrent_tasks: int = 1
+    # design and ignores this. Default 4 (a sensible single-user
+    # ceiling: dispatcher + a few workers + analyst can all make
+    # progress in parallel without saturating a laptop). SQLite WAL +
+    # 10s busy_timeout cover cross-process write contention; the
+    # ceiling exists for predictable CPU / model-API rate-limit
+    # behavior, not because more would break anything.
+    max_concurrent_tasks: int = 4
 
     @classmethod
     def from_env(cls) -> Config:
@@ -370,19 +372,26 @@ class Config:
         # [scheduler] max_concurrent_tasks = N in config.toml; env var
         # `LYRE_MAX_CONCURRENT_TASKS` wins (matches the existing
         # env-beats-toml convention for runtime knobs).
+        # Use explicit `is not None` rather than `or` chain — `or`
+        # treats 0 as falsy and falls through to the default, which
+        # would silently reactivate parallelism the user tried to
+        # disable with `max_concurrent_tasks = 0`.
         scheduler_raw = raw.get("scheduler", {}) or {}
-        try:
-            max_concurrent = int(
-                os.environ.get("LYRE_MAX_CONCURRENT_TASKS")
-                or scheduler_raw.get("max_concurrent_tasks")
-                or 1
-            )
-        except (ValueError, TypeError):
-            max_concurrent = 1
+        env_raw = os.environ.get("LYRE_MAX_CONCURRENT_TASKS")
+        toml_raw = scheduler_raw.get("max_concurrent_tasks")
+        chosen = env_raw if env_raw is not None else toml_raw
+        if chosen is None:
+            max_concurrent = 4
+        else:
+            try:
+                max_concurrent = int(chosen)
+            except (ValueError, TypeError):
+                # Garbage input → default 4 rather than crash startup.
+                max_concurrent = 4
         if max_concurrent < 1:
-            # Treat 0 / negative as "disabled, fall back to 1" rather
-            # than failing startup — a typo in config shouldn't stop
-            # the daemon.
+            # Explicit 0 / negative is the user asking for serial —
+            # clamp to 1 (NOT 4), so a deliberate "disable parallelism"
+            # signal is honored.
             max_concurrent = 1
 
         # ---- bootstrap agent id overrides ----
