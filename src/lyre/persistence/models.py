@@ -243,8 +243,12 @@ class Blob(BaseModel):
 
 class OutboxRow(BaseModel):
     id: int | None = None
-    task_id: str
-    wakeup_id: str
+    # Nullable since migration 0004 — `channel_publish` rows may
+    # come from owner-side mail with no task / wakeup attribution
+    # (dashboard /send to self, system-injected mail, etc.). The
+    # mailbox_send / tier1_notification kinds always populate them.
+    task_id: str | None = None
+    wakeup_id: str | None = None
     kind: OutboxKind
     payload: dict[str, Any]
     external_id: str

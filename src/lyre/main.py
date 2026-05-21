@@ -232,16 +232,63 @@ def serve_cmd(
                 spawn_subprocess=use_subprocess,
                 adapter_factory=AdapterFactory(blob_store=blob_store),
             )
-            dispatcher = OutboxDispatcher(repos, poll_interval_s=poll_interval)
+            # Build the external-channel registry from cfg.integrations.
+            # Channels register themselves into the registry; the outbox
+            # dispatcher routes `channel_publish` rows by name. Empty
+            # registry = integrations disabled (today's default) and
+            # the rest of the runtime is unaffected.
+            from .integrations import ChannelRegistry
+            channel_registry = ChannelRegistry()
+            if cfg.integrations.lark.enabled:
+                from .integrations.lark import LarkChannel
+                try:
+                    channel_registry.register(LarkChannel(
+                        cfg.integrations.lark,
+                        repos,
+                        blob_store,
+                        dispatcher_id=cfg.bootstrap.dispatcher_id,
+                    ))
+                except ValueError as exc:
+                    click.echo(
+                        f"WARNING: Lark integration enabled but disabled "
+                        f"at startup: {exc}",
+                        err=True,
+                    )
+
+            dispatcher = OutboxDispatcher(
+                repos,
+                poll_interval_s=poll_interval,
+                channel_registry=channel_registry,
+            )
 
             # Shared stop_event so SIGINT halts all services together.
             stop_event = asyncio.Event()
             loop = asyncio.get_running_loop()
 
+            # Owner-mail enqueuer + one broadcaster per channel run.
+            # Broadcaster lives for the whole serve lifetime so the
+            # enqueuer can subscribe.
+            owner_broadcaster = None
+            owner_enqueuer = None
+            if channel_registry:
+                from .dashboard.sse import MailboxBroadcaster
+                from .integrations.owner_mail_enqueuer import (
+                    OwnerMailEnqueuer,
+                )
+                owner_broadcaster = MailboxBroadcaster(
+                    repos=repos, recipient="owner",
+                    poll_interval_s=poll_interval,
+                )
+                await owner_broadcaster.prime()
+                await owner_broadcaster.start()
+                owner_enqueuer = OwnerMailEnqueuer(repos, channel_registry)
+
             def _stop_all() -> None:
                 stop_event.set()
                 scheduler.request_stop()
                 dispatcher.request_stop()
+                if owner_enqueuer is not None:
+                    owner_enqueuer.request_stop()
 
             for sig in (signal.SIGINT, signal.SIGTERM):
                 loop.add_signal_handler(sig, _stop_all)
@@ -250,6 +297,18 @@ def serve_cmd(
                 asyncio.create_task(scheduler.run(), name="scheduler"),
                 asyncio.create_task(dispatcher.run(), name="outbox_dispatcher"),
             ]
+            # Spawn each registered channel + the owner-mail enqueuer.
+            for channel in channel_registry.values():
+                services.append(asyncio.create_task(
+                    channel.run(stop_event),
+                    name=f"channel:{channel.name}",
+                ))
+                click.echo(f"  channel {channel.name} enabled")
+            if owner_enqueuer is not None and owner_broadcaster is not None:
+                services.append(asyncio.create_task(
+                    owner_enqueuer.run(owner_broadcaster),
+                    name="owner_mail_enqueuer",
+                ))
             mode = "subprocess-isolated" if use_subprocess else "inline"
             click.echo(
                 f"Lyre scheduler ({mode}) + outbox dispatcher started."
@@ -292,6 +351,12 @@ def serve_cmd(
                 await asyncio.gather(*services)
             except asyncio.CancelledError:
                 pass
+            finally:
+                # Owner-mail broadcaster runs alongside the enqueuer;
+                # stop it explicitly so its poll task doesn't hold
+                # the loop open after services drain.
+                if owner_broadcaster is not None:
+                    await owner_broadcaster.stop()
         finally:
             await conn.close()
 
