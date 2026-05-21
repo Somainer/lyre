@@ -237,7 +237,13 @@ async def test_subprocess_sigkill_mid_task_recovers_via_expired_lease(
 
         entry = ModelEntry(
             id="fake.workhorse", provider="fake",
-            endpoint=ModelEndpoint(None, "X"),
+            # Use the conftest-provided FAKE_API_KEY env var so the
+            # router's reachability filter (added when header-only auth
+            # mode landed) sees this entry as authenticatable. The
+            # actual auth doesn't matter — adapter_for_test below
+            # substitutes a fake adapter — but the router runs first
+            # and drops anything with no usable auth.
+            endpoint=ModelEndpoint(None, "FAKE_API_KEY"),
             capabilities=("tool_use", "streaming"),
             tier="workhorse",
             cost_per_mtok=ModelCost(None, None),

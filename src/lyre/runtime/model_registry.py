@@ -217,20 +217,30 @@ def default_registry_path() -> Path:
 def merge_user_entries(
     base: ModelRegistry, user_entries: list[Any]
 ) -> ModelRegistry:
-    """Fold ``Config.models`` entries into a shipped registry.
+    """Resolve the effective model registry from shipped defaults +
+    the user's ``Config.models`` (config.toml ``[[models]]`` blocks).
 
-    Same-``id`` user entries REPLACE the shipped entry (whole-row override).
-    New ``id`` user entries are appended. Returns a new ``ModelRegistry``;
-    the input is not mutated.
+    Semantics: **explicit beats shipped**.
+
+      * No ``user_entries`` (fresh install, no config.toml yet) →
+        the shipped registry is returned unchanged. This keeps the
+        out-of-box experience working before ``lyre onboard``.
+      * Any ``user_entries`` present → those entries ARE the registry.
+        Shipped defaults are dropped entirely. If the user wants a
+        shipped entry, they list it explicitly in their config —
+        otherwise the router won't even consider it as a candidate.
+
+    The previous behavior appended user entries onto the shipped
+    defaults, which surprised users who'd configured a custom proxy
+    and then found the router ranking shipped Anthropic / DeepSeek
+    entries above theirs (and crashing on missing env vars). Drop
+    that.
     """
     if not user_entries:
         return base
-
-    by_id: dict[str, ModelEntry] = {e.id: e for e in base.entries}
-    for raw in user_entries:
-        entry = _user_entry_to_runtime(raw)
-        by_id[entry.id] = entry
-    return ModelRegistry(entries=list(by_id.values()))
+    return ModelRegistry(
+        entries=[_user_entry_to_runtime(raw) for raw in user_entries]
+    )
 
 
 def _user_entry_to_runtime(raw: Any) -> ModelEntry:

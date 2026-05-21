@@ -687,7 +687,22 @@ class AgentLoop:
                 )
                 continue
 
-            adapter = self.adapter_for(candidate)
+            # Adapter construction can fail (env var unset, malformed
+            # endpoint, etc.). Skip to the next candidate instead of
+            # tearing the whole task down — the router's reachability
+            # filter usually catches these earlier, but this is the
+            # last line of defense if e.g. an env var was unset
+            # between router select and this attempt.
+            try:
+                adapter = self.adapter_for(candidate)
+            except Exception as exc:  # noqa: BLE001
+                fallback_events.append(
+                    {"model_id": candidate.id, "reason": f"adapter_factory: {exc}"}
+                )
+                self.transcript.note(
+                    f"model_skip: {candidate.id} adapter_factory failed ({exc})"
+                )
+                continue
             model_name = self.model_name_for(candidate)
             text_parts: list[str] = []
             tool_uses: list[dict[str, Any]] = []
