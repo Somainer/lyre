@@ -29,6 +29,7 @@ import click
 from .persistence.db import init_db
 from .persistence.sqlite_impl import SqliteRepositories
 from .personas.seed import ensure_user_personas, seed_default_agents, seed_personas
+from .runtime.identity import is_valid_agent_id
 from .runtime.memory import ensure_shipped_facts, ensure_skeleton
 from .runtime.skills import ensure_skills_skeleton
 
@@ -545,18 +546,18 @@ def run_wizard(*, lyre_home: Path) -> OnboardPlan:
         "Lyre seeds three role agents. Persona roles are fixed (dispatcher /\n"
         "analyst / reviewer) but the owner-facing AGENT names are yours to pick."
     )
-    dispatcher_id = click.prompt(
+    dispatcher_id = _prompt_agent_id(
         "Dispatcher name (the agent you'll mostly talk to)",
         default="dispatcher",
-    ).strip() or "dispatcher"
-    analyst_id = click.prompt(
+    )
+    analyst_id = _prompt_agent_id(
         "Analyst name (does research, writes specs)",
         default="analyst-1",
-    ).strip() or "analyst-1"
-    reviewer_id = click.prompt(
+    )
+    reviewer_id = _prompt_agent_id(
         "Reviewer name (reviews PRs and skill proposals)",
         default="reviewer-1",
-    ).strip() or "reviewer-1"
+    )
 
     click.echo("")
     click.echo(
@@ -673,6 +674,50 @@ _HEADER_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
 
 def _is_valid_header_name(name: str) -> bool:
     return bool(_HEADER_NAME_RE.match(name))
+
+
+def _normalize_agent_id_input(raw: str, *, default: str) -> tuple[str, str | None]:
+    """Massage owner-typed agent-id input into a legal id.
+
+    Returns ``(value, hint)`` where ``hint`` is a message to echo back if
+    we adjusted the input (auto-lowercased it), or ``None`` if the value
+    was already fine.
+
+    Empty/whitespace falls back to ``default``. If the result still doesn't
+    match :func:`is_valid_agent_id`, returns ``("", error)`` so the caller
+    can re-prompt.
+    """
+    s = raw.strip()
+    if not s:
+        return default, None
+    lowered = s.lower()
+    if not is_valid_agent_id(lowered):
+        return (
+            "",
+            f"  ✗ {s!r} isn't a valid agent id. Use lowercase letters / "
+            f"digits / hyphens; must start with a letter. Try again.",
+        )
+    if lowered != s:
+        return lowered, f"  ✓ stored as {lowered!r} (agent ids are lowercase)."
+    return lowered, None
+
+
+def _prompt_agent_id(message: str, *, default: str) -> str:
+    """Prompt loop until the owner types something that passes the grammar.
+
+    Auto-lowercases input that's otherwise valid (so natural names like
+    "Subaru" become "subaru" with a one-line confirmation), and re-prompts
+    on truly invalid input (spaces, punctuation, etc.).
+    """
+    while True:
+        raw = click.prompt(message, default=default)
+        value, hint = _normalize_agent_id_input(raw, default=default)
+        if not value:
+            click.echo(hint, err=True)
+            continue
+        if hint:
+            click.echo(hint)
+        return value
 
 
 def _prompt_for_one_model(

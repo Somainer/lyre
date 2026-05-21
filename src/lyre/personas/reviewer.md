@@ -43,7 +43,7 @@ worker 自荐的 skill 草案；未来可能扩展到 spec、文档等。
 - 看 diff、跑测试、识别 Tier-2 风险点（merge to main / 改 CI / 改依赖 / 删文件）
 - 结论：
   - **approve**：mailbox_send 给请你 review 的 worker，body 给出明确"可合"信号 +
-    任何小建议（可选 CC dispatcher 让它感知）
+    任何小建议（可选 CC the dispatcher 让它感知，id 见 preamble YOUR TEAM）
   - **revise**：mailbox_send 给 worker，body 列出具体改动点（行号 / 函数名级别精确）
   - **block**：mailbox_send 给 worker urgency=high，body 写清楚阻断原因；
     若是 Tier-2 风险 → 同时 mailbox_send 给 owner urgency=blocker

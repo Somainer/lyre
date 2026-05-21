@@ -108,18 +108,30 @@ def assemble_system_prompt(
     Hermes/Pi pattern.
     """
     # Identity + universal protocols. THIS BLOCK IS BYTE-IDENTICAL ACROSS
-    # WAKEUPS for the same (agent_id, persona, allowed_tools). Putting it
-    # first maximizes the cached prefix on Anthropic & DeepSeek.
+    # WAKEUPS for the same (agent_id, persona, allowed_tools, peers).
+    # Putting it first maximizes the cached prefix on Anthropic & DeepSeek.
     effective_id = agent_id or persona.name
     parent_agent_id: str | None = None
+    # Peer bootstrap agents — first parent-less agent per persona name,
+    # excluding self. Lets persona bodies stay generic ("hand off to the
+    # analyst") while the preamble names the actual agent ids the owner
+    # customized via [bootstrap] in config.toml.
+    peer_bootstrap: dict[str, str] = {}
     if other_agents:
         for a in other_agents:
-            # Pydantic Agent or dataclass-like; just look up id.
             if getattr(a, "id", None) == effective_id:
                 parent_agent_id = getattr(a, "parent_agent_id", None)
-                break
+                continue
+            if getattr(a, "parent_agent_id", None) is not None:
+                continue  # spawned, not a bootstrap singleton
+            if getattr(a, "status", "idle") == "archived":
+                continue
+            p_name = getattr(a, "persona_name", None)
+            if p_name and p_name not in peer_bootstrap:
+                peer_bootstrap[p_name] = getattr(a, "id", "")
     identity = _build_identity_preamble(
         effective_id, persona.name, parent_agent_id=parent_agent_id,
+        peer_bootstrap=peer_bootstrap or None,
     )
 
     parts: list[str] = [
@@ -225,13 +237,21 @@ def _build_identity_preamble(
     persona_name: str,
     *,
     parent_agent_id: str | None = None,
+    peer_bootstrap: dict[str, str] | None = None,
 ) -> str:
     """The universal head of every system prompt. Byte-identical for a
-    given (agent_id, persona_name, parent_agent_id) — maximizes
-    Anthropic / DeepSeek prefix-cache hits across wakeups. The
+    given (agent_id, persona_name, parent_agent_id, peer_bootstrap) —
+    maximizes Anthropic / DeepSeek prefix-cache hits across wakeups. The
     parent-agent line only appears when there IS a parent (spawned
     agents); bootstrap roots like `owner`/`dispatcher` see the prompt
-    without that line, preserving cache reuse for them too."""
+    without that line, preserving cache reuse for them too.
+
+    ``peer_bootstrap`` maps persona name → current agent id for each
+    bootstrap singleton OTHER than self. Persona bodies refer to peers
+    generically ("the analyst", "your reviewer") so they stay correct
+    when the owner customizes the agent ids via ``[bootstrap]`` in
+    config.toml; this section in the preamble grounds those generic
+    references to the actual ids."""
     # `persona/name` ids would otherwise hint at a directory layer in
     # the notes path; flatten `/` to `-` to match
     # ensure_agent_notes_file's filename convention.
@@ -247,6 +267,24 @@ def _build_identity_preamble(
             f"orchestrates the work; let them decide whether owner needs "
             f"to be looped in.\n"
         )
+    peers_block = ""
+    if peer_bootstrap:
+        # Sort by persona for stable cache-friendly ordering.
+        lines = [
+            f"  • the {p} = `{aid}`"
+            for p, aid in sorted(peer_bootstrap.items())
+        ]
+        peers_block = (
+            "\n**YOUR TEAM — IMPORTANT.** When this prompt below talks "
+            "generically about \"the dispatcher\" / \"the analyst\" / "
+            "\"the reviewer\", those refer to these CURRENT live agent "
+            "ids — use them as recipients in mailbox_send / dispatch_task:\n"
+            + "\n".join(lines)
+            + "\nThe owner may have renamed these via config.toml, so the "
+            "names above are the source of truth — DO NOT use generic "
+            "strings like \"dispatcher\" as recipients unless that "
+            "literally matches an id above.\n"
+        )
     return (
         f"You are agent **{agent_id}** (persona: `{persona_name}`).\n"
         f"Your mailbox key is `{agent_id}` — when you call mailbox_read "
@@ -255,7 +293,8 @@ def _build_identity_preamble(
         f"Do not refer to yourself by any other name. In particular, do "
         f"not synthesize variants like `{agent_id}-scheduler` or "
         f"`{persona_name}-foo`.\n"
-        + parent_line +
+        + parent_line
+        + peers_block +
         f"\n"
         f"**HOW WAKEUPS END — IMPORTANT MECHANICS.** There is NO "
         f"`end_turn` tool to call. The wakeup ends *naturally* when you "

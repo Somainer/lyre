@@ -238,6 +238,11 @@ async def seed_default_agents(
     is the "agent's private scratchpad for cross-wakeup memory" that the
     identity preamble teaches about (Codex-style: pre-create the path so
     the agent naturally `ls` / `cat`s it).
+
+    After seeding, calls :func:`archive_stale_bootstrap_agents` to soft-
+    delete any *other* parentless agents of the same bootstrap personas —
+    this handles the "owner re-ran onboard with new names" case, so the
+    dashboard stops showing both `dispatcher` and `luna` side-by-side.
     """
     pairs = agents if agents is not None else DEFAULT_AGENTS
     created: list[str] = []
@@ -251,7 +256,49 @@ async def seed_default_agents(
             created.append(agent_id)
         if memory_root is not None:
             ensure_agent_notes_file(memory_root, agent_id)
+    await archive_stale_bootstrap_agents(repo, pairs)
     return created
+
+
+async def archive_stale_bootstrap_agents(
+    repo: AgentRepository,
+    canonical: tuple[tuple[str, str], ...],
+) -> list[str]:
+    """Soft-archive bootstrap agents that no longer match ``canonical``.
+
+    ``canonical`` is the freshly-resolved (agent_id, persona_name) list
+    from ``Config.bootstrap`` (what *should* be seeded right now).
+
+    A row qualifies for archival when ALL these hold:
+      - persona_name appears in ``canonical`` (it's a bootstrap persona)
+      - row's id is NOT in ``canonical`` (it's the wrong id for this slot)
+      - row.parent_agent_id IS NULL (truly bootstrap-seeded, not a
+        user-spawned child like `dispatcher/refactor-x`)
+      - row.status != 'archived' (don't re-archive)
+
+    Mail and wakeups attached to the archived row stay queryable from
+    the dashboard, but new mail / new dispatch is refused. Owner can
+    `lyre agent` un-archive later if needed.
+
+    Returns the list of archived ids.
+    """
+    canonical_ids = {aid for aid, _ in canonical}
+    canonical_personas = {p for _, p in canonical}
+
+    archived: list[str] = []
+    for agent in await repo.list_all(include_archived=False):
+        if agent.persona_name not in canonical_personas:
+            continue
+        if agent.id in canonical_ids:
+            continue
+        if agent.parent_agent_id is not None:
+            continue  # user-spawned, leave alone
+        if agent.status == "archived":
+            continue
+        ok = await repo.archive(agent.id)
+        if ok:
+            archived.append(agent.id)
+    return archived
 
 
 def ensure_agent_notes_file(memory_root: Path, agent_id: str) -> Path:

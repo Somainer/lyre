@@ -30,7 +30,7 @@
         <span class="dim mono" style="font-size:var(--t-micro);">to</span>
         <select name="recipient">
           {% for a in compose_recipients %}
-            <option value="{{ a.id }}">{{ a.id }}</option>
+            <option value="{{ a.id }}"{% if a.id == default_recipient %} selected{% endif %}>{{ a.id }}</option>
           {% endfor %}
         </select>
       </div>
@@ -44,7 +44,7 @@
         </select>
       </div>
       <div class="field" style="flex:1;">
-        <input name="body" placeholder="Send mail to dispatcher…" required/>
+        <input name="body" placeholder="Send mail to {{ default_recipient }}…" required/>
       </div>
       <input type="hidden" name="sender" value="owner"/>
       <button type="submit" class="btn primary">
