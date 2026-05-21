@@ -6,6 +6,8 @@ Capability tags are free-form strings — no validation against an enum.
 
 from __future__ import annotations
 
+import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -18,16 +20,74 @@ RegistryStatus = Literal["enabled", "disabled"]
 
 @dataclass(frozen=True)
 class ModelEndpoint:
+    """How to reach + authenticate to one model endpoint.
+
+    Two auth modes are supported (and they can stack — e.g. an API key
+    via `auth_env` PLUS extra org/project headers):
+
+      * `auth_env`: name of an environment variable whose value is the
+        API key. Passed to the SDK as `api_key=…`, which then sets the
+        provider's expected auth header (Bearer / x-api-key / etc.).
+        Leave None to skip API-key auth entirely.
+
+      * `headers`: explicit HTTP headers, sent on every request via
+        the SDK's `default_headers`. Useful when the proxy / gateway
+        in front of the model expects a custom auth scheme (signed
+        JWT, mTLS-passthrough token, internal SSO, …) that the
+        provider SDK doesn't know about. Values support `${ENV_VAR}`
+        interpolation so secrets stay out of config.toml.
+
+    At least one of the two must be set — adapter factory will refuse
+    to build a client otherwise.
+    """
+
     base_url: str | None
-    auth_env: str
+    auth_env: str | None
+    # tuple of (name, value) pairs — frozen so the dataclass stays hashable.
+    headers: tuple[tuple[str, str], ...] = ()
 
     @classmethod
     def from_dict(cls, d: dict | None) -> ModelEndpoint:
         d = d or {}
+        raw_headers = d.get("headers") or {}
+        if not isinstance(raw_headers, dict):
+            raise ValueError(
+                "endpoint.headers must be a dict of header-name → value "
+                f"strings; got {type(raw_headers).__name__}"
+            )
+        headers = tuple(
+            (str(k), _interpolate_env(str(v)))
+            for k, v in raw_headers.items()
+        )
         return cls(
             base_url=d.get("base_url") or None,
-            auth_env=d.get("auth_env") or "ANTHROPIC_API_KEY",
+            auth_env=d.get("auth_env") or None,
+            headers=headers,
         )
+
+    @property
+    def headers_dict(self) -> dict[str, str]:
+        """Convenience for callers — never None, never empty-of-key
+        entries."""
+        return {k: v for k, v in self.headers if k and v}
+
+
+# ${VAR} interpolation for header values. Pattern is intentionally
+# narrow: must be the WHOLE value (not a substring), and references a
+# single env var. This avoids ambiguity with header values that
+# legitimately contain $ characters.
+_ENV_INTERPOLATE_RE = re.compile(r"^\$\{([A-Z_][A-Z0-9_]*)\}$")
+
+
+def _interpolate_env(value: str) -> str:
+    """If `value` is exactly `${VAR_NAME}`, replace with env value. The
+    env var is read once at registry load — Lyre re-loads the registry
+    on startup, so rotating a token via env var requires a restart.
+    Plain strings are returned unchanged."""
+    match = _ENV_INTERPOLATE_RE.match(value)
+    if match is None:
+        return value
+    return os.environ.get(match.group(1), "")
 
 
 @dataclass(frozen=True)

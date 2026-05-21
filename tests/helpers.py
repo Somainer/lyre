@@ -20,13 +20,16 @@ def fake_entry(
     capabilities: tuple[str, ...] = ("tool_use", "streaming"),
     provider: str = "fake",
     base_url: str | None = None,
-    auth_env: str = "FAKE_API_KEY",
+    auth_env: str | None = "FAKE_API_KEY",
+    headers: tuple[tuple[str, str], ...] = (),
     status: str = "enabled",
 ) -> ModelEntry:
     return ModelEntry(
         id=id,
         provider=provider,
-        endpoint=ModelEndpoint(base_url=base_url, auth_env=auth_env),
+        endpoint=ModelEndpoint(
+            base_url=base_url, auth_env=auth_env, headers=headers,
+        ),
         capabilities=capabilities,
         tier=tier,  # type: ignore[arg-type]
         cost_per_mtok=ModelCost(None, None),

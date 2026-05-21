@@ -67,10 +67,17 @@ class OpenAIAdapter:
         api_key: str,
         base_url: str | None = None,
         timeout: float = 600.0,
+        extra_headers: dict[str, str] | None = None,
     ):
         kwargs: dict[str, Any] = {"api_key": api_key, "timeout": timeout}
         if base_url:
             kwargs["base_url"] = base_url
+        # Custom headers ride alongside the SDK's Bearer header. Used
+        # when a proxy/gateway in front of the model expects a custom
+        # auth scheme (signed JWT, internal SSO token, mTLS-passthrough
+        # token, etc.).
+        if extra_headers:
+            kwargs["default_headers"] = extra_headers
         self.client = AsyncOpenAI(**kwargs)
 
     async def stream_turn(

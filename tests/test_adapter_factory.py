@@ -94,3 +94,110 @@ def test_factory_passes_base_url_to_openai(monkeypatch) -> None:
     adapter = AdapterFactory().make(entry)
     # The AsyncOpenAI client exposes base_url; verify it round-tripped.
     assert str(adapter.client.base_url).rstrip("/") == "https://api.deepseek.com/v1"
+
+
+# ---------------------------------------------------------------------------
+# Custom-header auth mode — for proxies / gateways that authenticate via
+# a non-standard scheme (signed JWT, internal SSO token, mTLS-passthrough)
+# instead of (or in addition to) the provider's native API key.
+# ---------------------------------------------------------------------------
+
+
+def test_factory_header_only_mode_builds_adapter(monkeypatch) -> None:
+    """auth_env=None + headers set should build a working adapter
+    without an API key. The SDK still requires a non-empty api_key
+    string, so the factory passes a sentinel — the actual auth is
+    supplied by the custom headers."""
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    entry = fake_entry(
+        provider="openai",
+        auth_env=None,
+        headers=(("X-Custom-Auth", "static-token"),),
+        base_url="https://my-proxy.internal/v1",
+    )
+    adapter = AdapterFactory().make(entry)
+    # The OpenAI SDK exposes default_headers on the client; verify our
+    # header was registered.
+    from lyre.adapter.openai import OpenAIAdapter
+    assert isinstance(adapter, OpenAIAdapter)
+    assert adapter.client.default_headers.get("X-Custom-Auth") == "static-token"
+
+
+def test_factory_header_value_interpolates_env_var(monkeypatch) -> None:
+    """Header values may use ${ENV_VAR} so secrets stay out of
+    config.toml. Interpolation runs at registry-load time (in
+    ModelEndpoint.from_dict)."""
+    monkeypatch.setenv("PROXY_TOKEN", "secret-jwt")
+    from lyre.runtime.model_registry import ModelEndpoint
+    ep = ModelEndpoint.from_dict({
+        "headers": {"Authorization": "Bearer ${PROXY_TOKEN}"},
+    })
+    # The whole value must be the placeholder for interpolation to fire
+    # — `"Bearer ${PROXY_TOKEN}"` is a partial placeholder, so it
+    # stays as-is. Test the pure form (`"${PROXY_TOKEN}"`).
+    ep_pure = ModelEndpoint.from_dict({
+        "headers": {"X-Auth": "${PROXY_TOKEN}"},
+    })
+    assert dict(ep_pure.headers)["X-Auth"] == "secret-jwt"
+    # And the partial form survives unchanged.
+    assert dict(ep.headers)["Authorization"] == "Bearer ${PROXY_TOKEN}"
+
+
+def test_factory_header_interpolation_missing_env_is_empty(
+    monkeypatch,
+) -> None:
+    """Referencing an unset env var resolves to empty string, not an
+    error — caller learns about it via auth failure at request time."""
+    monkeypatch.delenv("NEVER_SET", raising=False)
+    from lyre.runtime.model_registry import ModelEndpoint
+    ep = ModelEndpoint.from_dict({
+        "headers": {"X-Token": "${NEVER_SET}"},
+    })
+    assert dict(ep.headers)["X-Token"] == ""
+
+
+def test_factory_both_modes_can_stack(monkeypatch) -> None:
+    """API key + extra org/project headers is the OpenAI / Anthropic
+    enterprise pattern — both must coexist."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-fake")
+    entry = fake_entry(
+        provider="openai",
+        auth_env="OPENAI_API_KEY",
+        headers=(
+            ("OpenAI-Organization", "org-abc"),
+            ("OpenAI-Project", "proj-123"),
+        ),
+    )
+    adapter = AdapterFactory().make(entry)
+    assert adapter.client.default_headers.get("OpenAI-Organization") == "org-abc"
+    assert adapter.client.default_headers.get("OpenAI-Project") == "proj-123"
+
+
+def test_factory_rejects_when_neither_auth_env_nor_headers(
+    monkeypatch,
+) -> None:
+    """auth_env=None AND headers=() must error — there's no way to
+    authenticate. This is the loud failure that catches a misconfigured
+    config.toml early."""
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    entry = fake_entry(provider="anthropic", auth_env=None, headers=())
+    with pytest.raises(AdapterFactoryError, match="no auth configured"):
+        AdapterFactory().make(entry)
+
+
+def test_factory_header_only_with_anthropic_provider(
+    monkeypatch,
+) -> None:
+    """Same path works for the Anthropic adapter (for users fronting
+    Claude via a custom proxy)."""
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    entry = fake_entry(
+        provider="anthropic",
+        auth_env=None,
+        headers=(("X-Proxy-Token", "abc123"),),
+    )
+    adapter = AdapterFactory().make(entry)
+    from lyre.adapter.anthropic import AnthropicAdapter
+    assert isinstance(adapter, AnthropicAdapter)
+    assert adapter.client.default_headers.get("X-Proxy-Token") == "abc123"
