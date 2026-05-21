@@ -15,7 +15,7 @@ allowed_lyre_tools:
 needs_worktree: false
 model_preference:
   tier: workhorse
-  requires: [tool_use, streaming, long_context_1M]
+  requires: [tool_use, streaming]
   prefer: [anthropic.claude-sonnet-4-6, anthropic.claude-opus-4-7]
 ---
 
