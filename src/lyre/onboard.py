@@ -18,6 +18,7 @@ existing artifact. Headless / scripted setup: hand-edit ``config.toml`` +
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -206,33 +207,47 @@ def write_config_toml(
         lines.append("[[models]]")
         lines.append(f'id = "{_toml_escape(model.id)}"')
         lines.append(f'provider = "{_toml_escape(model.provider)}"')
-        endpoint_inline_parts: list[str] = []
-        if model.endpoint:
-            endpoint_inline_parts.append(
-                f'base_url = "{_toml_escape(model.endpoint)}"'
-            )
-        if model.auth_env:
-            endpoint_inline_parts.append(
-                f'auth_env = "{_toml_escape(model.auth_env)}"'
-            )
-        if endpoint_inline_parts:
-            lines.append(
-                "endpoint = { " + ", ".join(endpoint_inline_parts) + " }"
-            )
-        # Custom headers (header-only mode, or extras stacked on API
-        # key auth). Written as a separate sub-table because inline
-        # TOML can't nest a dict inside a dict cleanly. ${VAR} values
-        # interpolate at registry-load time.
+        # Capabilities + tier MUST come before any sub-tables we add
+        # below — TOML's "sub-tables belong to the most recent header"
+        # rule means anything after `[models.endpoint]` would be read
+        # as part of endpoint, not as part of the model entry.
+        lines.append('capabilities = ["tool_use", "streaming"]')
+        lines.append('tier = "workhorse"')
         if model.headers:
+            # Header-only or stacked auth: write endpoint + nested
+            # headers as proper sub-tables. Inline-table syntax can't
+            # be extended with a sub-table per TOML spec, so we can't
+            # use the compact `endpoint = { ... }` form here.
+            lines.append("[models.endpoint]")
+            if model.endpoint:
+                lines.append(
+                    f'base_url = "{_toml_escape(model.endpoint)}"'
+                )
+            if model.auth_env:
+                lines.append(
+                    f'auth_env = "{_toml_escape(model.auth_env)}"'
+                )
             lines.append("[models.endpoint.headers]")
             for name, value in model.headers:
                 lines.append(
                     f'"{_toml_escape(name)}" = "{_toml_escape(value)}"'
                 )
-        # Sensible defaults for capabilities + tier. Edit in config.toml
-        # later if you need flagship / cheap distinctions.
-        lines.append('capabilities = ["tool_use", "streaming"]')
-        lines.append('tier = "workhorse"')
+        else:
+            # No custom headers: inline-table form is fine and reads
+            # more compactly in the file.
+            endpoint_inline_parts: list[str] = []
+            if model.endpoint:
+                endpoint_inline_parts.append(
+                    f'base_url = "{_toml_escape(model.endpoint)}"'
+                )
+            if model.auth_env:
+                endpoint_inline_parts.append(
+                    f'auth_env = "{_toml_escape(model.auth_env)}"'
+                )
+            if endpoint_inline_parts:
+                lines.append(
+                    "endpoint = { " + ", ".join(endpoint_inline_parts) + " }"
+                )
         lines.append("")
 
     # Stubs for the user to fill in later.
@@ -382,24 +397,41 @@ def run_wizard(*, lyre_home: Path) -> OnboardPlan:
     user_personas_dir = lyre_home / "personas"
 
     click.echo("")
-    click.echo(click.style("Lyre setup", bold=True))
+    click.echo(click.style("━━━ Lyre setup ━━━", bold=True))
+    click.echo(
+        "Three short sections. Press Enter on any prompt to accept the "
+        "default in brackets."
+    )
     click.echo(f"All files land under {lyre_home}.")
     click.echo("")
 
-    # ---- owner identity ----
+    # ---- [1/3] owner identity ----
+    click.echo(click.style("[1/3] Owner identity", bold=True))
+    click.echo(
+        "  Used for the dashboard greeting and any owner-addressed mail."
+    )
     default_name = (
         detect_git_user_name() or os.environ.get("USER") or "owner"
     )
-    owner_name = click.prompt("Owner name", default=default_name).strip() or default_name
+    owner_name = click.prompt(
+        "  Owner name", default=default_name,
+    ).strip() or default_name
 
     default_email = detect_git_user_email() or ""
     owner_email_raw = click.prompt(
-        "Owner email (optional, press Enter to skip)",
+        "  Owner email (optional, press Enter to skip)",
         default=default_email, show_default=bool(default_email),
     ).strip()
     owner_email = owner_email_raw or None
 
-    # ---- models (loop until user picks "done") ----
+    # ---- [2/3] models (loop until user picks "done") ----
+    click.echo("")
+    click.echo(click.style("[2/3] Model endpoints", bold=True))
+    click.echo(
+        "  Configure one or more LLM endpoints. You can mix Anthropic and\n"
+        "  OpenAI-compatible providers, point at proxies, etc. Pick 'Done'\n"
+        "  when finished."
+    )
     models: list[ModelSpec] = []
     api_keys_in_env: list[str] = []
     api_keys_written: list[str] = []
@@ -424,8 +456,7 @@ def run_wizard(*, lyre_home: Path) -> OnboardPlan:
         click.echo("")
         click.echo("Configured models:")
         for i, m in enumerate(models, start=1):
-            endpoint_label = m.endpoint or "(SDK default)"
-            click.echo(f"  {i}) {m.id}  →  {endpoint_label}  [${m.auth_env}]")
+            click.echo(f"  {i}) {_model_summary_line(m)}")
         idx = click.prompt(
             "Which one is the router's default (used when no persona preference matches)?",
             type=click.IntRange(1, len(models)), default=1,
@@ -438,8 +469,11 @@ def run_wizard(*, lyre_home: Path) -> OnboardPlan:
             "or in the persona's frontmatter at ~/.lyre/personas/<name>/identity.md."
         )
 
-    # ---- user.md template ----
+    # ---- [3/3] files ----
     click.echo("")
+    click.echo(click.style("[3/3] Files", bold=True))
+
+    # ---- user.md template ----
     if user_md_path.is_file():
         click.echo(f"  {user_md_path} already exists — leaving untouched.")
     elif click.confirm(
@@ -494,6 +528,32 @@ def run_wizard(*, lyre_home: Path) -> OnboardPlan:
         api_keys_in_env=api_keys_in_env,
         api_keys_written_to_env_file=api_keys_written,
     )
+
+
+def _model_summary_line(m: ModelSpec) -> str:
+    """One-line description of a configured model entry, used in the
+    default-model picker and the final wizard summary. Adapts to the
+    auth mode so header-only entries don't show an empty `[$]`."""
+    endpoint_label = m.endpoint or "(SDK default)"
+    if m.auth_env and m.headers:
+        auth_label = f"key:${m.auth_env} + {len(m.headers)} header(s)"
+    elif m.auth_env:
+        auth_label = f"key:${m.auth_env}"
+    elif m.headers:
+        auth_label = f"{len(m.headers)} custom header(s)"
+    else:
+        auth_label = "(no auth!)"
+    return f"{m.id}  →  {endpoint_label}  [{auth_label}]"
+
+
+# Header names per RFC 7230 §3.2.6 token rule — but we narrow further:
+# letters, digits, hyphen, underscore. Catches typos like "X Token"
+# (space) without rejecting any header name a real provider asks for.
+_HEADER_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
+
+
+def _is_valid_header_name(name: str) -> bool:
+    return bool(_HEADER_NAME_RE.match(name))
 
 
 def _prompt_for_one_model(
@@ -554,9 +614,21 @@ def _prompt_for_one_model(
             default=protocol.default_env_var, show_default=True,
         ).strip() or protocol.default_env_var
     else:
+        click.echo("")
+        click.echo("  Enter HTTP headers one at a time. Blank header-name to finish.")
+        click.echo("  Common patterns:")
         click.echo(
-            "  Enter HTTP headers (blank header-name to finish). Values "
-            "may use ${ENV_VAR} to read from the environment at startup."
+            click.style(
+                "    Authorization        Bearer ${MY_PROXY_TOKEN}\n"
+                "    X-API-Key            ${MY_PROXY_TOKEN}\n"
+                "    X-Internal-JWT       ${INTERNAL_JWT}",
+                fg="cyan",
+            )
+        )
+        click.echo(
+            "  Values may use ${ENV_VAR} (the whole value, not a "
+            "substring) to read from the environment at startup so the\n"
+            "  secret never lands in config.toml."
         )
         while True:
             name = click.prompt(
@@ -564,12 +636,31 @@ def _prompt_for_one_model(
             ).strip()
             if not name:
                 break
+            if not _is_valid_header_name(name):
+                click.echo(
+                    f"  ✗ {name!r} is not a valid header name "
+                    f"(letters/digits/-/_, must start with a letter). "
+                    f"Try again."
+                )
+                continue
             value = click.prompt(
                 f"  Value for {name}", default="", show_default=False,
             ).strip()
             if not value:
                 click.echo("  (empty value — skipped)")
                 continue
+            # Resolve-time check: if the value is a pure ${VAR}, peek
+            # at the env now and warn if it's unset. Doesn't block —
+            # the user might set it later in ~/.lyre/.env.
+            interp = re.match(r"^\$\{([A-Z_][A-Z0-9_]*)\}$", value)
+            if interp:
+                env_name = interp.group(1)
+                if not os.environ.get(env_name):
+                    click.echo(
+                        f"    ⚠ ${env_name} is not currently set — "
+                        f"remember to export it or add it to "
+                        f"{env_path}."
+                    )
             headers.append((name, value))
         if not headers:
             click.echo(
