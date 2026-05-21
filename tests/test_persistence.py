@@ -10,7 +10,7 @@ import asyncio
 
 import pytest
 
-from lyre.persistence.models import MailboxMessage, OutboxRow, Persona, TaskSpec
+from lyre.persistence.models import Blob, MailboxMessage, OutboxRow, Persona, TaskSpec
 from lyre.persistence.sqlite_impl import SqliteRepositories
 
 
@@ -288,3 +288,117 @@ async def test_wakeup_end_records_metering(repos: SqliteRepositories) -> None:
     assert row["end_status"] == "completed"
     assert row["token_input"] == 100
     assert row["transcript_uri"] == "file:///x"
+
+
+# ---------------------------------------------------------------------------
+# Blob metadata (multimodal) — content-addressed binary registry.
+# ---------------------------------------------------------------------------
+
+
+def _fake_blob(blob_id: str = "a" * 64, *, media_type: str = "image/png",
+               size: int = 4096, filename: str | None = "shot.png",
+               source: str = "owner") -> Blob:
+    return Blob(
+        id=blob_id, media_type=media_type, size_bytes=size,
+        filename=filename, source=source,
+    )
+
+
+@pytest.mark.asyncio
+async def test_blob_upsert_and_get(repos: SqliteRepositories) -> None:
+    b = _fake_blob()
+    await repos.blobs.upsert(b)
+    got = await repos.blobs.get(b.id)
+    assert got is not None
+    assert got.id == b.id
+    assert got.media_type == "image/png"
+    assert got.size_bytes == 4096
+    assert got.filename == "shot.png"
+    assert got.source == "owner"
+    assert got.created_at is not None  # set by DB default
+
+
+@pytest.mark.asyncio
+async def test_blob_upsert_idempotent_on_id_conflict(
+    repos: SqliteRepositories,
+) -> None:
+    """Re-uploading identical bytes resolves to the same sha256, so
+    upsert must be a no-op (NOT clobber the existing row's metadata
+    with the new one's filename/source — the first writer wins)."""
+    first = _fake_blob(filename="original.png", source="owner")
+    await repos.blobs.upsert(first)
+    second = _fake_blob(filename="renamed.png", source="dispatcher/1")
+    await repos.blobs.upsert(second)
+    got = await repos.blobs.get(first.id)
+    assert got is not None
+    assert got.filename == "original.png"
+    assert got.source == "owner"
+
+
+@pytest.mark.asyncio
+async def test_blob_exists_and_list_ids(repos: SqliteRepositories) -> None:
+    b1 = _fake_blob(blob_id="a" * 64, filename="one.png")
+    b2 = _fake_blob(blob_id="b" * 64, filename="two.png")
+    await repos.blobs.upsert(b1)
+    await repos.blobs.upsert(b2)
+    assert await repos.blobs.exists(b1.id) is True
+    assert await repos.blobs.exists("c" * 64) is False
+
+    # list_ids preserves request order and silently skips unknowns.
+    out = await repos.blobs.list_ids([b2.id, "missing", b1.id])
+    assert [b.id for b in out] == [b2.id, b1.id]
+
+
+@pytest.mark.asyncio
+async def test_blob_list_ids_empty_returns_empty(
+    repos: SqliteRepositories,
+) -> None:
+    assert await repos.blobs.list_ids([]) == []
+
+
+@pytest.mark.asyncio
+async def test_mailbox_message_roundtrips_attachments(
+    repos: SqliteRepositories,
+) -> None:
+    """The JSON `attachments` column carries a list of blob ids;
+    round-trip through insert_message → get_message must preserve
+    order and identity."""
+    await repos.personas.upsert(
+        Persona(name="dispatcher", role_description="d", system_prompt="d")
+    )
+    await repos.mailbox.ensure_mailbox("worker-maintainer/x")
+    blob_ids = ["a" * 64, "b" * 64]
+    mid = await repos.mailbox.insert_message(
+        MailboxMessage(
+            recipient="worker-maintainer/x",
+            external_id="msg-with-attach",
+            sender="owner",
+            urgency="normal",
+            body="look at this",
+            attachments=blob_ids,
+        )
+    )
+    got = await repos.mailbox.get_message(mid)
+    assert got is not None
+    assert got.attachments == blob_ids
+
+
+@pytest.mark.asyncio
+async def test_mailbox_message_without_attachments_is_none(
+    repos: SqliteRepositories,
+) -> None:
+    """Existing mail with no attachments must still load — the column
+    is NULLable and pre-0002 rows never set it."""
+    await repos.personas.upsert(
+        Persona(name="d", role_description="d", system_prompt="d")
+    )
+    await repos.mailbox.ensure_mailbox("owner")
+    mid = await repos.mailbox.insert_message(
+        MailboxMessage(
+            recipient="owner", external_id="plain",
+            sender="d", urgency="normal", body="hi",
+        )
+    )
+    got = await repos.mailbox.get_message(mid)
+    assert got is not None
+    assert got.attachments is None

@@ -37,7 +37,10 @@ async def test_initial_schema_has_broadcast_columns(tmp_path: Path) -> None:
             "SELECT version FROM schema_migrations ORDER BY version"
         ) as cur:
             versions = [r["version"] for r in await cur.fetchall()]
-        assert versions == [1]
+        # Fresh init runs every shipped migration. Assert presence,
+        # not exact ordinal — keeps the test stable as new migrations
+        # land (0002_blobs, etc.).
+        assert 1 in versions
     finally:
         await conn.close()
 
@@ -46,14 +49,20 @@ async def test_initial_schema_has_broadcast_columns(tmp_path: Path) -> None:
 async def test_migration_runner_idempotent_on_reinit(tmp_path: Path) -> None:
     db = tmp_path / "lyre.db"
     c1 = await init_db(db)
+    async with c1.execute(
+        "SELECT version FROM schema_migrations ORDER BY version"
+    ) as cur:
+        first_versions = [r["version"] for r in await cur.fetchall()]
     await c1.close()
     c2 = await init_db(db)
     try:
         async with c2.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
         ) as cur:
-            versions = [r["version"] for r in await cur.fetchall()]
-        assert versions == [1]
+            second_versions = [r["version"] for r in await cur.fetchall()]
+        # Re-init must NOT add or duplicate rows — the schema_migrations
+        # table is a fixed-point set per init_db call.
+        assert second_versions == first_versions
     finally:
         await c2.close()
 

@@ -13,6 +13,7 @@ from typing import Any, Protocol
 from .models import (
     Agent,
     Artifact,
+    Blob,
     MailboxMessage,
     OutboxRow,
     Persona,
@@ -396,6 +397,25 @@ class LocalHotRepository(Protocol):
     async def clear_task(self, task_id: str) -> None: ...
 
 
+class BlobRepository(Protocol):
+    """Content-addressed binary blobs (images, documents).
+
+    The DB row carries metadata only — bytes live on disk under
+    ``${object_store}/blobs/<sha256>.<ext>``. ``upsert`` is a no-op when
+    the blob id already exists, which is the normal case for any retry
+    or duplicate upload (content-addressed → same bytes → same id).
+    """
+
+    async def upsert(self, blob: Blob) -> None: ...
+    async def get(self, blob_id: str) -> Blob | None: ...
+    async def exists(self, blob_id: str) -> bool: ...
+    async def list_ids(self, blob_ids: list[str]) -> list[Blob]:
+        """Bulk-fetch metadata for a list of ids. Used by mailbox tooling
+        to translate ``attachments=[...]`` into image content blocks
+        without N+1 round-trips."""
+        ...
+
+
 class Repositories(Protocol):
     """Aggregate facade — what business code receives."""
 
@@ -409,3 +429,4 @@ class Repositories(Protocol):
     skills: SkillRepository
     artifacts: ArtifactRepository
     local_hot: LocalHotRepository
+    blobs: BlobRepository

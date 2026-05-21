@@ -21,7 +21,18 @@ class LyreContentBlock:
     # the API rejects with "content[].thinking must be passed back".
     # The signature is the provider's cryptographic seal on the
     # reasoning; pass-through only, don't synthesize.
-    type: Literal["text", "tool_use", "tool_result", "thinking"]
+    #
+    # "image" / "document" blocks reference a blob in the persistence
+    # `blobs` table by `blob_id` (sha256 hex). Adapters resolve the
+    # bytes via the runtime BlobStore at send-time and translate to
+    # the provider's native shape (Anthropic source/base64, OpenAI
+    # image_url, Responses input_image). When the routed model has
+    # no `vision` capability, the agent_loop replaces these blocks
+    # with text placeholders before dispatch — see model_router.
+    type: Literal[
+        "text", "tool_use", "tool_result", "thinking",
+        "image", "document",
+    ]
     text: str | None = None  # reused for both text and thinking content
     tool_use_id: str | None = None
     tool_name: str | None = None
@@ -29,6 +40,14 @@ class LyreContentBlock:
     tool_result: Any = None
     is_error: bool = False
     signature: str | None = None  # only meaningful for type="thinking"
+    # Multimodal: identifies a row in `blobs` (sha256 hex) plus the
+    # media type (`image/png`, `application/pdf`, …). Bytes live on
+    # disk under `${object_store}/blobs/<id>.<ext>`. `filename` is the
+    # original upload name when known — preserved for human display
+    # in the dashboard mail-detail view; not sent to the model.
+    blob_id: str | None = None
+    media_type: str | None = None
+    filename: str | None = None
 
 
 @dataclass

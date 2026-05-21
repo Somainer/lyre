@@ -212,6 +212,33 @@ class MailboxMessage(BaseModel):
     # `mailbox_read` when the agent sees the row, or explicitly by
     # `mark_read`. Owner-side mailbox stays NULL (owner is a human).
     read_at: datetime | None = None
+    # Multimodal (0002_blobs): list of blob ids attached to this message.
+    # Each id is a sha256 hex string and looks up into the `blobs` table
+    # for media_type / on-disk path. Empty/None = no attachments.
+    attachments: list[str] | None = None
+
+
+class Blob(BaseModel):
+    """Content-addressed binary blob (images, documents) referenced by
+    mailbox messages.
+
+    Bytes live on disk at ``${object_store}/blobs/<sha256>.<ext>`` — the
+    DB row only carries metadata. ``id`` is the lowercase hex sha256 of
+    the file contents, so dedup is automatic and the same upload always
+    resolves to the same id.
+
+    Lifecycle: created when (a) owner uploads via dashboard ``/send`` or
+    (b) future tool returns bytes. Agents can only *reference* existing
+    blob ids in ``mailbox_send(attachments=[...])`` — they can't
+    fabricate new ones from base64, so the trust boundary stays clean.
+    """
+
+    id: str
+    media_type: str
+    size_bytes: int
+    filename: str | None = None
+    source: str
+    created_at: datetime | None = None
 
 
 class OutboxRow(BaseModel):
