@@ -8,7 +8,6 @@ import os
 import signal
 import sys
 from datetime import UTC
-from typing import Any
 
 import click
 import structlog
@@ -91,29 +90,10 @@ def onboard_cmd() -> None:
 # lyre serve
 # ----------------------------------------------------------------------
 
-def _model_entry_reachable(entry: Any) -> bool:
-    """An enabled model entry is "reachable" — usable at startup — when
-    its auth config is actually satisfied at this moment:
-
-      * API-key mode (auth_env set): the named env var has a value.
-      * Header-only mode (auth_env None, headers set): at least one
-        header is configured. We don't try to verify the proxy
-        actually accepts it — that would mean issuing a real request
-        at startup, which is too slow and noisy.
-      * Stacked mode (both set): the API key path still has to pass;
-        headers alone can't substitute for the key the SDK expects.
-      * Neither set: not reachable. Adapter factory will refuse this
-        entry at dispatch time too.
-
-    Lifted to module scope (out of serve_cmd) so it's unit-testable —
-    auth_env being Optional was a sharp edge that previously caused a
-    `TypeError: str expected, not NoneType` at `os.getenv(None)` for
-    users running a header-only model config.
-    """
-    auth_env = entry.endpoint.auth_env
-    if auth_env:
-        return bool(os.getenv(auth_env))
-    return bool(entry.endpoint.headers)
+# Backward-compat alias — the original test added in the serve-crash fix
+# imports `_model_entry_reachable` from this module. The implementation
+# now lives in runtime/adapter_factory.py so the router can use it too.
+from .runtime.adapter_factory import entry_reachable as _model_entry_reachable  # noqa: E402
 
 
 @cli.command("serve")

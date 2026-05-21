@@ -25,6 +25,33 @@ class AdapterFactoryError(RuntimeError):
     """Failed to construct an adapter for the given model entry."""
 
 
+def entry_reachable(entry: ModelEntry) -> bool:
+    """Cheap pre-flight: would ``AdapterFactory.make(entry)`` succeed
+    right now?
+
+    Used in two places (kept out of the factory itself so it stays a
+    pure "build OR raise" path):
+
+      * `lyre serve` / `lyre models list` for startup-time
+        reachability hints in the CLI output.
+      * The model router to filter out entries that have no usable
+        auth from the candidate list — so a persona whose `prefer`
+        names a shipped model with no API key configured will still
+        fall through to a user-configured entry that does have auth.
+
+    Rules:
+      * API-key mode (auth_env set): env var must be non-empty.
+      * Header-only mode (auth_env None, headers set): always
+        "reachable" — we don't try to ping the proxy at startup.
+      * Stacked (both set): API key is still required.
+      * Neither set: not reachable (adapter factory will raise too).
+    """
+    auth_env = entry.endpoint.auth_env
+    if auth_env:
+        return bool(os.getenv(auth_env))
+    return bool(entry.endpoint.headers)
+
+
 class AdapterFactory:
     """Stateless: cache-free instantiation. The SDKs (Anthropic / OpenAI) each
     manage their own connection pools, so creating one client per wakeup is

@@ -32,3 +32,19 @@ def object_store(tmp_path: Path) -> Path:
     p = tmp_path / "object_store"
     p.mkdir(parents=True, exist_ok=True)
     return p
+
+
+@pytest.fixture(autouse=True)
+def _default_fake_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The shared `fake_entry()` helper defaults to `auth_env=FAKE_API_KEY`.
+    The router now filters unreachable entries from candidate lists
+    (see lyre/runtime/model_router.py — the second-pass reachability
+    filter), so tests that don't care about auth still need the
+    referenced env var to be set or every candidate gets dropped.
+
+    Set it once here. Tests that DO want to exercise "key missing"
+    behavior (e.g. adapter_factory crash paths, reachability tests)
+    `monkeypatch.delenv("FAKE_API_KEY", raising=False)` inside the
+    test — the monkeypatch's per-test scope reverts cleanly.
+    """
+    monkeypatch.setenv("FAKE_API_KEY", "fake-key-for-tests")

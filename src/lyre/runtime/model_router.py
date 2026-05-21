@@ -24,6 +24,7 @@ from dataclasses import dataclass
 
 import structlog
 
+from .adapter_factory import entry_reachable
 from .health_tracker import HealthTracker
 from .model_registry import ModelEntry, ModelRegistry, Tier
 
@@ -75,6 +76,8 @@ class ModelRouter:
                 )
             return [entry]
 
+        # First pass: requires-capability filter (the persona declares
+        # what features it depends on, e.g. tool_use + streaming).
         candidates = [
             e
             for e in self.registry.enabled()
@@ -85,6 +88,35 @@ class ModelRouter:
                 f"No enabled model in registry supports requires={list(pref.requires)}. "
                 f"Persona tier={pref.tier}. "
                 "Check model_registry.yaml or persona model_preference."
+            )
+
+        # Second pass: drop entries we have no auth for. Without this,
+        # a persona whose `prefer` names a shipped model (e.g.
+        # anthropic.claude-opus-4-7) wins ranking even when
+        # ANTHROPIC_API_KEY is unset — the agent_loop then trips on
+        # adapter_factory and the whole task fails, even though the
+        # user HAS configured a different reachable model. Filtering
+        # at the router lets the user-configured entry (with custom
+        # headers, or a different env var that IS set) bubble up.
+        unreachable = [e for e in candidates if not entry_reachable(e)]
+        candidates = [e for e in candidates if entry_reachable(e)]
+        if not candidates:
+            blocked_ids = ", ".join(e.id for e in unreachable)
+            raise NoEligibleModelError(
+                f"No reachable model can satisfy persona "
+                f"requires={list(pref.requires)} tier={pref.tier}. "
+                f"Entries that match capability-wise but lack auth: "
+                f"{blocked_ids}. Either set the relevant API-key env "
+                f"var, configure custom headers in "
+                f"~/.lyre/config.toml [models.endpoint.headers], or "
+                f"add a different [[models]] entry the router can "
+                f"reach."
+            )
+        if unreachable:
+            log.debug(
+                "model_router_filtered_unreachable",
+                dropped=[e.id for e in unreachable],
+                remaining=[e.id for e in candidates],
             )
 
         prefer_index = {mid: i for i, mid in enumerate(pref.prefer)}
