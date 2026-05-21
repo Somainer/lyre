@@ -18,6 +18,7 @@ from typing import Any
 
 import structlog
 
+from ..integrations import ChannelRegistry
 from ..persistence.models import MailboxMessage, OutboxRow
 from ..persistence.repositories import Repositories
 from ..runtime.kill_switch import KillSwitch
@@ -35,12 +36,20 @@ class OutboxDispatcher:
         batch_limit: int = 50,
         tier1_subscribers: list[str] | None = None,
         kill_switch: KillSwitch | None = None,
+        channel_registry: ChannelRegistry | None = None,
     ):
         self.repos = repos
         self.poll_interval_s = poll_interval_s
         self.batch_limit = batch_limit
         self.tier1_subscribers = tier1_subscribers or list(_TIER1_SUBSCRIBERS_FALLBACK)
         self.kill_switch = kill_switch or KillSwitch()
+        # External-channel routing for `channel_publish` rows. None →
+        # any channel_publish row raises ValueError on dispatch, which
+        # is the correct loud-failure mode if rows got enqueued but no
+        # channels are configured. lyre serve wires the live registry
+        # in; tests use a small in-memory one (or omit when not
+        # exercising channels).
+        self.channel_registry = channel_registry or ChannelRegistry()
         self._stop_event = asyncio.Event()
 
     def request_stop(self) -> None:
@@ -106,6 +115,8 @@ class OutboxDispatcher:
             await self._dispatch_mailbox_send(row)
         elif row.kind == "tier1_notification":
             await self._dispatch_tier1_notification(row)
+        elif row.kind == "channel_publish":
+            await self._dispatch_channel_publish(row)
         else:
             raise ValueError(f"Unknown outbox kind: {row.kind!r}")
 
@@ -149,6 +160,59 @@ class OutboxDispatcher:
                         "details": payload.get("details"),
                     },
                 )
+            )
+
+
+    async def _dispatch_channel_publish(self, row: OutboxRow) -> None:
+        """Mirror an owner-mail to one external channel (Lark / Slack / …).
+
+        Payload shape:
+          channel:               the channel name (matches ExternalChannel.name)
+          msg_id:                the owner-mail row id to publish
+          reply_to_external_id:  optional — channel's own id of the parent
+                                 message, looked up upstream from
+                                 ``parent.metadata.channels.<name>.message_id``
+
+        The dispatch is idempotent at the outbox level (the row's
+        external_id ``channel:<name>:owner-mail:<msg_id>`` ON CONFLICT
+        DO NOTHING'd at enqueue time) AND at the channel side when the
+        implementation chooses to surface a client-side dedup token.
+        On success, the channel returns its message id, which we
+        persist on ``msg.metadata.channels.<name>.message_id`` so a
+        future reply can resolve threading without re-querying the
+        channel's API.
+        """
+        payload = row.payload
+        channel_name = payload.get("channel")
+        msg_id = payload.get("msg_id")
+        if not channel_name or not isinstance(msg_id, int):
+            raise ValueError(
+                f"channel_publish payload missing channel/msg_id: {payload!r}"
+            )
+        channel = self.channel_registry.get(channel_name)
+        if channel is None:
+            raise ValueError(
+                f"channel {channel_name!r} not in registry "
+                f"(known: {self.channel_registry.names()}). Is the "
+                f"channel enabled in [integrations.{channel_name}]?"
+            )
+        msg = await self.repos.mailbox.get_message(msg_id)
+        if msg is None:
+            # The mail row was deleted between enqueue and dispatch.
+            # Nothing to publish; treat as success so the outbox row
+            # gets marked dispatched and we don't retry forever.
+            log.warning(
+                "channel_publish_msg_gone",
+                channel=channel_name, msg_id=msg_id,
+            )
+            return
+        ext_id = await channel.publish_owner_mail(
+            msg,
+            reply_to_external_id=payload.get("reply_to_external_id"),
+        )
+        if ext_id:
+            await self.repos.mailbox.set_channel_external_id(
+                msg_id, channel_name, ext_id,
             )
 
 

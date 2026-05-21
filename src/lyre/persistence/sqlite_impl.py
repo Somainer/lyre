@@ -1091,6 +1091,38 @@ class SqliteMailboxRepository:
             row = await cur.fetchone()
         return self._row_to_msg(row) if row else None
 
+    async def set_channel_external_id(
+        self, msg_id: int, channel_name: str, external_id: str,
+    ) -> None:
+        # Two nested json_set calls — outer ensures `channels` exists as
+        # a JSON object, inner writes the message_id under the named
+        # channel's sub-tree. Other channels' metadata is preserved.
+        # Path syntax: $.channels.<name>.message_id; channel_name is
+        # restricted to [a-z0-9_] by the Protocol convention so it's
+        # safe to interpolate into the path string.
+        if not channel_name.replace("_", "").isalnum():
+            raise ValueError(
+                f"channel name {channel_name!r} contains characters "
+                "that would corrupt the JSON path"
+            )
+        path = f"$.channels.{channel_name}.message_id"
+        ensure_channels = (
+            "json_set(COALESCE(metadata, '{}'), '$.channels', "
+            "COALESCE(json_extract(metadata, '$.channels'), json('{}')))"
+        )
+        ensure_named = (
+            f"json_set({ensure_channels}, '$.channels.{channel_name}', "
+            f"COALESCE(json_extract(metadata, '$.channels.{channel_name}'), "
+            "json('{}')))"
+        )
+        await self.conn.execute(
+            f"UPDATE mailbox_messages "
+            f"SET metadata = json_set({ensure_named}, '{path}', ?) "
+            f"WHERE id = ?",
+            (external_id, msg_id),
+        )
+        await self.conn.commit()
+
     async def get_last_auto_triggered_id(self, recipient: str) -> int:
         await self.ensure_mailbox(recipient)
         async with self.conn.execute(

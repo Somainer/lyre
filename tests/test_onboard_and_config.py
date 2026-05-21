@@ -190,6 +190,46 @@ def test_bootstrap_runtime_uses_custom_dispatcher_id(
     assert (cfg.memory_path / "facts" / "agent-cassandra-notes.md").is_file()
 
 
+def test_config_integrations_lark_disabled_by_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No [integrations.lark] section → channel disabled, runtime
+    skips spawning the bot. Default-off keeps the daemon free of
+    external network calls until the owner explicitly enables."""
+    monkeypatch.setenv("LYRE_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("LARK_APP_ID", raising=False)
+    monkeypatch.delenv("LARK_APP_SECRET", raising=False)
+    (tmp_path / "config.toml").write_text(
+        '[owner]\nname = "o"\n', encoding="utf-8",
+    )
+    cfg = Config.from_env()
+    assert cfg.integrations.lark.enabled is False
+    assert cfg.integrations.lark.authorized_user_id is None
+
+
+def test_config_integrations_lark_reads_toml_plus_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-sensitive fields (enabled, authorized_user_id) load from
+    config.toml; secrets (app_id/app_secret) come from env vars so
+    they stay out of group-readable files."""
+    monkeypatch.setenv("LYRE_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("LARK_APP_ID", "cli_abc")
+    monkeypatch.setenv("LARK_APP_SECRET", "shh-secret")
+    (tmp_path / "config.toml").write_text(
+        '[owner]\nname = "o"\n\n[integrations.lark]\n'
+        'enabled = true\nauthorized_user_id = "ou_xyz"\n',
+        encoding="utf-8",
+    )
+    cfg = Config.from_env()
+    assert cfg.integrations.lark.enabled is True
+    assert cfg.integrations.lark.authorized_user_id == "ou_xyz"
+    assert cfg.integrations.lark.app_id == "cli_abc"
+    assert cfg.integrations.lark.app_secret == "shh-secret"
+
+
 def test_config_max_concurrent_tasks_defaults_to_four(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
