@@ -100,12 +100,28 @@ class DashboardBroadcaster:
 
     async def stop(self) -> None:
         self._stop_event.set()
+        # Wake every subscribed SSE handler IMMEDIATELY (None sentinel
+        # on each queue). Without this, uvicorn's graceful shutdown
+        # waits for handlers to notice via their queue.get timeout —
+        # several seconds of "exit hangs" on Ctrl-C.
+        self._wake_subscribers_for_shutdown()
         if self._task is not None:
             try:
                 await self._task
             except asyncio.CancelledError:
                 pass
             self._task = None
+
+    def _wake_subscribers_for_shutdown(self) -> None:
+        for q in list(self._subscribers):
+            try:
+                q.put_nowait(None)  # type: ignore[arg-type]
+            except asyncio.QueueFull:
+                try:
+                    q.get_nowait()
+                    q.put_nowait(None)  # type: ignore[arg-type]
+                except (asyncio.QueueEmpty, asyncio.QueueFull):
+                    pass
 
     async def _loop(self) -> None:
         log.info(

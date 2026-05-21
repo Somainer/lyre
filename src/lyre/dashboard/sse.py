@@ -69,12 +69,35 @@ class MailboxBroadcaster:
 
     async def stop(self) -> None:
         self._stop_event.set()
+        # Wake every subscribed SSE handler IMMEDIATELY so they exit
+        # cleanly instead of sitting in queue.get for their 2s timeout.
+        # Without this, uvicorn's graceful shutdown waits for those
+        # blocked handlers to drain — visible as several seconds of
+        # "exit hangs" on Ctrl-C.
+        self._wake_subscribers_for_shutdown()
         if self._task is not None:
             try:
                 await self._task
             except asyncio.CancelledError:
                 pass
             self._task = None
+
+    def _wake_subscribers_for_shutdown(self) -> None:
+        """Drop a None sentinel onto every subscribed queue. SSE handlers
+        treat None as "broadcaster is going away; exit your drain loop."
+        """
+        for q in list(self._subscribers):
+            try:
+                q.put_nowait(None)  # type: ignore[arg-type]
+            except asyncio.QueueFull:
+                # Make room — full queue means a slow subscriber that's
+                # about to be torn down anyway; we just need them to
+                # wake at least once.
+                try:
+                    q.get_nowait()
+                    q.put_nowait(None)  # type: ignore[arg-type]
+                except (asyncio.QueueEmpty, asyncio.QueueFull):
+                    pass
 
     async def _loop(self) -> None:
         log.info(
