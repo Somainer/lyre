@@ -12,7 +12,7 @@ from datetime import UTC
 import click
 import structlog
 
-from .config import Config, load_dotenv_chain
+from .config import Config, load_dotenv_chain, lyre_home
 from .outbox.dispatcher import OutboxDispatcher
 from .persistence.db import init_db
 from .persistence.models import MailboxMessage, TaskSpec
@@ -132,6 +132,34 @@ def serve_cmd(
         # actually authenticate before starting, so we fail loudly here
         # instead of silently on the first dispatched task.
         registry = load_registry_for_config(cfg)
+        # Make registry provenance visible at startup. The most common
+        # config-not-loading symptom (file at wrong path, [[models]]
+        # under wrong section, missing config.toml) used to show up as
+        # a confusing NoEligibleModelError listing only SHIPPED entries
+        # — this log line explains why before that error fires.
+        if cfg.models:
+            click.echo(
+                f"Loaded {len(cfg.models)} model entr"
+                f"{'y' if len(cfg.models) == 1 else 'ies'} from "
+                f"{lyre_home() / 'config.toml'}; shipped defaults "
+                "ignored."
+            )
+            for m in cfg.models:
+                ep = m.endpoint or {}
+                auth_summary = (
+                    "$" + ep["auth_env"] if ep.get("auth_env")
+                    else (
+                        f"{len(ep.get('headers', {}))} header(s)"
+                        if ep.get("headers") else "(no auth!)"
+                    )
+                )
+                click.echo(f"  • {m.id} [{m.tier}, {auth_summary}]")
+        else:
+            click.echo(
+                f"No [[models]] in {lyre_home() / 'config.toml'} "
+                "(file missing or empty) — using shipped registry "
+                "defaults. Run `lyre onboard` to configure your own."
+            )
         candidates = registry.enabled()
         if cfg.model_override:
             candidates = [e for e in candidates if e.id == cfg.model_override]

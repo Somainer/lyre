@@ -125,23 +125,38 @@ def test_factory_header_only_mode_builds_adapter(monkeypatch) -> None:
 
 
 def test_factory_header_value_interpolates_env_var(monkeypatch) -> None:
-    """Header values may use ${ENV_VAR} so secrets stay out of
-    config.toml. Interpolation runs at registry-load time (in
-    ModelEndpoint.from_dict)."""
+    """Header values use shell-style ${ENV_VAR} so secrets stay out of
+    config.toml. Substitution applies to every ${NAME} occurrence in
+    the value — supports the common `Bearer ${TOKEN}` pattern."""
     monkeypatch.setenv("PROXY_TOKEN", "secret-jwt")
     from lyre.runtime.model_registry import ModelEndpoint
-    ep = ModelEndpoint.from_dict({
-        "headers": {"Authorization": "Bearer ${PROXY_TOKEN}"},
-    })
-    # The whole value must be the placeholder for interpolation to fire
-    # — `"Bearer ${PROXY_TOKEN}"` is a partial placeholder, so it
-    # stays as-is. Test the pure form (`"${PROXY_TOKEN}"`).
+
+    # Whole-value placeholder
     ep_pure = ModelEndpoint.from_dict({
         "headers": {"X-Auth": "${PROXY_TOKEN}"},
     })
     assert dict(ep_pure.headers)["X-Auth"] == "secret-jwt"
-    # And the partial form survives unchanged.
-    assert dict(ep.headers)["Authorization"] == "Bearer ${PROXY_TOKEN}"
+
+    # Partial placeholder — the standard `Authorization: Bearer …` form
+    ep_partial = ModelEndpoint.from_dict({
+        "headers": {"Authorization": "Bearer ${PROXY_TOKEN}"},
+    })
+    assert (
+        dict(ep_partial.headers)["Authorization"] == "Bearer secret-jwt"
+    )
+
+    # Multiple placeholders in one value
+    monkeypatch.setenv("ORG", "acme")
+    ep_multi = ModelEndpoint.from_dict({
+        "headers": {"X-Org-Token": "${ORG}/${PROXY_TOKEN}"},
+    })
+    assert dict(ep_multi.headers)["X-Org-Token"] == "acme/secret-jwt"
+
+    # Literal `$` survives when not in `${…}` form
+    ep_lit = ModelEndpoint.from_dict({
+        "headers": {"X-Plain": "$NOT_A_PLACEHOLDER"},
+    })
+    assert dict(ep_lit.headers)["X-Plain"] == "$NOT_A_PLACEHOLDER"
 
 
 def test_factory_header_interpolation_missing_env_is_empty(
