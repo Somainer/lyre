@@ -32,35 +32,44 @@
   </div>
 
   <div class="card">
-    <div style="display:grid;grid-template-columns:80px 180px 1fr 100px;gap:var(--s-4);padding:var(--s-2) var(--s-4);font-size:var(--t-micro);color:var(--fg-3);text-transform:uppercase;letter-spacing:0.04em;border-bottom:1px solid var(--line-1);">
-      <div>urgency</div><div>from → to</div><div>title · preview</div><div style="text-align:right;">delivered · id</div>
+    <div class="mail-row-head">
+      <div>urgency</div><div>from → to</div><div>title · preview</div><div style="text-align:right;">delivered · id</div><div></div>
     </div>
     {% if messages %}
       {% for m in messages %}
-        <a class="mail-row{% if not m.read_at %} is-unread{% endif %}"
-           href="/send?reply_to={{ m.id }}"
-           style="text-decoration:none;color:inherit;">
+        {# Row is a <div>, not an <a>. The previous design wrapped the
+           whole row in a link to /send?reply_to=, which made selecting
+           the body text impossible (every drag became a click that
+           navigated away). The actual user need is copying text out —
+           so the body is now freely selectable, and reply is one
+           explicit icon button on the right. #}
+        <div class="mail-row{% if not m.read_at %} is-unread{% endif %}">
           <div>{{ urgency_chip(m.urgency) }}</div>
           <div class="who">
             {{ agent_id_pill(m.sender, size='sm', dim=True) }}
             <span class="arrow">→</span>
             {{ agent_id_pill(m.recipient, size='sm', dim=True) }}
           </div>
-          <div>
+          <div class="mail-content">
             <div class="mail-title">
               {% if not m.read_at %}<span class="unread-dot" aria-label="unread"></span>{% endif %}
               {{ m.title or "(no title)" }}
             </div>
             {% if m.body %}
-              <details class="mail-body-fold" data-fold-id="mail-{{ m.id }}"
-                       onclick="event.stopPropagation();">
+              <details class="mail-body-fold" data-fold-id="mail-{{ m.id }}">
                 <summary class="mail-preview">show body ({{ m.body|length }} chars)</summary>
-                <div class="md-body" style="padding:var(--s-3) 0 0;">{{ m.body | markdown }}</div>
+                <div class="md-body mail-body-selectable">{{ m.body | markdown }}</div>
               </details>
             {% endif %}
           </div>
           <div class="when">{{ m.delivered_at | rel_time }}<br><span class="dim">#{{ m.id }}</span></div>
-        </a>
+          <a class="btn ghost sm mail-reply-btn"
+             href="/send?reply_to={{ m.id }}"
+             title="Reply"
+             aria-label="Reply">
+            {{ glyph("reply", 12) }}
+          </a>
+        </div>
       {% endfor %}
     {% else %}
       <p class="empty">

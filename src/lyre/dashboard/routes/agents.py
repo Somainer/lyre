@@ -172,6 +172,7 @@ async def agent_detail(
             # the broadcaster pushes only events involving them.
             "sse_agent_id": agent_id,
             "sse_minutes": minutes,
+            "sse_events": "activity,agent-status,health",
         },
     )
 

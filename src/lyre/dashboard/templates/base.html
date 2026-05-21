@@ -20,8 +20,14 @@
    so the activity event is scoped to that agent.
    `minutes` is set by the {body_minutes} context var (defaults to 30
    for global, overridden per agent_detail view). #}
+{# Default = topnav widgets only (health + agent-status). Pages that
+   render heavier sse-swap targets (Home: stats; Activity / agent_detail:
+   activity) opt IN via their own sse_events setting. Mail / Runs / Agents
+   / Send stick with the default so they don't pay for fragments they
+   don't display. #}
+{% set _events = sse_events|default('agent-status,health') %}
 <body hx-ext="sse"
-      sse-connect="/sse/dashboard{% if sse_agent_id %}?agent_id={{ sse_agent_id }}{% endif %}{% if sse_minutes %}{% if sse_agent_id %}&{% else %}?{% endif %}minutes={{ sse_minutes }}{% endif %}">
+      sse-connect="/sse/dashboard?events={{ _events }}{% if sse_agent_id %}&agent_id={{ sse_agent_id }}{% endif %}{% if sse_minutes %}&minutes={{ sse_minutes }}{% endif %}">
 {% from "_macros.html" import glyph, live_dot %}
 <div class="app">
   <nav class="topnav">

@@ -495,16 +495,26 @@ code, pre, .mono { font-family: var(--font-mono); }
 /* =========================================================
    Mail row (Inbox / Feed list)
    ========================================================= */
-.mail-row {
+.mail-row,
+.mail-row-head {
   display: grid;
-  grid-template-columns: 80px 180px 1fr 100px;
+  grid-template-columns: 80px 180px 1fr 100px 36px;
   gap: var(--s-4);
   padding: var(--s-3) var(--s-4);
   border-bottom: 1px solid var(--line-1);
-  cursor: pointer;
-  transition: background 80ms ease;
   align-items: start;
 }
+.mail-row-head {
+  padding: var(--s-2) var(--s-4);
+  font-size: var(--t-micro);
+  color: var(--fg-3);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+/* No cursor:pointer on the row anymore — clicking text should select,
+   not navigate. The reply icon is the only clickable affordance for
+   navigation; the title summary toggles the body fold. */
+.mail-row { cursor: default; }
 .mail-row:hover { background: var(--bg-raised); }
 .mail-row.is-unread .mail-title { color: var(--fg-1); font-weight: 500; }
 .mail-row.is-unread::before { /* unread bar */
@@ -543,6 +553,23 @@ code, pre, .mono { font-family: var(--font-mono); }
   text-align: right;
   font-variant-numeric: tabular-nums;
 }
+.mail-row .mail-content { min-width: 0; }
+/* Body fold — selectable plain content. The summary is the click
+   target (toggle expand); cursor is default elsewhere so dragging
+   actually selects. */
+.mail-row .mail-body-fold > summary { cursor: pointer; }
+.mail-row .mail-body-fold > .md-body { cursor: text; user-select: text; }
+.mail-row .mail-body-selectable {
+  white-space: pre-wrap;
+  word-break: break-word;
+  user-select: text;
+}
+.mail-row .mail-reply-btn {
+  align-self: start;
+  padding: 4px 6px;
+  color: var(--fg-3);
+}
+.mail-row .mail-reply-btn:hover { color: var(--fg-1); background: var(--bg-raised); }
 
 /* =========================================================
    ACTIVITY view — chat-style timeline

@@ -329,11 +329,10 @@ def test_mail_filters_to_blocker_band(
     assert r.status_code == 200
     body = r.text
     assert "STOP, awaiting decision" in body
-    # mail-row markup wraps each row; "status update" was urgency=normal
-    # so it should NOT appear in the rendered list (it may still appear
-    # in script literals, so anchor on the mail-row class).
-    assert 'href="/send?reply_to=' in body  # at least one row rendered
-    rows = body.count('class="mail-row')
+    # Count actual data rows (not the column-header row which shares
+    # the `mail-row` substring via `mail-row-head`). The reply icon's
+    # href is unique-per-row, so we can count those instead.
+    rows = body.count('class="btn ghost sm mail-reply-btn"')
     assert rows == 1, f"blocker band should leave exactly 1 row, got {rows}"
 
 
