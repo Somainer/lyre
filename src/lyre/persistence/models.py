@@ -216,6 +216,11 @@ class MailboxMessage(BaseModel):
     # Each id is a sha256 hex string and looks up into the `blobs` table
     # for media_type / on-disk path. Empty/None = no attachments.
     attachments: list[str] | None = None
+    # Reactions (0005_mail_reactions): hydrated by `get_message`, NOT by
+    # listing endpoints — the inbox view stays minimal. None vs empty
+    # list distinguishes "we didn't bother loading" from "loaded, no
+    # reactions yet" so the dashboard can render accordingly.
+    reactions: list[MailReaction] | None = None
 
 
 class Blob(BaseModel):
@@ -238,6 +243,29 @@ class Blob(BaseModel):
     size_bytes: int
     filename: str | None = None
     source: str
+    created_at: datetime | None = None
+
+
+ReactionKind = Literal["ack"]
+
+
+class MailReaction(BaseModel):
+    """A lightweight ack marker on one mailbox_messages row.
+
+    Reactions live in their own table (`mail_reactions`) precisely so
+    they DON'T behave like mail: no unread count, no Phase 0 auto-wake,
+    no inbox-listing slot. The point is to give an agent a way to say
+    "saw it, no further action" that *doesn't* force the other side into
+    a reply — breaking the handshake-storm pattern where two polite
+    agents bounce "收到 / closing" off each other indefinitely.
+
+    Visible to the original sender via `get_message(msg_id)` (which
+    embeds the reactions list) and on the dashboard's mail-detail view.
+    """
+
+    msg_id: int
+    reactor: str
+    kind: ReactionKind = "ack"
     created_at: datetime | None = None
 
 

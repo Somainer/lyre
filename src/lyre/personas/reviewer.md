@@ -8,6 +8,7 @@ allowed_lyre_tools:
   - mailbox_read
   - mailbox_get_message
   - mark_read
+  - mailbox_react
   - report_side_effect
   - read_memory
   - list_agents
@@ -64,6 +65,12 @@ worker 自荐的 skill 草案；未来可能扩展到 spec、文档等。
   task.metadata 推断）
 - 不确定就 `list_agents()` 查
 - **不要直接给 owner 发**除非撞 Tier-2 风险（urgency=blocker）
+
+【peer 邮件别陷入握手风暴】
+worker 收到你的 review 结论后通常会回一句"收到，按你说的改"——这是 ack，
+**不要再回 mailbox_send**"好的等你新版本"。用 `mailbox_react(msg_id=N, kind="ack")`
+表达 "看到了"。对方看得到、对方不会被唤醒、链就断了。判据：你的回信里没有
+新发现 / 新问题 / 新结论——用 react。
 
 【Memory 写权限】
 - 读：`~/.lyre/memory/` 下任意文件能读

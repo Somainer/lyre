@@ -572,6 +572,50 @@ async def _mark_read(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
     return {"status": "ok", "recipient": ctx.self_mailbox, "msg_ids": ids}
 
 
+_ALLOWED_REACTION_KINDS = ("ack",)
+
+
+async def _mailbox_react(
+    ctx: ToolContext, args: dict[str, Any]
+) -> dict[str, Any]:
+    """Leave a reaction on someone else's message.
+
+    Reactions are deliberately NOT mail: no new mailbox row, no unread
+    count change, no Phase 0 auto-wake. The original sender sees it
+    next time they pull `mailbox_get_message(msg_id)` or open the
+    dashboard mail-detail view.
+
+    Use this — instead of `mailbox_send` — when the polite response is
+    "saw it, no further action". Avoids the handshake-storm pattern
+    (A → B 'closing' → A 'ok, closing too' → B 'understood, closing' → …).
+    """
+    msg_id = args.get("msg_id")
+    if not isinstance(msg_id, int):
+        raise ToolError("msg_id must be an integer")
+    kind = args.get("kind", "ack")
+    if kind not in _ALLOWED_REACTION_KINDS:
+        raise ToolError(
+            f"kind must be one of {list(_ALLOWED_REACTION_KINDS)}; got {kind!r}"
+        )
+
+    # Validate the target exists — surface typos / hallucinated ids the
+    # same way mailbox_send does, instead of silently inserting an FK
+    # error or a dangling reaction.
+    target = await ctx.repos.mailbox.get_message(msg_id)
+    if target is None:
+        raise ToolError(f"no mail with id={msg_id}")
+
+    inserted = await ctx.repos.mailbox.add_reaction(
+        msg_id=msg_id, reactor=ctx.self_mailbox, kind=kind,
+    )
+    return {
+        "status": "ok" if inserted else "already_reacted",
+        "msg_id": msg_id,
+        "kind": kind,
+        "reactor": ctx.self_mailbox,
+    }
+
+
 MAILBOX_SEND = Tool(
     name="mailbox_send",
     description=(
@@ -796,6 +840,41 @@ MARK_READ = Tool(
         "required": ["msg_id"],
     },
     handler=_mark_read,
+)
+
+
+MAILBOX_REACT = Tool(
+    name="mailbox_react",
+    description=(
+        "React to a message you received — a lightweight ack that the "
+        "sender can see but does NOT wake them or take a mailbox slot. "
+        "Use this for 'saw it, no further action' instead of replying "
+        "with another mailbox_send, which would only invite another "
+        "polite ack and start a handshake loop. Currently the only "
+        "kind is 'ack'."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "msg_id": {
+                "type": "integer",
+                "description": "The mailbox_messages.id you're reacting to.",
+            },
+            "kind": {
+                "type": "string",
+                "enum": list(_ALLOWED_REACTION_KINDS),
+                "default": "ack",
+                "description": (
+                    "Reaction kind. Today only 'ack' (= 'I saw your "
+                    "message, no reply needed'). The vocabulary stays "
+                    "narrow on purpose — pick a richer signal only when "
+                    "ack is genuinely the wrong word."
+                ),
+            },
+        },
+        "required": ["msg_id"],
+    },
+    handler=_mailbox_react,
 )
 
 

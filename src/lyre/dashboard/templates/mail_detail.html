@@ -39,6 +39,22 @@
     <div class="md-body">{{ msg.body | markdown }}</div>
   </div>
 
+  {# Reactions — lightweight acks on this message. Surfaced inline so
+     the sender can see "B has ack'd this" without an unread mail. #}
+  {% if msg.reactions %}
+  <div style="margin-top:var(--s-3);display:flex;flex-wrap:wrap;gap:var(--s-2);align-items:center;">
+    <span style="font-size:var(--t-micro);text-transform:uppercase;letter-spacing:0.06em;color:var(--fg-3);">
+      Reactions
+    </span>
+    {% for r in msg.reactions %}
+      <span class="meta-pill dim"
+            title="{{ r.reactor }} reacted with {{ r.kind }} at {{ r.created_at }}">
+        {{ r.reactor }} · {{ r.kind }}
+      </span>
+    {% endfor %}
+  </div>
+  {% endif %}
+
   {# Attachments — content-addressed blobs served via /blobs/<id>.
      Images render inline; PDFs / unknown types show as a download
      link with media type + size. #}
