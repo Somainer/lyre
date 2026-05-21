@@ -61,17 +61,10 @@ PROTOCOLS: tuple[ProviderProtocol, ...] = (
     ),
     ProviderProtocol(
         key="openai",
-        display="OpenAI Chat Completions (OpenAI API, OpenRouter, Together, DeepSeek-OAI, vLLM-OAI, …)",
+        display="OpenAI-compatible (OpenAI API, OpenRouter, Together, DeepSeek-OAI, vLLM-OAI, …)",
         default_endpoint="https://api.openai.com/v1",
         default_env_var="OPENAI_API_KEY",
         default_model="gpt-4o",
-    ),
-    ProviderProtocol(
-        key="openai-responses",
-        display="OpenAI Responses API (POST /v1/responses — newer surface; some corporate gateways)",
-        default_endpoint="https://api.openai.com/v1",
-        default_env_var="OPENAI_API_KEY",
-        default_model="gpt-5",
     ),
 )
 
@@ -101,6 +94,9 @@ class ModelSpec:
     endpoint: str      # base_url; "" / None means "use SDK default"
     auth_env: str      # env-var name; empty string for header-only mode
     headers: tuple[tuple[str, str], ...] = ()
+    # Only meaningful when provider == "openai" — picks Chat Completions
+    # vs Responses dialect. Empty / "chat-completions" → standard path.
+    api: str = "chat-completions"
 
 
 # ---------------------------------------------------------------------------
@@ -220,11 +216,19 @@ def write_config_toml(
         # as part of endpoint, not as part of the model entry.
         lines.append('capabilities = ["tool_use", "streaming"]')
         lines.append('tier = "workhorse"')
-        if model.headers:
-            # Header-only or stacked auth: write endpoint + nested
-            # headers as proper sub-tables. Inline-table syntax can't
-            # be extended with a sub-table per TOML spec, so we can't
-            # use the compact `endpoint = { ... }` form here.
+        # `api` only matters for the OpenAI family. Default is
+        # "chat-completions"; only write it when non-default to keep
+        # the file uncluttered for the common case.
+        non_default_api = (
+            model.provider == "openai"
+            and (model.api or "chat-completions") != "chat-completions"
+        )
+        if model.headers or non_default_api:
+            # Header-only / stacked auth OR a non-default `api` value:
+            # write endpoint + nested headers as proper sub-tables.
+            # Inline-table syntax can't be extended with a sub-table
+            # per TOML spec, so we can't use the compact
+            # `endpoint = { ... }` form here.
             lines.append("[models.endpoint]")
             if model.endpoint:
                 lines.append(
@@ -234,14 +238,17 @@ def write_config_toml(
                 lines.append(
                     f'auth_env = "{_toml_escape(model.auth_env)}"'
                 )
-            lines.append("[models.endpoint.headers]")
-            for name, value in model.headers:
-                lines.append(
-                    f'"{_toml_escape(name)}" = "{_toml_escape(value)}"'
-                )
+            if non_default_api:
+                lines.append(f'api = "{_toml_escape(model.api)}"')
+            if model.headers:
+                lines.append("[models.endpoint.headers]")
+                for name, value in model.headers:
+                    lines.append(
+                        f'"{_toml_escape(name)}" = "{_toml_escape(value)}"'
+                    )
         else:
-            # No custom headers: inline-table form is fine and reads
-            # more compactly in the file.
+            # No custom headers + default `api`: inline-table form is
+            # fine and reads more compactly in the file.
             endpoint_inline_parts: list[str] = []
             if model.endpoint:
                 endpoint_inline_parts.append(
@@ -594,6 +601,22 @@ def _prompt_for_one_model(
         return None
 
     protocol = PROTOCOLS[choice - 1]
+
+    # Within the OpenAI family, ask the API dialect. Anthropic has one
+    # shape today so no sub-question. Default is the historical
+    # chat-completions surface; "responses" is opt-in for users on the
+    # newer /v1/responses endpoint (some corporate gateways).
+    api = "chat-completions"
+    if protocol.key == "openai":
+        click.echo("")
+        click.echo("  Which OpenAI API surface does this endpoint expose?")
+        click.echo("    1) Chat Completions (POST /v1/chat/completions) — default")
+        click.echo("    2) Responses        (POST /v1/responses)        — newer; some gateways")
+        api_choice = click.prompt(
+            "  Choice", type=click.IntRange(1, 2), default=1,
+        )
+        api = "responses" if api_choice == 2 else "chat-completions"
+
     endpoint = click.prompt(
         "  Endpoint URL",
         default=protocol.default_endpoint, show_default=True,
@@ -687,6 +710,7 @@ def _prompt_for_one_model(
         endpoint=normalized_endpoint,
         auth_env=env_var,
         headers=tuple(headers),
+        api=api,
     )
 
     # API key handling — only when API-key mode is selected and only

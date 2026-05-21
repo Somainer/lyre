@@ -426,6 +426,85 @@ def test_config_loader_round_trips_multiple_models(
     assert cfg.default_model == "openai.gpt-4o-mini"
 
 
+def test_write_config_toml_emits_api_responses_when_non_default(
+    tmp_path: Path,
+) -> None:
+    """When ModelSpec.api='responses', the written config.toml must
+    surface it under [models.endpoint] so the loader and adapter
+    factory route to OpenAIResponsesAdapter."""
+    cfg = tmp_path / "config.toml"
+    spec = ModelSpec(
+        id="openai.proxy-gpt5",
+        provider="openai",
+        endpoint="https://gateway.internal/responses",
+        auth_env="PROXY_API_KEY",
+        api="responses",
+    )
+    write_config_toml(
+        cfg, owner_name="Alice", owner_email=None,
+        models=[spec], default_model=spec.id,
+    )
+    text = cfg.read_text(encoding="utf-8")
+    active = _strip_comments(text)
+    assert 'api = "responses"' in active
+    assert "[models.endpoint]" in active
+    assert 'base_url = "https://gateway.internal/responses"' in active
+
+
+def test_write_config_toml_omits_api_when_default(tmp_path: Path) -> None:
+    """`api` field is opt-in noise — for the standard chat-completions
+    dialect we should NOT clutter config.toml with a redundant
+    `api = "chat-completions"` line."""
+    cfg = tmp_path / "config.toml"
+    spec = ModelSpec(
+        id="openai.gpt-4o",
+        provider="openai",
+        endpoint="",
+        auth_env="OPENAI_API_KEY",
+        # api defaults to "chat-completions"
+    )
+    write_config_toml(
+        cfg, owner_name="Alice", owner_email=None,
+        models=[spec], default_model=spec.id,
+    )
+    active = _strip_comments(cfg.read_text(encoding="utf-8"))
+    assert "api = " not in active
+
+
+def test_config_loader_round_trips_endpoint_api_responses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end: ModelSpec(api='responses') → config.toml → Config
+    loader preserves the field so the runtime registry sees
+    `endpoint.api='responses'`."""
+    monkeypatch.setenv("LYRE_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    spec = ModelSpec(
+        id="openai.proxy-gpt5",
+        provider="openai",
+        endpoint="https://gateway.internal/responses",
+        auth_env="PROXY_API_KEY",
+        api="responses",
+    )
+    write_config_toml(
+        tmp_path / "config.toml",
+        owner_name="Alice", owner_email=None,
+        models=[spec], default_model=spec.id,
+    )
+
+    cfg = Config.from_env()
+    assert len(cfg.models) == 1
+    m = cfg.models[0]
+    assert m.endpoint["api"] == "responses"
+
+    # And the runtime registry routes through OpenAIResponsesAdapter.
+    from lyre.runtime.model_registry import load_registry_for_config
+    reg = load_registry_for_config(cfg)
+    entry = reg.by_id("openai.proxy-gpt5")
+    assert entry is not None
+    assert entry.endpoint.api == "responses"
+
+
 def test_write_config_toml_escapes_quotes_in_name(tmp_path: Path) -> None:
     cfg = tmp_path / "config.toml"
     write_config_toml(cfg, owner_name='Eve "the" Owner', owner_email=None)
@@ -473,16 +552,17 @@ def test_append_env_line_adds_new_key_alongside_existing(tmp_path: Path) -> None
 # ---------------------------------------------------------------------------
 
 
-def test_protocols_cover_three_compatible_protocols() -> None:
-    """Three slots:
+def test_protocols_cover_two_compatible_protocols() -> None:
+    """Two top-level provider slots:
       * Anthropic-compatible — /v1/messages shape (Claude API et al.)
-      * OpenAI Chat Completions — /v1/chat/completions (OpenAI proper,
-        DeepSeek-OAI, OpenRouter, vLLM-OAI, …)
-      * OpenAI Responses API — /v1/responses (newer surface, internal
-        corporate gateways like bytedance ai-coder)
+      * OpenAI-compatible — covers both Chat Completions (OpenAI proper,
+        DeepSeek-OAI, OpenRouter, vLLM-OAI, …) and the Responses API
+        (newer surface, internal gateways like bytedance ai-coder).
+        Dialect is picked by `endpoint.api`, asked as a sub-question
+        in the wizard — NOT a separate protocol.
     Anything else is just a custom endpoint over one of these."""
     keys = {p.key for p in PROTOCOLS}
-    assert keys == {"anthropic", "openai", "openai-responses"}
+    assert keys == {"anthropic", "openai"}
 
 
 def test_can_reach_env_var_detects_missing(
