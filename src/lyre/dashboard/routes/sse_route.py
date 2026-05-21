@@ -167,6 +167,14 @@ async def sse_dashboard(
 ):
     """Push rendered HTML fragments whenever the relevant tables change.
 
+    **No initial render.** The page route already renders each fragment
+    inline via `{% include "partials/..." %}`, so the browser tab shows
+    current data the moment HTML arrives. An "initial render" here
+    would re-run ~30 sequential repo queries on the single aiosqlite
+    connection at the worst possible time (right when the user clicked
+    a heavy page like Mail and the broadcasters + scheduler are also
+    polling), starving every other coroutine. We push only deltas.
+
     Query params:
       agent_id   — when set, the `activity` event renders the per-agent
                    scoped timeline (transcript included). When None, the
@@ -177,21 +185,43 @@ async def sse_dashboard(
     bc = getattr(request.app.state, "dashboard_broadcaster", None)
 
     async def event_stream():
-        # 1. Initial render — send all four fragments so the page is
-        #    consistent on connect. Browsers that just opened the tab
-        #    don't have to wait for the first real change to populate.
-        for event, renderer in _RENDERERS.items():
-            try:
-                html = await renderer(request, agent_id, minutes)
-                yield _sse_format(event, html)
-            except Exception:  # noqa: BLE001
-                # Skip a single broken fragment rather than tear down
-                # the whole stream — the rest still works.
-                continue
+        # Fire one immediate keepalive comment so the browser sees the
+        # response headers + body byte right away (otherwise some
+        # proxies / browsers wait for the first event before flipping
+        # the EventSource to OPEN). Costs nothing.
+        yield ": connected\n\n"
 
-        # 2. Subscribe and forward change-event sets. If no broadcaster is
-        #    attached (tests / minimal embedding) we just keepalive — the
-        #    initial render still made it through.
+        # Cheap initial render: the topnav widgets (health pill,
+        # agent-status badge) appear on EVERY page and would otherwise
+        # stay at their "checking…" placeholder until the first change.
+        # Both share a single DB query (list_active_wakeups), so this
+        # is a one-query connect overhead — not the 30-query burst the
+        # full initial render was. The expensive fragments
+        # (stats / activity) skip this path: they're only shown on
+        # their own pages and the page route already inlines them.
+        try:
+            repos = request.app.state.repos
+            active = await list_active_wakeups(repos)
+            templates = request.app.state.templates
+            yield _sse_format(
+                EVENT_HEALTH,
+                templates.get_template("partials/health.html").render(
+                    active_count=len(active),
+                ),
+            )
+            yield _sse_format(
+                EVENT_AGENT_STATUS,
+                templates.get_template("partials/agent_status.html").render(
+                    active_wakeups=active,
+                ),
+            )
+        except Exception:  # noqa: BLE001
+            # Don't tear the stream down for a single broken initial
+            # render — the subsequent change events will repopulate.
+            pass
+
+        # No broadcaster attached (tests / minimal embedding) — just
+        # keepalive until the client disconnects.
         if bc is None:
             while True:
                 if await request.is_disconnected():
@@ -200,6 +230,9 @@ async def sse_dashboard(
                 yield ": keepalive\n\n"
             return
 
+        # Subscribe AND drain the queue. No rendering happens here
+        # until the broadcaster publishes a change — the page route
+        # already shipped the heavy fragments (stats, activity).
         queue = bc.subscribe()
         try:
             while True:
@@ -210,7 +243,14 @@ async def sse_dashboard(
                 except TimeoutError:
                     yield ": keepalive\n\n"
                     continue
+                # Yield to other coroutines BEFORE we start rendering
+                # — gives any pending non-SSE request a chance to run on
+                # the same aiosqlite connection before we queue 5-10
+                # queries of our own.
+                await asyncio.sleep(0)
                 for event in events:
+                    if await request.is_disconnected():
+                        break
                     renderer = _RENDERERS.get(event)
                     if renderer is None:
                         continue

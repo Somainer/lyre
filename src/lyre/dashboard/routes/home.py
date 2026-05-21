@@ -84,6 +84,13 @@ async def _home_card_context(repos, model_context_windows) -> dict:
         await repos.tasks.count_completed_since(since_1h)
     )
 
+    # Single tuple unpack — the previous version awaited
+    # sum_tokens_since twice (once per channel), doubling DB pressure
+    # for no payoff.
+    tokens_in_24h, tokens_out_24h = await repos.wakeups.sum_tokens_since(
+        since_24h
+    )
+
     return {
         # tile 1
         "tasks_in_flight": tasks_in_flight,
@@ -124,8 +131,8 @@ async def _home_card_context(repos, model_context_windows) -> dict:
         "last_wakeup_ctx_pct": last_w_ctx_pct,
         # legacy keys for tests that grep for "in-progress" / "blockers unread"
         "completed_24h": completed_24h,
-        "tokens_in_24h": (await repos.wakeups.sum_tokens_since(since_24h))[0],
-        "tokens_out_24h": (await repos.wakeups.sum_tokens_since(since_24h))[1],
+        "tokens_in_24h": tokens_in_24h,
+        "tokens_out_24h": tokens_out_24h,
     }
 
 
