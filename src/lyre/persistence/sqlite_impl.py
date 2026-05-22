@@ -1174,6 +1174,13 @@ class SqliteMailboxRepository:
                 if "recipients_all" in keys else None
             ),
             metadata=_parse_json(row["metadata"]),
+            # `delivered_at` is the canonical timestamp for "when mail
+            # appeared in the recipient's inbox" — the dashboard sorts
+            # the activity timeline by it. Forgetting it here meant
+            # MailboxMessage.delivered_at was always None on read-back,
+            # which made every mail event lex-sort to the start of the
+            # timeline (empty string < any ISO timestamp).
+            delivered_at=row["delivered_at"] if "delivered_at" in keys else None,
             read_at=row["read_at"] if "read_at" in keys else None,
             attachments=(
                 _parse_json(row["attachments"])

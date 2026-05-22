@@ -402,3 +402,43 @@ async def test_mailbox_message_without_attachments_is_none(
     got = await repos.mailbox.get_message(mid)
     assert got is not None
     assert got.attachments is None
+
+
+@pytest.mark.asyncio
+async def test_mailbox_message_roundtrips_delivered_at(
+    repos: SqliteRepositories,
+) -> None:
+    """Regression: `_row_to_msg` used to forget to read `delivered_at`,
+    so every MailboxMessage came back with `delivered_at=None`. The
+    dashboard activity sort then keyed off `m.delivered_at.isoformat()
+    or ""` and slotted every mail event ABOVE everything else (empty
+    string lex-sorts to start). Pin the round-trip so this can't
+    silently regress."""
+    import datetime as _dt
+
+    await repos.personas.upsert(
+        Persona(name="d", role_description="d", system_prompt="d")
+    )
+    await repos.mailbox.ensure_mailbox("owner")
+    before = _dt.datetime.now(_dt.UTC)
+    mid = await repos.mailbox.insert_message(
+        MailboxMessage(
+            recipient="owner", external_id="ts-check",
+            sender="d", urgency="normal", body="hi",
+        )
+    )
+    after = _dt.datetime.now(_dt.UTC)
+
+    got = await repos.mailbox.get_message(mid)
+    assert got is not None
+    assert got.delivered_at is not None, (
+        "delivered_at must be populated on read-back; if this fails "
+        "the dashboard timeline ordering will be wrong"
+    )
+    # Pydantic parses the sqlite ISO string into an aware datetime.
+    assert isinstance(got.delivered_at, _dt.datetime)
+    # And the value is sensible — within the window we inserted in.
+    # A few seconds of slack on each side covers clock skew and the
+    # sqlite vs python time gap.
+    assert before - _dt.timedelta(seconds=5) <= got.delivered_at
+    assert got.delivered_at <= after + _dt.timedelta(seconds=5)
