@@ -15,6 +15,7 @@ from .models import (
     Artifact,
     Blob,
     MailboxMessage,
+    MailReaction,
     OutboxRow,
     Persona,
     ScheduledMail,
@@ -260,7 +261,25 @@ class MailboxRepository(Protocol):
 
     async def get_message(self, msg_id: int) -> MailboxMessage | None:
         """Fetch ANY mailbox message by primary id, regardless of recipient.
-        Used by `mailbox_get_message` for thread/reply/forward context."""
+        Used by `mailbox_get_message` for thread/reply/forward context.
+
+        Implementations should hydrate the message's ``reactions`` field
+        from `mail_reactions` so callers see acks inline."""
+        ...
+
+    async def add_reaction(
+        self, msg_id: int, reactor: str, kind: str,
+    ) -> bool:
+        """Idempotently record a reaction. Returns True if a new row was
+        inserted, False if the (msg_id, reactor, kind) already existed.
+
+        Crucially does NOT touch mailbox_messages or any unread state —
+        reactions are an out-of-band channel by design (see
+        migrations/0005_mail_reactions.sql for the rationale)."""
+        ...
+
+    async def list_reactions(self, msg_id: int) -> list[MailReaction]:
+        """All reactions on one message, oldest-first."""
         ...
 
     async def set_channel_external_id(

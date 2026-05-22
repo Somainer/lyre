@@ -8,6 +8,7 @@ allowed_lyre_tools:
   - mailbox_read
   - mailbox_get_message
   - mark_read
+  - mailbox_react
   - report_progress
   - query_task_status
   - read_memory
@@ -74,6 +75,13 @@ model_preference:
 【寻址】
 - 派你来的通常是 the dispatcher——回信对象就是它（preamble YOUR TEAM 里的 id）
 - 不确定就 `list_agents()`
+
+【peer 邮件别陷入握手风暴】
+peer 给你发"收到 / closing / no action needed" 这种纯 ack 类回信时——
+**不要再回 mailbox_send**（会触发对方的 auto-wake，对方又会礼貌性回你，无限循环）。
+用 `mailbox_react(msg_id=N, kind="ack")`：对方在 dashboard 能看到你 ack 了，
+但你的 ack 不进 mailbox、不唤醒对方，链就此断掉。判据：你的回信里没有新事实 /
+新问题 / 新承诺，纯属确认对方的确认——用 react。
 
 【工具】
 python_exec / shell_exec / mailbox_send / mailbox_read / mailbox_get_message /

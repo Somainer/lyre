@@ -21,6 +21,7 @@ from .models import (
     Artifact,
     Blob,
     MailboxMessage,
+    MailReaction,
     OutboxRow,
     Persona,
     ScheduledMail,
@@ -1089,7 +1090,51 @@ class SqliteMailboxRepository:
             "SELECT * FROM mailbox_messages WHERE id = ?", (msg_id,)
         ) as cur:
             row = await cur.fetchone()
-        return self._row_to_msg(row) if row else None
+        if not row:
+            return None
+        msg = self._row_to_msg(row)
+        msg.reactions = await self.list_reactions(msg_id)
+        return msg
+
+    async def add_reaction(
+        self, msg_id: int, reactor: str, kind: str,
+    ) -> bool:
+        """Idempotent insert into mail_reactions. `INSERT OR IGNORE`
+        relies on the (msg_id, reactor, kind) PK to drop duplicates
+        cleanly, and `changes()` distinguishes "new row" from "already
+        existed" without an extra round-trip."""
+        await self.conn.execute(
+            """
+            INSERT OR IGNORE INTO mail_reactions (msg_id, reactor, kind)
+            VALUES (?, ?, ?)
+            """,
+            (msg_id, reactor, kind),
+        )
+        async with self.conn.execute("SELECT changes()") as cur:
+            row = await cur.fetchone()
+        await self.conn.commit()
+        return bool(row and row[0])
+
+    async def list_reactions(self, msg_id: int) -> list[MailReaction]:
+        async with self.conn.execute(
+            """
+            SELECT msg_id, reactor, kind, created_at
+            FROM mail_reactions
+            WHERE msg_id = ?
+            ORDER BY created_at ASC, reactor ASC
+            """,
+            (msg_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [
+            MailReaction(
+                msg_id=r["msg_id"],
+                reactor=r["reactor"],
+                kind=r["kind"],
+                created_at=r["created_at"],
+            )
+            for r in rows
+        ]
 
     async def set_channel_external_id(
         self, msg_id: int, channel_name: str, external_id: str,

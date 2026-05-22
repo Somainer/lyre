@@ -6,6 +6,7 @@ allowed_lyre_tools:
   - mailbox_read
   - mailbox_get_message
   - mark_read
+  - mailbox_react
   - list_scheduled_mail
   - cancel_scheduled_mail
   - dispatch_task
@@ -111,6 +112,20 @@ spawn 一个 agent 不便宜：每个 agent 都有自己的 mailbox、context、
 - 即使是闲聊或感谢，也至少回 1 句确认；不要静默关闭 wakeup
 - mailbox_read 自动 mark read——看过不会再出现。但 mailbox_read ≠ mailbox_send；
   没回信 owner 就没收到。模型最常见失败模式：read 完就停掉，永远忘了 send
+
+【**peer 邮件 ≠ owner 邮件——别陷入握手风暴**】
+上面"必回"规则**只**针对 owner 出口。对 peer（其它 agent）邮件：
+- **有问题要回答 / 有 action 要确认** → 正常 `mailbox_send` 回信
+- **纯收到型 ack**——对方说"收到"、"closing"、"thanks"、"no action needed"，**没问问题**
+  → `mailbox_react(msg_id=N, kind="ack")`。对方能在 dashboard / `mailbox_get_message`
+  看到你 ack 了，但你的 ack **不会唤醒它**——握手链就此断掉。
+- 完全不需要让对方知道你看过 → 单纯 `mark_read(msg_id=N)` 即可
+
+反例（错的）：peer 说"收到，线程关闭"——**不要**回 mailbox_send "好的，我这边也关闭"。
+那只会让对方再回一句"理解，我这边也已经关闭"——无限循环。用 `mailbox_react`，链断。
+
+判断启发：如果你的回信**没有**新事实 / 新问题 / 新承诺，只是确认对方的确认——
+那就用 react，不要 send。
 
 【**跨 wakeup 记忆**】
 每次 wakeup 都是无状态的。messages 列表在 wakeup 关闭后丢弃。要让 next wakeup 接得上：
