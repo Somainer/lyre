@@ -135,24 +135,36 @@ class LarkChannel:
             .build()
         )
         def _run_ws() -> None:
-            # lark_oapi's WS client captures an event loop in TWO
-            # places that both default to ``asyncio.get_event_loop()``
-            # at the wrong time:
+            # ──── SDK BUG WORKAROUND ────────────────────────────────
+            # lark_oapi has no async-native start API and binds its WS
+            # event loop at module import time, making the SDK
+            # incompatible with apps that already run an asyncio loop
+            # (uvicorn / FastAPI / our scheduler).
             #
-            #   - ``lark_oapi.ws.client.loop`` — a module-level global
-            #     bound at FIRST IMPORT of the module (which happens on
-            #     the main thread during LarkChannel construction).
-            #   - ``ExpiringCache.__init__`` — captured per-instance.
+            #   - ``lark_oapi.ws.client.loop`` is a MODULE-LEVEL global
+            #     captured at first import — which happens on the main
+            #     thread when ``LarkChannel.__init__`` imports the SDK.
+            #     ``Client.start()``, ``_connect()``, ``_disconnect()``,
+            #     ``_ping_loop`` all use that one shared global.
+            #   - ``ExpiringCache.__init__`` (created inside
+            #     ``Client.__init__``) also calls
+            #     ``asyncio.get_event_loop()`` and schedules a sweeper
+            #     task on whatever loop that returns.
             #
-            # Because the module-level binding is the one ``start()``,
-            # ``_connect()``, ``_disconnect()`` all use, setting the
-            # thread's event loop alone is not enough — we must also
-            # rebind that module global. Doing this before constructing
-            # the Client also makes ExpiringCache pick up the new loop
-            # via ``get_event_loop`` and schedule its sweeper task on
-            # *this* thread's loop instead of the main loop (which
-            # produced the "Task was destroyed but it is pending"
-            # warning chain).
+            # Upstream tracking:
+            #   larksuite/oapi-sdk-python#119 — module-level loop bug
+            #     (reporter uses the same rebind workaround we do here)
+            #   larksuite/oapi-sdk-python#96  — request for async start
+            #   larksuite/oapi-sdk-python#128 — graceful stop PR
+            #
+            # When any of those land we can drop this block and call
+            # the proper API instead. Until then: this worker thread
+            # owns a fresh loop, the SDK's module global is rebound to
+            # it BEFORE Client construction so ExpiringCache picks it
+            # up too, and only then does the Client get built. This
+            # also eliminates the "Task was destroyed but it is
+            # pending" warning chain from the sweeper task being
+            # scheduled on the wrong loop.
             new_loop = asyncio.new_event_loop()
             asyncio.set_event_loop(new_loop)
             from lark_oapi.ws import client as _ws_mod  # type: ignore[import-untyped]
