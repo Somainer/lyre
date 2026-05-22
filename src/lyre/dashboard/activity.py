@@ -200,8 +200,10 @@ def _build_wakeup_events(
     return events
 
 
-def _fmt_tokens(n: int) -> str:
+def _fmt_tokens(n: int | None) -> str:
     """Compact token count: 12345 → 12.3K, 1234567 → 1.2M."""
+    if n is None:
+        return "—"
     if n >= 1_000_000:
         return f"{n / 1_000_000:.1f}M"
     if n >= 1_000:

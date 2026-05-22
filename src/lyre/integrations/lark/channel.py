@@ -94,7 +94,7 @@ class LarkChannel:
         self.dispatcher_id = dispatcher_id
         # Late-imported so the import-time cost of lark-oapi only
         # hits processes that actually enable the integration.
-        import lark_oapi
+        import lark_oapi  # type: ignore[import-untyped]
 
         self._lark = lark_oapi
         # Async-capable client for outbound API calls. Built lazily
@@ -134,13 +134,51 @@ class LarkChannel:
             .register_p2_im_message_receive_v1(self._on_lark_message)
             .build()
         )
-        ws = self._lark.ws.Client(
-            self.cfg.app_id,
-            self.cfg.app_secret,
-            event_handler=handler,
-        )
+        def _run_ws() -> None:
+            # ──── SDK BUG WORKAROUND ────────────────────────────────
+            # lark_oapi has no async-native start API and binds its WS
+            # event loop at module import time, making the SDK
+            # incompatible with apps that already run an asyncio loop
+            # (uvicorn / FastAPI / our scheduler).
+            #
+            #   - ``lark_oapi.ws.client.loop`` is a MODULE-LEVEL global
+            #     captured at first import — which happens on the main
+            #     thread when ``LarkChannel.__init__`` imports the SDK.
+            #     ``Client.start()``, ``_connect()``, ``_disconnect()``,
+            #     ``_ping_loop`` all use that one shared global.
+            #   - ``ExpiringCache.__init__`` (created inside
+            #     ``Client.__init__``) also calls
+            #     ``asyncio.get_event_loop()`` and schedules a sweeper
+            #     task on whatever loop that returns.
+            #
+            # Upstream tracking:
+            #   larksuite/oapi-sdk-python#119 — module-level loop bug
+            #     (reporter uses the same rebind workaround we do here)
+            #   larksuite/oapi-sdk-python#96  — request for async start
+            #   larksuite/oapi-sdk-python#128 — graceful stop PR
+            #
+            # When any of those land we can drop this block and call
+            # the proper API instead. Until then: this worker thread
+            # owns a fresh loop, the SDK's module global is rebound to
+            # it BEFORE Client construction so ExpiringCache picks it
+            # up too, and only then does the Client get built. This
+            # also eliminates the "Task was destroyed but it is
+            # pending" warning chain from the sweeper task being
+            # scheduled on the wrong loop.
+            new_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(new_loop)
+            from lark_oapi.ws import client as _ws_mod  # type: ignore[import-untyped]
+            _ws_mod.loop = new_loop
+
+            ws = self._lark.ws.Client(
+                self.cfg.app_id,
+                self.cfg.app_secret,
+                event_handler=handler,
+            )
+            ws.start()
+
         thread = threading.Thread(
-            target=ws.start, name="lark-ws", daemon=True,
+            target=_run_ws, name="lark-ws", daemon=True,
         )
         thread.start()
         log.info(
@@ -183,12 +221,28 @@ class LarkChannel:
         try:
             payload = event.event
             sender = payload.sender
-            sender_user_id = sender.sender_id.user_id if sender else None
-            if sender_user_id != self.cfg.authorized_user_id:
-                log.debug(
+            # ``sender_id`` carries open_id / user_id / union_id; we
+            # match on ``open_id`` because that's the app-scoped form
+            # the bot can use for outbound sends WITHOUT requesting the
+            # contact:user.employee_id:readonly scope (which user_id
+            # would need — Lark equates user_id with employee_id).
+            sender_open_id = (
+                sender.sender_id.open_id if sender else None
+            )
+            if sender_open_id != self.cfg.authorized_user_id:
+                # INFO (not debug) — during first-time config the owner
+                # needs to see their app-scoped open_id to put it in
+                # config.toml. Lark's open_id is per-app: an id obtained
+                # from one bot won't match here. Send a message to this
+                # bot, copy the ``got=ou_…`` value from this line.
+                log.info(
                     "lark_event_unauthorized_sender",
-                    got=sender_user_id,
+                    got=sender_open_id,
                     expected=self.cfg.authorized_user_id,
+                    hint=(
+                        "if this is YOUR open_id for this app, set "
+                        "[integrations.lark].authorized_user_id to it"
+                    ),
                 )
                 return
 
@@ -273,7 +327,7 @@ class LarkChannel:
                         "channels": {
                             "lark": {
                                 "message_id": msg_id,
-                                "user_id": sender_user_id,
+                                "open_id": sender_open_id,
                                 # `root_id` for thread, falls back
                                 # to the message id itself so a
                                 # first-message-in-thread still has
@@ -299,20 +353,9 @@ class LarkChannel:
     ) -> MailboxMessage | None:
         """Find a mail whose metadata records this Lark message id.
         Used to resolve thread-reply recipients."""
-        # SQLite JSON1 path query — small mail volumes per user,
-        # acceptable to scan. If this becomes hot we can add an
-        # index on metadata->>'$.channels.lark.message_id'.
-        async with self.repos.conn.execute(
-            "SELECT * FROM mailbox_messages "
-            "WHERE json_extract(metadata, "
-            "  '$.channels.lark.message_id') = ? "
-            "LIMIT 1",
-            (lark_message_id,),
-        ) as cur:
-            row = await cur.fetchone()
-        if row is None:
-            return None
-        return self.repos.mailbox._row_to_msg(row)
+        return await self.repos.mailbox.find_by_channel_external_id(
+            "lark", lark_message_id,
+        )
 
     async def _download_images(
         self, lark_message_id: str, image_keys: list[str],
@@ -328,7 +371,9 @@ class LarkChannel:
             )
             return []
         blob_ids: list[str] = []
-        from lark_oapi.api.im.v1 import GetMessageResourceRequest
+        from lark_oapi.api.im.v1 import (  # type: ignore[import-untyped]
+            GetMessageResourceRequest,
+        )
 
         for key in image_keys:
             req = (
@@ -345,7 +390,16 @@ class LarkChannel:
                     file_key=key, code=resp.code, msg=resp.msg,
                 )
                 continue
-            data = resp.file.getvalue() if isinstance(resp.file, io.IOBase) else resp.file
+            # ``resp.file`` is typed loosely by the SDK; at runtime it's
+            # either a BytesIO-like buffer (download stream) or the raw
+            # bytes. ``getvalue`` exists on BytesIO but not the abstract
+            # ``IOBase`` mypy sees, so the cast is needed only for the
+            # type-checker.
+            file_obj = resp.file
+            if isinstance(file_obj, io.IOBase) and hasattr(file_obj, "getvalue"):
+                data = file_obj.getvalue()
+            else:
+                data = file_obj
             # Lark doesn't surface a MIME type on download. Sniff
             # from the magic bytes — png/jpg/gif/webp cover the
             # vast majority of screenshots and phone-camera images.
@@ -391,7 +445,7 @@ class LarkChannel:
 
         text_req = (
             CreateMessageRequest.builder()
-            .receive_id_type("user_id")
+            .receive_id_type("open_id")
             .request_body(
                 CreateMessageRequestBody.builder()
                 .receive_id(self.cfg.authorized_user_id)
@@ -451,7 +505,7 @@ class LarkChannel:
                     continue
                 img_req = (
                     CreateMessageRequest.builder()
-                    .receive_id_type("user_id")
+                    .receive_id_type("open_id")
                     .request_body(
                         CreateMessageRequestBody.builder()
                         .receive_id(self.cfg.authorized_user_id)

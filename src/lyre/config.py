@@ -219,9 +219,15 @@ class LarkConfig:
     """
 
     enabled: bool = False
-    # Lark user_id (e.g. "ou_abc...") whose messages the bot treats
-    # as coming from the owner. Anyone else's messages are silently
-    # ignored — prevents random tenant members from injecting tasks.
+    # Lark **open_id** (``ou_xxx...``) whose messages the bot treats as
+    # coming from the owner. Anyone else's messages are silently ignored
+    # — prevents random tenant members from injecting tasks.
+    #
+    # NB: this is the open_id, NOT user_id / employee_id. Using open_id
+    # avoids the contact:user.employee_id:readonly scope requirement on
+    # outbound sends (Lark equates user_id with employee_id). The field
+    # name stayed ``authorized_user_id`` for historical config compat
+    # — what you put here should be the ``ou_…`` form.
     authorized_user_id: str | None = None
     # Lark app credentials from .env (LARK_APP_ID / LARK_APP_SECRET).
     # Populated by Config.from_env() reading the env vars; NOT loaded

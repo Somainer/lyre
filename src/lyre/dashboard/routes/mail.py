@@ -10,8 +10,11 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse
+from starlette.templating import _TemplateResponse
 
+from ...persistence.models import MailboxMessage
 from ..view_helpers import rel_time
+from . import repos_from, templates_from
 
 router = APIRouter()
 
@@ -26,7 +29,9 @@ _FILTER_BANDS: dict[str, set[str]] = {
 }
 
 
-def _filter_msgs(msgs, key: str):
+def _filter_msgs(
+    msgs: list[MailboxMessage], key: str,
+) -> list[MailboxMessage]:
     band = _FILTER_BANDS.get(key, _FILTER_BANDS["all"])
     return [m for m in msgs if m.urgency in band]
 
@@ -34,8 +39,8 @@ def _filter_msgs(msgs, key: str):
 @router.get("/mail", response_class=HTMLResponse)
 async def mail_view(
     request: Request, u: str = "all", before_id: int | None = None,
-) -> HTMLResponse:
-    repos = request.app.state.repos
+) -> _TemplateResponse:
+    repos = repos_from(request)
     # 50-row default — each row markdown-renders its body, and 200 of
     # those would lock the event loop for a noticeable beat on a busy
     # mailbox. Mail's primary use is scanning recent items + copying
@@ -53,8 +58,7 @@ async def mail_view(
     unread_total = sum(1 for m in msgs if not m.read_at)
     last_delivery_rel = rel_time(msgs[0].delivered_at) if msgs else "—"
 
-    templates = request.app.state.templates
-    return templates.TemplateResponse(
+    return templates_from(request).TemplateResponse(
         request, "mail.html",
         {
             "tab": "mail",
@@ -72,7 +76,7 @@ async def mail_view(
 @router.get("/mail/{msg_id}", response_class=HTMLResponse)
 async def mail_detail(
     request: Request, msg_id: int,
-) -> HTMLResponse:
+) -> _TemplateResponse:
     """Single-message view with rendered markdown.
 
     The list view (`/mail`) keeps bodies as fast plain text in a <pre>
@@ -84,7 +88,7 @@ async def mail_detail(
     raw (for copying via the one-click Copy button) — so the user
     never has to choose between "looks nice" and "copies clean".
     """
-    repos = request.app.state.repos
+    repos = repos_from(request)
     msg = await repos.mailbox.get_message(msg_id)
     if msg is None:
         raise HTTPException(
@@ -96,8 +100,7 @@ async def mail_detail(
         await repos.blobs.list_ids(msg.attachments)
         if msg.attachments else []
     )
-    templates = request.app.state.templates
-    return templates.TemplateResponse(
+    return templates_from(request).TemplateResponse(
         request, "mail_detail.html",
         {
             "tab": "mail",

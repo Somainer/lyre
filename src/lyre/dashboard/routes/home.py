@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Any
 
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse
+from starlette.templating import _TemplateResponse
 
+from ...persistence.repositories import Repositories
 from ..view_helpers import (
     bucket_into,
     fmt_ms,
@@ -15,11 +18,15 @@ from ..view_helpers import (
     rel_time,
     utc_iso_hours_ago,
 )
+from . import repos_from, templates_from
 
 router = APIRouter()
 
 
-async def _home_card_context(repos, model_context_windows) -> dict:
+async def _home_card_context(
+    repos: Repositories,
+    model_context_windows: dict[str, int] | None,
+) -> dict[str, Any]:
     """Compute the data block shared by the full page + the HTMX partial."""
     since_24h = utc_iso_hours_ago(24)
     since_1h = utc_iso_hours_ago(1)
@@ -144,8 +151,8 @@ async def _home_card_context(repos, model_context_windows) -> dict:
 
 
 @router.get("/", response_class=HTMLResponse)
-async def home(request: Request) -> HTMLResponse:
-    repos = request.app.state.repos
+async def home(request: Request) -> _TemplateResponse:
+    repos = repos_from(request)
     mcw = getattr(request.app.state, "model_context_windows", None)
     ctx = await _home_card_context(repos, mcw)
 
@@ -166,8 +173,7 @@ async def home(request: Request) -> HTMLResponse:
     unread_count = ctx["unread_total"]
     needs_input_count = ctx["needs_input"]
 
-    templates = request.app.state.templates
-    return templates.TemplateResponse(
+    return templates_from(request).TemplateResponse(
         request,
         "home.html",
         {
@@ -192,25 +198,21 @@ async def home(request: Request) -> HTMLResponse:
 
 
 @router.get("/partials/home/cards", response_class=HTMLResponse)
-async def home_cards_partial(request: Request) -> HTMLResponse:
-    repos = request.app.state.repos
+async def home_cards_partial(request: Request) -> _TemplateResponse:
+    repos = repos_from(request)
     mcw = getattr(request.app.state, "model_context_windows", None)
     ctx = await _home_card_context(repos, mcw)
-    templates = request.app.state.templates
-    return templates.TemplateResponse(
+    return templates_from(request).TemplateResponse(
         request, "partials/home_cards.html", ctx
     )
 
 
 @router.get("/partials/health", response_class=HTMLResponse)
-async def health_partial(request: Request) -> HTMLResponse:
+async def health_partial(request: Request) -> _TemplateResponse:
     """Topbar health pill: animated dot + 'N live · state.db ok'."""
-    repos = request.app.state.repos
+    repos = repos_from(request)
     active = await repos.wakeups.list_active()
-    from ..view_helpers import fmt_tokens  # local: keep route lean
-    _ = fmt_tokens  # silence linter if unused
-    templates = request.app.state.templates
-    return templates.TemplateResponse(
+    return templates_from(request).TemplateResponse(
         request, "partials/health.html",
         {"active_count": len(active)},
     )

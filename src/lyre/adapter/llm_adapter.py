@@ -121,9 +121,14 @@ class ToolUseComplete(StreamEvent):
     input: dict[str, Any]
 
 
+StopReason = Literal[
+    "end_turn", "tool_use", "max_tokens", "cancelled", "error"
+]
+
+
 @dataclass
 class TurnComplete(StreamEvent):
-    stop_reason: Literal["end_turn", "tool_use", "max_tokens", "cancelled", "error"]
+    stop_reason: StopReason
 
 
 @dataclass
@@ -159,5 +164,11 @@ class LLMAdapter(Protocol):
         Yields StreamEvent subclasses in order. Caller can cancel mid-stream
         by calling .aclose() on the returned iterator.
         """
+        # Protocol method body — never executed. The bare ``yield`` flags
+        # the function as an async generator so the return-type satisfies
+        # ``AsyncIterator``. Using a literal ``False`` makes mypy treat
+        # the yield as unreachable, which is fine — Protocol methods are
+        # never called directly.
+        if False:
+            yield
         ...
-        yield  # pragma: no cover (Protocol)

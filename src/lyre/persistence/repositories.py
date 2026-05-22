@@ -8,7 +8,10 @@ See PERSISTENCE_SCHEMA.md §4 for design rationale.
 
 from __future__ import annotations
 
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
+
+if TYPE_CHECKING:
+    import aiosqlite
 
 from .models import (
     Agent,
@@ -295,6 +298,36 @@ class MailboxRepository(Protocol):
         """
         ...
 
+    async def find_by_channel_external_id(
+        self, channel_name: str, external_id: str,
+    ) -> MailboxMessage | None:
+        """Reverse lookup: find the mail whose metadata records
+        ``channels.<channel_name>.message_id == external_id``.
+
+        Used by external-channel inbound handlers to resolve thread
+        replies (e.g. Lark / Slack message-id → original Lyre mail).
+        Returns None when no row matches.
+        """
+        ...
+
+    async def find_id_by_external_id(
+        self, recipient: str, external_id: str,
+    ) -> int | None:
+        """Resolve ``(recipient, external_id)`` → mailbox row id, or
+        None. Used by recovery paths after a UNIQUE-constraint collision
+        on insert when we need the existing row's id to link FKs.
+        """
+        ...
+
+    async def list_pending_channel_publish(
+        self, *, recipient: str, channel_name: str, limit: int = 500,
+    ) -> list[MailboxMessage]:
+        """Owner-bound mails for which no ``channel_publish`` outbox
+        row exists yet (for the given channel). Used by the owner-mail
+        enqueuer to catch up after restarts / channel additions.
+        """
+        ...
+
     async def get_last_auto_triggered_id(self, recipient: str) -> int:
         """Scheduler-side cursor: highest msg_id we've already auto-dispatched
         a 'check inbox' task for. Independent of per-message read_at
@@ -462,3 +495,10 @@ class Repositories(Protocol):
     artifacts: ArtifactRepository
     local_hot: LocalHotRepository
     blobs: BlobRepository
+    # Raw connection for queries that span multiple tables or need SQL
+    # features beyond a single repo's API surface (cross-table joins,
+    # JSON1 path filters, dashboard snapshot aggregates). SQLite-typed by
+    # nature — Lyre is single-DB by design (PERSISTENCE_SCHEMA.md §4).
+    # Most call sites should prefer the per-repo methods; reach for
+    # ``conn`` only when a typed method would be a one-off helper.
+    conn: aiosqlite.Connection

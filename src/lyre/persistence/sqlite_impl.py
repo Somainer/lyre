@@ -30,6 +30,19 @@ from .models import (
     TaskSpec,
     Wakeup,
 )
+from .repositories import (
+    AgentRepository,
+    ArtifactRepository,
+    BlobRepository,
+    LocalHotRepository,
+    MailboxRepository,
+    OutboxRepository,
+    PersonaRepository,
+    ScheduledMailRepository,
+    SkillRepository,
+    TaskRepository,
+    WakeupRepository,
+)
 
 
 def _uuid7() -> str:
@@ -270,7 +283,7 @@ class SqliteAgentRepository:
     async def list_all(self, include_archived: bool = False) -> list[Agent]:
         if include_archived:
             sql = "SELECT * FROM agents ORDER BY created_at"
-            params: tuple = ()
+            params: tuple[Any, ...] = ()
         else:
             sql = "SELECT * FROM agents WHERE status != 'archived' ORDER BY created_at"
             params = ()
@@ -1184,6 +1197,55 @@ class SqliteMailboxRepository:
         )
         await self.conn.commit()
 
+    async def find_by_channel_external_id(
+        self, channel_name: str, external_id: str,
+    ) -> MailboxMessage | None:
+        # JSON1 path lookup; mail volumes per user are small, table scan
+        # is fine. If it ever gets hot, add an expression index on
+        # ``json_extract(metadata, '$.channels.<name>.message_id')``.
+        async with self.conn.execute(
+            "SELECT * FROM mailbox_messages "
+            "WHERE json_extract(metadata, ?) = ? "
+            "LIMIT 1",
+            (f"$.channels.{channel_name}.message_id", external_id),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        return self._row_to_msg(row)
+
+    async def find_id_by_external_id(
+        self, recipient: str, external_id: str,
+    ) -> int | None:
+        async with self.conn.execute(
+            "SELECT id FROM mailbox_messages "
+            "WHERE recipient = ? AND external_id = ?",
+            (recipient, external_id),
+        ) as cur:
+            row = await cur.fetchone()
+        return int(row["id"]) if row is not None else None
+
+    async def list_pending_channel_publish(
+        self, *, recipient: str, channel_name: str, limit: int = 500,
+    ) -> list[MailboxMessage]:
+        prefix = f"channel:{channel_name}:owner-mail:"
+        async with self.conn.execute(
+            """
+            SELECT m.* FROM mailbox_messages m
+            WHERE m.recipient = ?
+              AND NOT EXISTS (
+                SELECT 1 FROM outbox o
+                 WHERE o.kind = 'channel_publish'
+                   AND o.external_id = ? || m.id
+              )
+            ORDER BY m.id
+            LIMIT ?
+            """,
+            (recipient, prefix, limit),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [self._row_to_msg(r) for r in rows]
+
     async def get_last_auto_triggered_id(self, recipient: str) -> int:
         await self.ensure_mailbox(recipient)
         async with self.conn.execute(
@@ -1289,6 +1351,9 @@ class SqliteScheduledMailRepository:
         ) as cur:
             row = await cur.fetchone()
         await self.conn.commit()
+        # INSERT ... RETURNING always yields a row when no constraint
+        # violation occurs (which would raise instead of returning None).
+        assert row is not None  # noqa: S101 — narrows for mypy
         return int(row["id"])
 
     async def get(self, mail_id: int) -> ScheduledMail | None:
@@ -1691,7 +1756,26 @@ class SqliteBlobRepository:
 # Aggregate facade
 # -----------------------------------------------------------------------
 class SqliteRepositories:
-    """Bundle all SQLite repositories sharing one aiosqlite connection."""
+    """Bundle all SQLite repositories sharing one aiosqlite connection.
+
+    Attributes are declared with their Protocol types (``PersonaRepository``
+    etc.) so callers that accept the ``Repositories`` Protocol see the
+    abstract surface — mypy treats Protocol attribute types as invariant,
+    and without these annotations every callsite would flag a spurious
+    "incompatible type" against the concrete ``SqliteFooRepository``.
+    """
+
+    personas: PersonaRepository
+    agents: AgentRepository
+    tasks: TaskRepository
+    wakeups: WakeupRepository
+    mailbox: MailboxRepository
+    scheduled_mail: ScheduledMailRepository
+    outbox: OutboxRepository
+    skills: SkillRepository
+    artifacts: ArtifactRepository
+    local_hot: LocalHotRepository
+    blobs: BlobRepository
 
     def __init__(self, conn: aiosqlite.Connection):
         self.conn = conn

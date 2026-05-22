@@ -153,9 +153,10 @@ async def _await_subagents(
     # checkpoint update succeeds. Status update advances to needs_input; the
     # scheduler's post-loop logic detects this and won't overwrite it back
     # to completed/failed.
-    existing_checkpoint = (
-        await ctx.repos.tasks.get(ctx.task_id)
-    ).checkpoint or {}
+    current_task = await ctx.repos.tasks.get(ctx.task_id)
+    # The caller holds the lease — the row must exist.
+    assert current_task is not None  # noqa: S101 — narrows for mypy
+    existing_checkpoint = current_task.checkpoint or {}
     new_checkpoint = {
         **existing_checkpoint,
         "awaiting_children": [c["id"] for c in pending],

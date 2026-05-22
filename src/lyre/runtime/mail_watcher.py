@@ -48,7 +48,7 @@ class MailWatcher:
     pending: list[MailboxMessage] = field(default_factory=list)
     _shown_baseline: int = 0
     _stop_event: asyncio.Event = field(default_factory=asyncio.Event)
-    _task: asyncio.Task | None = None
+    _task: asyncio.Task[None] | None = None
 
     def __post_init__(self) -> None:
         self._shown_baseline = self.baseline_msg_id

@@ -19,6 +19,7 @@ import json
 from collections import deque
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 
 from .llm_adapter import (
     ContentDelta,
@@ -31,7 +32,7 @@ from .llm_adapter import (
 )
 
 
-def _parse_event(obj: dict) -> StreamEvent | None:
+def _parse_event(obj: dict[str, Any]) -> StreamEvent | None:
     t = obj.get("type")
     if t == "content_delta":
         return ContentDelta(text=obj.get("text", ""))

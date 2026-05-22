@@ -478,7 +478,7 @@ async def _mailbox_read(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any
                     "task_id": m.task_id,
                     "delivered_at": (
                         m.delivered_at.isoformat()
-                        if hasattr(m.delivered_at, "isoformat")
+                        if isinstance(m.delivered_at, datetime)
                         else m.delivered_at
                     ),
                 }
@@ -541,12 +541,12 @@ async def _mailbox_read(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any
                 "task_id": m.task_id,
                 "delivered_at": (
                     m.delivered_at.isoformat()
-                    if hasattr(m.delivered_at, "isoformat")
+                    if isinstance(m.delivered_at, datetime)
                     else m.delivered_at
                 ),
                 "read_at": (
                     m.read_at.isoformat()
-                    if hasattr(m.read_at, "isoformat")
+                    if isinstance(m.read_at, datetime)
                     else m.read_at
                 ),
             }

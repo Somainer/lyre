@@ -58,6 +58,7 @@ from .llm_adapter import (
     ContentDelta,
     LyreMessage,
     LyreToolSpec,
+    StopReason,
     StreamEvent,
     ThinkingBlockComplete,
     ThinkingDelta,
@@ -132,7 +133,7 @@ class OpenAIResponsesAdapter:
         # function_call_arguments.done with the parsed args.
         emitted_tool_starts: set[str] = set()
         reasoning_chunks: list[str] = []
-        last_finish: str | None = None
+        last_finish: StopReason | None = None
         usage_payload: tuple[int, int] | None = None
 
         stream = await self.client.responses.create(**kwargs)

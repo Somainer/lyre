@@ -21,6 +21,7 @@ Q9.4: cost is NOT consulted in MVP routing decisions.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import structlog
 
@@ -40,7 +41,7 @@ class ModelPreference:
     prefer: tuple[str, ...] = ()  # ranked list of model ids
 
     @classmethod
-    def from_dict(cls, d: dict | None) -> ModelPreference | None:
+    def from_dict(cls, d: dict[str, Any] | None) -> ModelPreference | None:
         if not d:
             return None
         tier = d.get("tier")
