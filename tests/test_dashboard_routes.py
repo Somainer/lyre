@@ -533,6 +533,70 @@ def test_send_post_rejects_unknown_agent_recipient(
     assert "unknown agent" in r.text
 
 
+def test_send_form_persona_dropdown_includes_custom_personas(
+    seeded_dashboard: tuple[TestClient, SqliteRepositories, dict],
+) -> None:
+    """Regression: the dropdown used to be a hardcoded list of the
+    shipped persona names, so user-added personas at
+    ``~/.lyre/personas/<name>/identity.md`` never appeared. Now it
+    queries `personas.list_active()` — any approved persona shows up.
+    Pin the live-query behavior with a custom persona inserted via
+    the repo, then GET /send and look for the new name in the
+    dropdown markup."""
+    client, repos, _ = seeded_dashboard
+    from lyre.persistence.models import Persona
+
+    async def _add_custom() -> None:
+        await repos.personas.upsert(
+            Persona(
+                name="researcher",
+                role_description="custom researcher persona",
+                system_prompt="you research stuff",
+                allowed_lyre_tools=["mailbox_send", "mailbox_read"],
+                status="approved",
+            )
+        )
+
+    asyncio.get_event_loop().run_until_complete(_add_custom())
+
+    r = client.get("/send")
+    assert r.status_code == 200
+    body = r.text
+    # The new persona MUST appear as an <option> value.
+    assert '<option value="researcher"' in body, (
+        "custom persona 'researcher' was upserted to the DB but the "
+        "send-form dropdown didn't pick it up — persona list looks "
+        "hardcoded again"
+    )
+    # And so do the shipped ones — the live query must not drop them.
+    for shipped in ("owner", "dispatcher", "analyst", "reviewer",
+                    "worker-maintainer"):
+        assert f'<option value="{shipped}"' in body
+
+
+def test_send_form_persona_dropdown_orders_owner_first(
+    seeded_dashboard: tuple[TestClient, SqliteRepositories, dict],
+) -> None:
+    """Owner is a special non-LLM role; the dropdown should always lead
+    with it (matches the previous hardcoded order). The rest of the
+    list is alphabetical."""
+    client, *_ = seeded_dashboard
+    r = client.get("/send")
+    assert r.status_code == 200
+    body = r.text
+    # Locate each option's first occurrence; owner's index must be
+    # strictly less than any other shipped persona's.
+    owner_at = body.find('<option value="owner"')
+    others = [
+        body.find(f'<option value="{p}"')
+        for p in ("analyst", "dispatcher", "reviewer", "worker-maintainer")
+    ]
+    assert owner_at >= 0 and all(o >= 0 for o in others)
+    assert all(owner_at < o for o in others), (
+        f"owner dropdown position {owner_at} should precede all others {others}"
+    )
+
+
 def test_send_form_with_reply_to_shows_original_message(
     seeded_dashboard: tuple[TestClient, SqliteRepositories, dict],
 ) -> None:
