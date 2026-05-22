@@ -139,8 +139,19 @@ class LarkChannel:
             self.cfg.app_secret,
             event_handler=handler,
         )
+
+        def _run_ws() -> None:
+            # ws.start() does `loop.run_until_complete(self._connect())`
+            # internally. Under Python 3.12 a worker thread that never
+            # called set_event_loop falls through to the *main* thread's
+            # loop (which is already running), raising
+            # ``RuntimeError: This event loop is already running``.
+            # Giving the thread its own loop fixes the boot.
+            asyncio.set_event_loop(asyncio.new_event_loop())
+            ws.start()
+
         thread = threading.Thread(
-            target=ws.start, name="lark-ws", daemon=True,
+            target=_run_ws, name="lark-ws", daemon=True,
         )
         thread.start()
         log.info(
@@ -183,11 +194,18 @@ class LarkChannel:
         try:
             payload = event.event
             sender = payload.sender
-            sender_user_id = sender.sender_id.user_id if sender else None
-            if sender_user_id != self.cfg.authorized_user_id:
+            # ``sender_id`` carries open_id / user_id / union_id; we
+            # match on ``open_id`` because that's the app-scoped form
+            # the bot can use for outbound sends WITHOUT requesting the
+            # contact:user.employee_id:readonly scope (which user_id
+            # would need — Lark equates user_id with employee_id).
+            sender_open_id = (
+                sender.sender_id.open_id if sender else None
+            )
+            if sender_open_id != self.cfg.authorized_user_id:
                 log.debug(
                     "lark_event_unauthorized_sender",
-                    got=sender_user_id,
+                    got=sender_open_id,
                     expected=self.cfg.authorized_user_id,
                 )
                 return
@@ -273,7 +291,7 @@ class LarkChannel:
                         "channels": {
                             "lark": {
                                 "message_id": msg_id,
-                                "user_id": sender_user_id,
+                                "open_id": sender_open_id,
                                 # `root_id` for thread, falls back
                                 # to the message id itself so a
                                 # first-message-in-thread still has
@@ -391,7 +409,7 @@ class LarkChannel:
 
         text_req = (
             CreateMessageRequest.builder()
-            .receive_id_type("user_id")
+            .receive_id_type("open_id")
             .request_body(
                 CreateMessageRequestBody.builder()
                 .receive_id(self.cfg.authorized_user_id)
@@ -451,7 +469,7 @@ class LarkChannel:
                     continue
                 img_req = (
                     CreateMessageRequest.builder()
-                    .receive_id_type("user_id")
+                    .receive_id_type("open_id")
                     .request_body(
                         CreateMessageRequestBody.builder()
                         .receive_id(self.cfg.authorized_user_id)
