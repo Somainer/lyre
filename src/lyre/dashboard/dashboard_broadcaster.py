@@ -79,10 +79,12 @@ class DashboardBroadcaster:
     repos: Repositories
     poll_interval_s: float = 1.0
     queue_max: int = 64
-    _subscribers: set[asyncio.Queue] = field(default_factory=set)
+    # Each event payload is the set of event names that changed; the
+    # shutdown sentinel is an empty `frozenset()` plus a closing None.
+    _subscribers: set[asyncio.Queue[set[str] | None]] = field(default_factory=set)
     _cursor: _Cursor = field(default_factory=_Cursor)
     _stop_event: asyncio.Event = field(default_factory=asyncio.Event)
-    _task: asyncio.Task | None = None
+    _task: asyncio.Task[None] | None = None
 
     async def prime(self) -> None:
         """Initialize cursor to current state so a fresh subscriber gets
@@ -91,13 +93,15 @@ class DashboardBroadcaster:
         of updates to subscribers."""
         self._cursor = await self._snapshot()
 
-    def subscribe(self) -> asyncio.Queue:
-        q: asyncio.Queue = asyncio.Queue(maxsize=self.queue_max)
+    def subscribe(self) -> asyncio.Queue[set[str] | None]:
+        q: asyncio.Queue[set[str] | None] = asyncio.Queue(
+            maxsize=self.queue_max
+        )
         self._subscribers.add(q)
         log.debug("dashboard_broadcaster_subscribed", n=len(self._subscribers))
         return q
 
-    def unsubscribe(self, q: asyncio.Queue) -> None:
+    def unsubscribe(self, q: asyncio.Queue[set[str] | None]) -> None:
         self._subscribers.discard(q)
         log.debug("dashboard_broadcaster_unsubscribed", n=len(self._subscribers))
 
@@ -125,11 +129,11 @@ class DashboardBroadcaster:
     def _wake_subscribers_for_shutdown(self) -> None:
         for q in list(self._subscribers):
             try:
-                q.put_nowait(None)  # type: ignore[arg-type]
+                q.put_nowait(None)
             except asyncio.QueueFull:
                 try:
                     q.get_nowait()
-                    q.put_nowait(None)  # type: ignore[arg-type]
+                    q.put_nowait(None)
                 except (asyncio.QueueEmpty, asyncio.QueueFull):
                     pass
 

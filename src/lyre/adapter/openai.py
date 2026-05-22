@@ -39,6 +39,7 @@ from .llm_adapter import (
     ContentDelta,
     LyreMessage,
     LyreToolSpec,
+    StopReason,
     StreamEvent,
     ThinkingBlockComplete,
     ThinkingDelta,
@@ -54,7 +55,7 @@ if TYPE_CHECKING:
 
 # OpenAI finish_reason → Lyre stop_reason. OAI doesn't have a "cancelled"
 # variant; "content_filter" is the closest to error-y.
-_FINISH_REASON_MAP: dict[str, str] = {
+_FINISH_REASON_MAP: dict[str, StopReason] = {
     "stop": "end_turn",
     "length": "max_tokens",
     "tool_calls": "tool_use",

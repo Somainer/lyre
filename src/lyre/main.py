@@ -8,8 +8,13 @@ import os
 import signal
 import sys
 from datetime import UTC
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 import click
+
+if TYPE_CHECKING:
+    import aiosqlite
 import structlog
 
 from .config import Config, load_dotenv_chain, lyre_home
@@ -303,7 +308,7 @@ def serve_cmd(
             for sig in (signal.SIGINT, signal.SIGTERM):
                 loop.add_signal_handler(sig, _stop_all)
 
-            services: list[asyncio.Task] = [
+            services: list[asyncio.Task[None]] = [
                 asyncio.create_task(scheduler.run(), name="scheduler"),
                 asyncio.create_task(dispatcher.run(), name="outbox_dispatcher"),
             ]
@@ -902,7 +907,7 @@ def audit_cmd(
                         "SELECT id FROM wakeups WHERE persona_name = ? "
                         "ORDER BY started_at DESC LIMIT 1"
                     )
-                    params: tuple = (persona,)
+                    params: tuple[Any, ...] = (persona,)
                 else:
                     sql = "SELECT id FROM wakeups ORDER BY started_at DESC LIMIT 1"
                     params = ()
@@ -917,7 +922,7 @@ def audit_cmd(
                     "SELECT id FROM wakeups WHERE id LIKE ? LIMIT 2",
                     (target + "%",),
                 ) as cur:
-                    rows = await cur.fetchall()
+                    rows = list(await cur.fetchall())
                 if not rows:
                     click.echo(f"No wakeup matches '{target}'", err=True)
                     sys.exit(1)
@@ -1105,10 +1110,12 @@ def tail_cmd(
     import time as _time
     from pathlib import Path as _P
 
-    async def _find_target(conn) -> tuple[str, str, bool] | None:
+    async def _find_target(
+        conn: aiosqlite.Connection,
+    ) -> tuple[str, str, bool] | None:
         """Return (wakeup_id, transcript_path, is_active) or None."""
         clauses = []
-        params: list = []
+        params: list[Any] = []
         if active_only:
             clauses.append("ended_at IS NULL")
         if persona:
@@ -1142,7 +1149,7 @@ def tail_cmd(
         is_active = row["ended_at"] is None
         return row["id"], path, is_active
 
-    def _render(evt: dict) -> str | None:
+    def _render(evt: dict[str, Any]) -> str | None:
         t = evt.get("type")
         ts = _time.strftime("%H:%M:%S", _time.localtime(evt.get("ts", 0) / 1000))
         if t == "system":
@@ -1255,11 +1262,12 @@ def tail_cmd(
         click.echo("\n(stopped)", err=True)
 
 
-def _read_slice(path, start: int, end: int) -> str:
+def _read_slice(path: Path, start: int, end: int) -> str:
     """Read [start, end) bytes of path; for tail file polling."""
     with path.open("rb") as fp:
         fp.seek(start)
-        return fp.read(end - start).decode("utf-8", errors="replace")
+        chunk = fp.read(end - start)
+    return chunk.decode("utf-8", errors="replace")
 
 
 # ----------------------------------------------------------------------
@@ -1295,7 +1303,7 @@ def agent_create_cmd(
                 sys.exit(1)
 
             if name is None:
-                from .runtime.tools.introspect import _next_auto_name  # type: ignore[attr-defined]
+                from .runtime.tools.introspect import _next_auto_name
 
                 class _Stub:
                     repos = None
@@ -1305,7 +1313,7 @@ def agent_create_cmd(
             else:
                 agent_id = name
 
-            metadata: dict = {}
+            metadata: dict[str, Any] = {}
             if description:
                 metadata["description"] = description
             if model:
@@ -1523,7 +1531,7 @@ def wakeups_list_cmd(
             ctx_windows = {}
 
         clauses: list[str] = []
-        params: list = []
+        params: list[Any] = []
         if persona:
             clauses.append("persona_name = ?")
             params.append(persona)
@@ -1555,7 +1563,11 @@ def wakeups_list_cmd(
         if as_json:
             for r in rows:
                 d = dict(r)
-                window = ctx_windows.get(d.get("model"))
+                model_id = d.get("model")
+                window = (
+                    ctx_windows.get(model_id) if isinstance(model_id, str)
+                    else None
+                )
                 peak = d.get("context_peak_tokens") or 0
                 d["context_window"] = window
                 d["context_peak_pct"] = (
@@ -1643,7 +1655,7 @@ def tasks_list_cmd(
     async def _run() -> None:
         cfg = Config.from_env()
         clauses: list[str] = []
-        params: list = []
+        params: list[Any] = []
         if persona:
             clauses.append("persona_name = ?")
             params.append(persona)

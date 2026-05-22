@@ -278,16 +278,18 @@ class AnthropicAdapter:
         # ContentBlockStopEvent: block finished (tool_use or thinking
         # buffer may be assembled now).
         if isinstance(evt, ContentBlockStopEvent):
-            buf = tool_use_buffers.pop(evt.index, None)
-            if buf is not None:
+            tu_buf: dict[str, Any] | None = tool_use_buffers.pop(
+                evt.index, None,
+            )
+            if tu_buf is not None:
                 import json as _json
-                input_json = buf.get("input_json", "")
+                input_json = tu_buf.get("input_json", "")
                 try:
                     parsed_input = _json.loads(input_json) if input_json else {}
                 except _json.JSONDecodeError:
                     parsed_input = {"_raw": input_json}
                 return ToolUseComplete(
-                    id=buf["id"], name=buf["name"], input=parsed_input
+                    id=tu_buf["id"], name=tu_buf["name"], input=parsed_input
                 )
             tbuf = thinking_buffers.pop(evt.index, None)
             if tbuf is not None:

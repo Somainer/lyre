@@ -13,8 +13,9 @@ from __future__ import annotations
 
 import time
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal
 
 CircuitState = Literal["closed", "open", "half_open"]
 
@@ -38,7 +39,7 @@ class HealthTracker:
         window_s: float = _WINDOW_S,
         fail_threshold: int = _FAIL_THRESHOLD,
         cooldown_s: float = _COOLDOWN_S,
-        now_fn: callable | None = None,
+        now_fn: Callable[[], float] | None = None,
     ):
         self.window_s = window_s
         self.fail_threshold = fail_threshold
@@ -88,9 +89,9 @@ class HealthTracker:
         st.failures.clear()
         st.opened_at = None
 
-    def snapshot(self) -> dict[str, dict]:
+    def snapshot(self) -> dict[str, dict[str, Any]]:
         """For logging / debugging."""
-        out = {}
+        out: dict[str, dict[str, Any]] = {}
         for mid, st in self._state.items():
             out[mid] = {
                 "state": self.state(mid),

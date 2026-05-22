@@ -9,6 +9,9 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse
+from starlette.templating import _TemplateResponse
+
+from . import repos_from, templates_from
 
 router = APIRouter()
 
@@ -26,8 +29,8 @@ async def runs_view(
     request: Request,
     tab: str = "tasks",
     status: str = "all",
-) -> HTMLResponse:
-    repos = request.app.state.repos
+) -> _TemplateResponse:
+    repos = repos_from(request)
     mcw = getattr(request.app.state, "model_context_windows", None)
     _ = mcw  # piped through to the template via context_peak_pct filter
 
@@ -69,8 +72,7 @@ async def runs_view(
         else:
             wakeups = [w for w in all_wakeups if w.end_status == status]
 
-    templates = request.app.state.templates
-    return templates.TemplateResponse(
+    return templates_from(request).TemplateResponse(
         request, "runs.html",
         {
             "tab": "runs",
@@ -92,14 +94,13 @@ async def runs_view(
 
 
 @router.get("/tasks/{task_id}", response_class=HTMLResponse)
-async def task_detail(task_id: str, request: Request) -> HTMLResponse:
-    repos = request.app.state.repos
+async def task_detail(task_id: str, request: Request) -> _TemplateResponse:
+    repos = repos_from(request)
     task = await repos.tasks.get(task_id)
     if task is None:
         raise HTTPException(status_code=404, detail=f"task {task_id} not found")
     children = await repos.tasks.find_children(task_id)
-    templates = request.app.state.templates
-    return templates.TemplateResponse(
+    return templates_from(request).TemplateResponse(
         request, "task_detail.html",
         {"tab": "runs", "task": task, "children": children},
     )

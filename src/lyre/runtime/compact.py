@@ -286,14 +286,15 @@ def _format_args(tool_input: dict[str, Any]) -> str:
     return ""
 
 
-def _try_parse_json(value: Any) -> dict | None:
+def _try_parse_json(value: Any) -> dict[str, Any] | None:
     if isinstance(value, dict):
         return value
     if isinstance(value, str):
         try:
-            return _json.loads(value)
+            parsed = _json.loads(value)
         except (ValueError, TypeError):
             return None
+        return parsed if isinstance(parsed, dict) else None
     return None
 
 

@@ -23,6 +23,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+from ...persistence.models import Agent, Task
 from ..identity import compose_id, is_valid_agent_id
 from . import Tool, ToolContext, ToolError
 
@@ -462,7 +463,7 @@ async def _list_agents(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]
 
     # In-flight task fan-out: pull once, group in Python.
     tasks = await ctx.repos.tasks.find_recent(limit=500)
-    in_flight_by_agent: dict[str, list] = {}
+    in_flight_by_agent: dict[str, list[Task]] = {}
     for t in tasks:
         key = t.agent_id or t.persona_name
         if t.status in _IN_FLIGHT:
@@ -481,7 +482,7 @@ async def _list_agents(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]
         # list_recent returns newest-first; keep the first hit per agent.
         last_active.setdefault(key, ts)
 
-    def _occupancy(agent) -> str:
+    def _occupancy(agent: Agent) -> str:
         if agent.status == "archived":
             return "archived"
         if agent.status == "busy":

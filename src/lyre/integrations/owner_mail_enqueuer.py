@@ -41,7 +41,8 @@ from dataclasses import dataclass, field
 
 import structlog
 
-from ..persistence.models import OutboxRow
+from ..dashboard.sse import MailboxBroadcaster
+from ..persistence.models import MailboxMessage, OutboxRow
 from ..persistence.repositories import Repositories
 from . import ChannelRegistry
 
@@ -54,12 +55,12 @@ class OwnerMailEnqueuer:
     channels: ChannelRegistry
     broadcaster_recipient: str = "owner"
     _stop_event: asyncio.Event = field(default_factory=asyncio.Event)
-    _task: asyncio.Task | None = None
+    _task: asyncio.Task[None] | None = None
 
     def request_stop(self) -> None:
         self._stop_event.set()
 
-    async def run(self, broadcaster) -> None:
+    async def run(self, broadcaster: MailboxBroadcaster) -> None:
         """Run the catch-up sweep then drain the broadcaster forever.
 
         ``broadcaster`` is a primed-and-started
@@ -109,38 +110,26 @@ class OwnerMailEnqueuer:
 
     async def _owner_mails_not_yet_enqueued(
         self, channel_name: str,
-    ) -> list:
+    ) -> list[MailboxMessage]:
         """Left-anti-join: owner-bound mails for which no
         channel_publish outbox row exists yet (for this channel).
         Cap at 500 to avoid pathological replays after long
         downtime — a follow-up sweep on the next tick picks up the
         rest."""
-        prefix = f"channel:{channel_name}:owner-mail:"
-        async with self.repos.conn.execute(
-            """
-            SELECT m.* FROM mailbox_messages m
-            WHERE m.recipient = ?
-              AND NOT EXISTS (
-                SELECT 1 FROM outbox o
-                 WHERE o.kind = 'channel_publish'
-                   AND o.external_id = ? || m.id
-              )
-            ORDER BY m.id
-            LIMIT 500
-            """,
-            (self.broadcaster_recipient, prefix),
-        ) as cur:
-            rows = await cur.fetchall()
-        # Reuse the mailbox repo's row → model converter so column
-        # parsing (JSON metadata, etc.) stays in one place.
-        return [self.repos.mailbox._row_to_msg(r) for r in rows]
+        return await self.repos.mailbox.list_pending_channel_publish(
+            recipient=self.broadcaster_recipient,
+            channel_name=channel_name,
+            limit=500,
+        )
 
-    async def _enqueue_for_channels(self, msg) -> None:
+    async def _enqueue_for_channels(self, msg: MailboxMessage) -> None:
         """Fan-out: one outbox row per registered channel."""
         for ch_name in self.channels.names():
             await self._enqueue_one(ch_name, msg)
 
-    async def _enqueue_one(self, channel_name: str, msg) -> None:
+    async def _enqueue_one(
+        self, channel_name: str, msg: MailboxMessage,
+    ) -> None:
         """Resolve reply-to (if any) and enqueue. ``ON CONFLICT
         DO NOTHING`` on the outbox's UNIQUE(kind, external_id)
         absorbs duplicate sweeps."""
@@ -168,7 +157,7 @@ class OwnerMailEnqueuer:
         ])
 
     async def _resolve_reply_to(
-        self, channel_name: str, msg,
+        self, channel_name: str, msg: MailboxMessage,
     ) -> str | None:
         """If ``msg.parent_msg_id`` is set and the parent has a
         recorded ``metadata.channels.<channel>.message_id``, return

@@ -11,7 +11,8 @@ asyncio tasks; both share the same Repositories handle.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable, Coroutine
+from typing import Any
 
 import structlog
 import uvicorn
@@ -128,12 +129,12 @@ async def run_dashboard(
 
 
 async def serve_until_signal(
-    coro: Awaitable[None],
+    coro: Coroutine[Any, Any, None],
     stop_event: asyncio.Event,
 ) -> None:
     """Run `coro` in an asyncio task; resolve when either it finishes or
     `stop_event` is set. Useful for composing services in `lyre serve`."""
-    inner = asyncio.create_task(coro)  # type: ignore[arg-type]
+    inner: asyncio.Task[None] = asyncio.create_task(coro)
     waiter = asyncio.create_task(stop_event.wait())
     done, pending = await asyncio.wait(
         {inner, waiter}, return_when=asyncio.FIRST_COMPLETED

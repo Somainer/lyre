@@ -11,9 +11,11 @@ recipient + threads parent_msg_id.
 from __future__ import annotations
 
 import uuid
+from typing import Any
 
 from fastapi import APIRouter, File, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse
+from starlette.templating import _TemplateResponse
 
 from ...persistence.models import Blob, MailboxMessage
 from ...persistence.repositories import Repositories
@@ -21,6 +23,7 @@ from ...runtime.identity import (
     compose_id,
     is_valid_agent_id,
 )
+from . import repos_from, templates_from
 
 # Hard cap on a single upload. The model burns vision tokens by
 # image area, the dashboard SSE wakes up on every mail insert, and
@@ -168,7 +171,9 @@ async def _ensure_agent(
     return agent_id
 
 
-async def _load_reply_context(repos, reply_to_id: int) -> dict | None:
+async def _load_reply_context(
+    repos: Repositories, reply_to_id: int,
+) -> dict[str, Any] | None:
     msg = await repos.mailbox.get_message(reply_to_id)
     if msg is None:
         return None
@@ -183,7 +188,7 @@ async def _load_reply_context(repos, reply_to_id: int) -> dict | None:
     }
 
 
-async def _known_agent_ids(repos) -> list[str]:
+async def _known_agent_ids(repos: Repositories) -> list[str]:
     return sorted(
         {a.id for a in await repos.agents.list_all(include_archived=False)}
     )
@@ -194,9 +199,8 @@ async def send_form(
     request: Request,
     to: str | None = None,
     reply_to: int | None = None,
-) -> HTMLResponse:
-    repos = request.app.state.repos
-    templates = request.app.state.templates
+) -> _TemplateResponse:
+    repos = repos_from(request)
     reply_ctx = None
     requested = to
     if reply_to is not None:
@@ -204,7 +208,7 @@ async def send_form(
         if reply_ctx is not None:
             requested = reply_ctx["sender"]
     preset_to, preset_persona, preset_name = await _resolve_preset(repos, requested)
-    return templates.TemplateResponse(
+    return templates_from(request).TemplateResponse(
         request, "send.html",
         {
             "tab": "send",
@@ -243,13 +247,15 @@ async def send_post(
     # (ruff B008 is a false positive against this pattern — the call
     # builds a parameter descriptor, not a shared mutable default).
     attachments: list[UploadFile] = File(default=[]),  # noqa: B008
-) -> HTMLResponse:
-    templates = request.app.state.templates
-    repos = request.app.state.repos
+) -> _TemplateResponse:
+    repos = repos_from(request)
+    templates = templates_from(request)
     blob_store = getattr(request.app.state, "blob_store", None)
     spawn = spawn_if_missing in ("1", "on", "true")
 
-    async def render_err(msg: str, status: int = 400) -> HTMLResponse:
+    async def render_err(
+        msg: str, status: int = 400,
+    ) -> _TemplateResponse:
         preset_to, preset_persona, preset_name = await _resolve_preset(
             repos, recipient or (compose_id(persona, name or "") if persona else None),
         )

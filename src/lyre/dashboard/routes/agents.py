@@ -7,8 +7,12 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse
+from starlette.templating import _TemplateResponse
 
+from ...persistence.models import Agent, Wakeup
+from ...persistence.repositories import Repositories
 from ..activity import build_activity, list_active_wakeups
+from . import repos_from, templates_from
 
 router = APIRouter()
 
@@ -29,7 +33,7 @@ class _AgentView:
     archived_at: Any = None
 
     @classmethod
-    def of(cls, agent, derived_status: str) -> _AgentView:
+    def of(cls, agent: Agent, derived_status: str) -> _AgentView:
         return cls(
             id=agent.id,
             persona_name=agent.persona_name,
@@ -45,7 +49,7 @@ class _AgentView:
 _IN_FLIGHT = {"pending", "in_progress", "needs_input"}
 
 
-async def _in_flight_by_agent(repos) -> dict[str, int]:
+async def _in_flight_by_agent(repos: Repositories) -> dict[str, int]:
     """How many in-flight tasks each agent owns. Used to compute the
     "queued" occupancy state (idle agent with work waiting) vs "available"
     (idle agent with nothing queued — actually free to take new work).
@@ -60,7 +64,7 @@ async def _in_flight_by_agent(repos) -> dict[str, int]:
 
 
 def _derive_occupancy_status(
-    agent,
+    agent: Agent,
     busy_agent_ids: set[str],
     busy_legacy_personas: set[str],
 ) -> str:
@@ -91,7 +95,9 @@ def _derive_occupancy_status(
     return "idle"
 
 
-def _busy_sets(active_wakeups) -> tuple[set[str], set[str]]:
+def _busy_sets(
+    active_wakeups: list[Wakeup],
+) -> tuple[set[str], set[str]]:
     """Split active wakeups into the two match sets used by
     ``_derive_occupancy_status``."""
     exact = {w.agent_id for w in active_wakeups if w.agent_id}
@@ -105,8 +111,8 @@ def _busy_sets(active_wakeups) -> tuple[set[str], set[str]]:
 @router.get("/agents", response_class=HTMLResponse)
 async def agents_list(
     request: Request, mode: str = "table",
-) -> HTMLResponse:
-    repos = request.app.state.repos
+) -> _TemplateResponse:
+    repos = repos_from(request)
     agents_all = await repos.agents.list_all(include_archived=True)
     live = [a for a in agents_all if a.status != "archived"]
     archived = [a for a in agents_all if a.status == "archived"]
@@ -141,8 +147,7 @@ async def agents_list(
 
     persona_count = len({v.persona_name for v in live_views})
 
-    templates = request.app.state.templates
-    return templates.TemplateResponse(
+    return templates_from(request).TemplateResponse(
         request, "agents.html",
         {
             "tab": "agents",
@@ -164,8 +169,8 @@ async def agents_list(
 @router.get("/agents/{agent_id:path}", response_class=HTMLResponse)
 async def agent_detail(
     request: Request, agent_id: str, minutes: int = 60,
-) -> HTMLResponse:
-    repos = request.app.state.repos
+) -> _TemplateResponse:
+    repos = repos_from(request)
     agent = await repos.agents.get(agent_id)
     if agent is None:
         raise HTTPException(
@@ -196,8 +201,7 @@ async def agent_detail(
         for c in children_raw
     ]
 
-    templates = request.app.state.templates
-    return templates.TemplateResponse(
+    return templates_from(request).TemplateResponse(
         request, "agent_detail.html",
         {
             "tab": "agent_detail",
@@ -227,8 +231,8 @@ async def agent_detail(
 )
 async def agent_timeline_partial(
     request: Request, agent_id: str, minutes: int = 60,
-) -> HTMLResponse:
-    repos = request.app.state.repos
+) -> _TemplateResponse:
+    repos = repos_from(request)
     if not await repos.agents.exists(agent_id):
         raise HTTPException(
             status_code=404, detail=f"agent {agent_id!r} not found"
@@ -244,8 +248,7 @@ async def agent_timeline_partial(
         if (w.agent_id == agent_id)
         or (w.agent_id is None and w.persona_name == agent_id)
     ]
-    templates = request.app.state.templates
-    return templates.TemplateResponse(
+    return templates_from(request).TemplateResponse(
         request, "partials/activity_body.html",
         {
             "events": events,

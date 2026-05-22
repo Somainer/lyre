@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import AsyncIterator, Awaitable, Callable
 
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
@@ -32,6 +33,7 @@ from ..dashboard_broadcaster import (
     EVENT_STATS,
 )
 from ..routes.home import _home_card_context
+from . import broadcaster_from, dashboard_broadcaster_from, repos_from, templates_from
 
 router = APIRouter()
 
@@ -42,10 +44,12 @@ router = APIRouter()
 
 
 @router.get("/sse/mailbox")
-async def sse_mailbox(request: Request, recipient: str = "owner"):
-    broadcaster = request.app.state.broadcaster
+async def sse_mailbox(
+    request: Request, recipient: str = "owner",
+) -> StreamingResponse:
+    broadcaster = broadcaster_from(request)
 
-    async def event_stream():
+    async def event_stream() -> AsyncIterator[str]:
         queue = broadcaster.subscribe()
         try:
             while True:
@@ -105,18 +109,20 @@ def _sse_format(event: str, html: str) -> str:
 
 async def _render_stats(request: Request) -> str:
     """Re-render the home stat tiles fragment."""
-    repos = request.app.state.repos
+    repos = repos_from(request)
     mcw = getattr(request.app.state, "model_context_windows", None)
     ctx = await _home_card_context(repos, mcw)
-    templates = request.app.state.templates
-    return templates.get_template("partials/home_cards.html").render(ctx)
+    html = templates_from(request).get_template(
+        "partials/home_cards.html"
+    ).render(ctx)
+    return str(html)
 
 
 async def _render_activity(
     request: Request, minutes: int, agent_id: str | None
 ) -> str:
     """Re-render the activity timeline fragment (global or per-agent)."""
-    repos = request.app.state.repos
+    repos = repos_from(request)
     mcw = getattr(request.app.state, "model_context_windows", None)
     events = await build_activity(
         repos,
@@ -132,31 +138,35 @@ async def _render_activity(
             if (w.agent_id == agent_id)
             or (w.agent_id is None and w.persona_name == agent_id)
         ]
-    templates = request.app.state.templates
-    return templates.get_template("partials/activity_body.html").render(
+    html = templates_from(request).get_template(
+        "partials/activity_body.html"
+    ).render(
         events=events, active_wakeups=active, window_minutes=minutes,
     )
+    return str(html)
 
 
 async def _render_agent_status(request: Request) -> str:
-    repos = request.app.state.repos
+    repos = repos_from(request)
     active = await list_active_wakeups(repos)
-    templates = request.app.state.templates
-    return templates.get_template("partials/agent_status.html").render(
-        active_wakeups=active,
-    )
+    html = templates_from(request).get_template(
+        "partials/agent_status.html"
+    ).render(active_wakeups=active)
+    return str(html)
 
 
 async def _render_health(request: Request) -> str:
-    repos = request.app.state.repos
+    repos = repos_from(request)
     active = await list_active_wakeups(repos)
-    templates = request.app.state.templates
-    return templates.get_template("partials/health.html").render(
-        active_count=len(active),
-    )
+    html = templates_from(request).get_template(
+        "partials/health.html"
+    ).render(active_count=len(active))
+    return str(html)
 
 
-_RENDERERS = {
+_Renderer = Callable[[Request, str | None, int], Awaitable[str]]
+
+_RENDERERS: dict[str, _Renderer] = {
     EVENT_STATS: lambda req, _aid, _m: _render_stats(req),
     EVENT_ACTIVITY: lambda req, aid, m: _render_activity(req, m, aid),
     EVENT_AGENT_STATUS: lambda req, _aid, _m: _render_agent_status(req),
@@ -191,7 +201,7 @@ async def sse_dashboard(
     agent_id: str | None = None,
     minutes: int = 30,
     events: str | None = None,
-):
+) -> StreamingResponse:
     """Push rendered HTML fragments whenever the relevant tables change.
 
     **No initial render.** The page route already renders each fragment
@@ -213,10 +223,10 @@ async def sse_dashboard(
                    Pages opt OUT of fragments they don't display so the
                    handler doesn't render fragments the DOM will discard.
     """
-    bc = getattr(request.app.state, "dashboard_broadcaster", None)
+    bc = dashboard_broadcaster_from(request)
     wanted = _parse_events(events)
 
-    async def event_stream():
+    async def event_stream() -> AsyncIterator[str]:
         # Fire one immediate keepalive comment so the browser sees the
         # response headers + body byte right away (otherwise some
         # proxies / browsers wait for the first event before flipping
@@ -233,22 +243,22 @@ async def sse_dashboard(
         # their own pages and the page route already inlines them.
         if (EVENT_HEALTH in wanted) or (EVENT_AGENT_STATUS in wanted):
             try:
-                repos = request.app.state.repos
+                repos = repos_from(request)
                 active = await list_active_wakeups(repos)
-                templates = request.app.state.templates
+                templates = templates_from(request)
                 if EVENT_HEALTH in wanted:
                     yield _sse_format(
                         EVENT_HEALTH,
-                        templates.get_template("partials/health.html").render(
-                            active_count=len(active),
-                        ),
+                        str(templates.get_template(
+                            "partials/health.html",
+                        ).render(active_count=len(active))),
                     )
                 if EVENT_AGENT_STATUS in wanted:
                     yield _sse_format(
                         EVENT_AGENT_STATUS,
-                        templates.get_template(
-                            "partials/agent_status.html"
-                        ).render(active_wakeups=active),
+                        str(templates.get_template(
+                            "partials/agent_status.html",
+                        ).render(active_wakeups=active)),
                     )
             except Exception:  # noqa: BLE001
                 # Don't tear the stream down for a single broken initial

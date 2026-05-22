@@ -8,8 +8,8 @@ stay focused on layout.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
-from typing import Any
 
 
 def fmt_tokens(n: int | None) -> str:
@@ -34,17 +34,16 @@ def fmt_ms(ms: int | None) -> str:
     return f"{m}m {s}s"
 
 
-def rel_time(dt: Any) -> str:
+def rel_time(dt: datetime | str | None) -> str:
     """Relative time from now. Accepts datetime, ISO string, or None."""
     if dt is None:
         return "—"
     if isinstance(dt, str):
         try:
-            dt = datetime.fromisoformat(dt.replace("Z", "+00:00"))
+            parsed = datetime.fromisoformat(dt.replace("Z", "+00:00"))
         except ValueError:
             return dt
-    if not isinstance(dt, datetime):
-        return str(dt)
+        dt = parsed
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=UTC)
     delta = datetime.now(UTC) - dt
@@ -60,17 +59,16 @@ def rel_time(dt: Any) -> str:
     return f"{s // 86_400}d ago"
 
 
-def clock_time(dt: Any) -> str:
+def clock_time(dt: datetime | str | None) -> str:
     """HH:MM in the local clock — used in the live-feed list."""
     if dt is None:
         return "—"
     if isinstance(dt, str):
         try:
-            dt = datetime.fromisoformat(dt.replace("Z", "+00:00"))
+            parsed = datetime.fromisoformat(dt.replace("Z", "+00:00"))
         except ValueError:
             return dt[11:16] if len(dt) >= 16 else dt
-    if not isinstance(dt, datetime):
-        return str(dt)
+        dt = parsed
     return dt.strftime("%H:%M")
 
 
@@ -94,7 +92,7 @@ def utc_iso_hours_ago(hours: int) -> str:
     return utc_iso_minutes_ago(hours * 60)
 
 
-def bucket_into(values: list[Any], buckets: int = 12) -> list[int]:
+def bucket_into(values: Sequence[object], buckets: int = 12) -> list[int]:
     """Squash a sequence into N equal-count buckets for the sparkline.
     Returns one int per bucket — useful for spark() macro."""
     if not values or buckets <= 0:

@@ -63,7 +63,7 @@ class ModelEndpoint:
     api: str = "chat-completions"
 
     @classmethod
-    def from_dict(cls, d: dict | None) -> ModelEndpoint:
+    def from_dict(cls, d: dict[str, Any] | None) -> ModelEndpoint:
         d = d or {}
         raw_headers = d.get("headers") or {}
         if not isinstance(raw_headers, dict):
@@ -125,7 +125,7 @@ class ModelCost:
     output: float | None
 
     @classmethod
-    def from_dict(cls, d: dict | None) -> ModelCost:
+    def from_dict(cls, d: dict[str, Any] | None) -> ModelCost:
         d = d or {}
         return cls(input=d.get("input"), output=d.get("output"))
 
@@ -161,7 +161,7 @@ class ModelRegistry:
         return [e for e in self.entries if e.status == "enabled"]
 
 
-def _validate_entry(d: dict, idx: int) -> None:
+def _validate_entry(d: dict[str, Any], idx: int) -> None:
     required = ("id", "provider", "tier", "capabilities")
     for k in required:
         if k not in d:
@@ -286,7 +286,8 @@ def merge_user_entries(
 
 def _user_entry_id(raw: Any) -> str:
     """Pluck the id off either a dict or a typed config.ModelEntry."""
-    return raw["id"] if isinstance(raw, dict) else raw.id
+    rid: str = raw["id"] if isinstance(raw, dict) else raw.id
+    return rid
 
 
 def _user_entry_to_runtime(

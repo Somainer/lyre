@@ -94,7 +94,7 @@ class LarkChannel:
         self.dispatcher_id = dispatcher_id
         # Late-imported so the import-time cost of lark-oapi only
         # hits processes that actually enable the integration.
-        import lark_oapi
+        import lark_oapi  # type: ignore[import-untyped]
 
         self._lark = lark_oapi
         # Async-capable client for outbound API calls. Built lazily
@@ -299,20 +299,9 @@ class LarkChannel:
     ) -> MailboxMessage | None:
         """Find a mail whose metadata records this Lark message id.
         Used to resolve thread-reply recipients."""
-        # SQLite JSON1 path query — small mail volumes per user,
-        # acceptable to scan. If this becomes hot we can add an
-        # index on metadata->>'$.channels.lark.message_id'.
-        async with self.repos.conn.execute(
-            "SELECT * FROM mailbox_messages "
-            "WHERE json_extract(metadata, "
-            "  '$.channels.lark.message_id') = ? "
-            "LIMIT 1",
-            (lark_message_id,),
-        ) as cur:
-            row = await cur.fetchone()
-        if row is None:
-            return None
-        return self.repos.mailbox._row_to_msg(row)
+        return await self.repos.mailbox.find_by_channel_external_id(
+            "lark", lark_message_id,
+        )
 
     async def _download_images(
         self, lark_message_id: str, image_keys: list[str],
@@ -328,7 +317,9 @@ class LarkChannel:
             )
             return []
         blob_ids: list[str] = []
-        from lark_oapi.api.im.v1 import GetMessageResourceRequest
+        from lark_oapi.api.im.v1 import (  # type: ignore[import-untyped]
+            GetMessageResourceRequest,
+        )
 
         for key in image_keys:
             req = (
@@ -345,7 +336,16 @@ class LarkChannel:
                     file_key=key, code=resp.code, msg=resp.msg,
                 )
                 continue
-            data = resp.file.getvalue() if isinstance(resp.file, io.IOBase) else resp.file
+            # ``resp.file`` is typed loosely by the SDK; at runtime it's
+            # either a BytesIO-like buffer (download stream) or the raw
+            # bytes. ``getvalue`` exists on BytesIO but not the abstract
+            # ``IOBase`` mypy sees, so the cast is needed only for the
+            # type-checker.
+            file_obj = resp.file
+            if isinstance(file_obj, io.IOBase) and hasattr(file_obj, "getvalue"):
+                data = file_obj.getvalue()
+            else:
+                data = file_obj
             # Lark doesn't surface a MIME type on download. Sniff
             # from the magic bytes — png/jpg/gif/webp cover the
             # vast majority of screenshots and phone-camera images.

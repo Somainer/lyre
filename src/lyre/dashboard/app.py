@@ -11,6 +11,7 @@ Sprint D2 will fold reply / approve / dispatch / cancel into the same shape.
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -82,7 +83,7 @@ def create_app(
     keepalive-pings.
     """
     @asynccontextmanager
-    async def lifespan(app: FastAPI):
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # Broadcaster lifecycle is managed externally (by `lyre serve`)
         # because it shares the asyncio loop with Scheduler etc.; we just
         # validate it's ready.

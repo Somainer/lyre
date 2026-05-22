@@ -20,16 +20,21 @@ from ..persistence.repositories import Repositories
 log = structlog.get_logger()
 
 
+# Queue payload: a fresh MailboxMessage, or None as the shutdown
+# sentinel that wakes SSE handlers out of their drain loop.
+SubscriberQueue = asyncio.Queue[MailboxMessage | None]
+
+
 @dataclass
 class MailboxBroadcaster:
     repos: Repositories
     recipient: str = "owner"
     poll_interval_s: float = 0.5
     queue_max: int = 200
-    _subscribers: set[asyncio.Queue] = field(default_factory=set)
+    _subscribers: set[SubscriberQueue] = field(default_factory=set)
     _last_seen_id: int = 0
     _stop_event: asyncio.Event = field(default_factory=asyncio.Event)
-    _task: asyncio.Task | None = None
+    _task: asyncio.Task[None] | None = None
 
     async def prime(self) -> None:
         """Initialize the watermark to the current max id so we only fan out
@@ -42,8 +47,8 @@ class MailboxBroadcaster:
         if recent and recent[0].id is not None:
             self._last_seen_id = recent[0].id
 
-    def subscribe(self) -> asyncio.Queue:
-        q: asyncio.Queue = asyncio.Queue(maxsize=self.queue_max)
+    def subscribe(self) -> SubscriberQueue:
+        q: SubscriberQueue = asyncio.Queue(maxsize=self.queue_max)
         self._subscribers.add(q)
         log.debug(
             "broadcaster_subscribed",
@@ -52,7 +57,7 @@ class MailboxBroadcaster:
         )
         return q
 
-    def unsubscribe(self, q: asyncio.Queue) -> None:
+    def unsubscribe(self, q: SubscriberQueue) -> None:
         self._subscribers.discard(q)
         log.debug(
             "broadcaster_unsubscribed",
@@ -88,14 +93,14 @@ class MailboxBroadcaster:
         """
         for q in list(self._subscribers):
             try:
-                q.put_nowait(None)  # type: ignore[arg-type]
+                q.put_nowait(None)
             except asyncio.QueueFull:
                 # Make room — full queue means a slow subscriber that's
                 # about to be torn down anyway; we just need them to
                 # wake at least once.
                 try:
                     q.get_nowait()
-                    q.put_nowait(None)  # type: ignore[arg-type]
+                    q.put_nowait(None)
                 except (asyncio.QueueEmpty, asyncio.QueueFull):
                     pass
 

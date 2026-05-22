@@ -26,12 +26,13 @@ import asyncio
 import os
 import sys
 from collections.abc import Callable
+from typing import Any
 
 import structlog
 
 from ..adapter.llm_adapter import LLMAdapter
 from ..config import Config
-from ..persistence.models import Persona, TaskSpec
+from ..persistence.models import Persona, ScheduledMail, TaskSpec
 from ..persistence.repositories import Repositories
 from ..runtime.adapter_factory import AdapterFactory, model_name_for_provider
 from ..runtime.agent_loop import AgentLoop
@@ -341,6 +342,9 @@ class Scheduler:
                     },
                 )
             )
+            # top.id is non-None because read_unread only returns
+            # persisted rows (the watermark column itself is NOT NULL).
+            assert top.id is not None  # noqa: S101 — narrows for mypy
             await self.repos.mailbox.set_last_auto_triggered_id(
                 agent.id, top.id
             )
@@ -420,13 +424,10 @@ class Scheduler:
                 # UNIQUE collision = already delivered before the previous
                 # run crashed mid-update. Look up the existing row's id so
                 # we can still set last_delivery_id correctly (FK protected).
-                async with self.repos.scheduled_mail.conn.execute(
-                    "SELECT id FROM mailbox_messages "
-                    "WHERE recipient = ? AND external_id = ?",
-                    (recipient, external_id),
-                ) as cur:
-                    existing = await cur.fetchone()
-                delivered_msg_id = int(existing["id"]) if existing else 0
+                existing_id = await self.repos.mailbox.find_id_by_external_id(
+                    recipient, external_id,
+                )
+                delivered_msg_id = existing_id or 0
             else:
                 delivered_msg_id = msg_id
 
@@ -435,10 +436,13 @@ class Scheduler:
                 sched.recur_kind,
                 sched.recur_value,
                 after=now,
-                recur_until=sched.recur_until,  # type: ignore[arg-type]
+                recur_until=sched.recur_until,
             )
+            # sched was loaded from a persisted row — its id is always set
+            # by the time it lands in the delivery loop.
+            assert sched.id is not None  # noqa: S101 — narrows for mypy
             await self.repos.scheduled_mail.mark_delivered(
-                mail_id=sched.id,  # type: ignore[arg-type]
+                mail_id=sched.id,
                 delivered_msg_id=delivered_msg_id,
                 next_scheduled_for=iso(next_fire) if next_fire else None,
                 completed=(next_fire is None),
@@ -453,7 +457,7 @@ class Scheduler:
             )
 
     async def _bounce_scheduled_mail(
-        self, sched, reason: str
+        self, sched: ScheduledMail, reason: str
     ) -> None:
         """Deliver a bounce notice back to the creator and mark the
         schedule bounced. If the creator is also gone (e.g. archived in
@@ -493,6 +497,7 @@ class Scheduler:
                 reason=reason,
                 creator=creator,
             )
+        assert sched.id is not None  # noqa: S101 — narrows for mypy
         await self.repos.scheduled_mail.mark_bounced(sched.id, reason)
 
     async def _run_task(self, task_id: str) -> None:
@@ -695,7 +700,7 @@ class Scheduler:
                 tasks_repo=self.repos.tasks,
             )
 
-            extras: dict = {}
+            extras: dict[str, Any] = {}
             if worktree_handle:
                 extras["worktree"] = str(worktree_handle.dir)
                 extras["env_overlay"] = worktree_handle.env_overlay()

@@ -441,7 +441,7 @@ class AgentLoop:
             messages.append(LyreMessage(role="assistant", content=assistant_blocks))
 
             # Execute tools and feed results back.
-            tool_result_blocks: list[LyreContentBlock] = []
+            tool_result_blocks = []
             for tu in tool_uses_this_turn:
                 result, is_error = await self._dispatch_tool(
                     tu["name"], tu["id"], tu["input"]
