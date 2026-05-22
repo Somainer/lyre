@@ -135,16 +135,29 @@ class LarkChannel:
             .build()
         )
         def _run_ws() -> None:
-            # ws.Client.__init__ captures ``asyncio.get_event_loop()``
-            # into ``self.loop`` and reuses it for every later
-            # ``run_until_complete``. If we built the Client on the main
-            # thread (where uvicorn / scheduler are running their loop),
-            # ``start()`` would call ``run_until_complete`` on the main
-            # loop — which is already running — and crash with
-            # ``RuntimeError: This event loop is already running``. So:
-            # set a fresh loop in this thread FIRST, then construct the
-            # Client so it captures *this* loop, then start it.
-            asyncio.set_event_loop(asyncio.new_event_loop())
+            # lark_oapi's WS client captures an event loop in TWO
+            # places that both default to ``asyncio.get_event_loop()``
+            # at the wrong time:
+            #
+            #   - ``lark_oapi.ws.client.loop`` — a module-level global
+            #     bound at FIRST IMPORT of the module (which happens on
+            #     the main thread during LarkChannel construction).
+            #   - ``ExpiringCache.__init__`` — captured per-instance.
+            #
+            # Because the module-level binding is the one ``start()``,
+            # ``_connect()``, ``_disconnect()`` all use, setting the
+            # thread's event loop alone is not enough — we must also
+            # rebind that module global. Doing this before constructing
+            # the Client also makes ExpiringCache pick up the new loop
+            # via ``get_event_loop`` and schedule its sweeper task on
+            # *this* thread's loop instead of the main loop (which
+            # produced the "Task was destroyed but it is pending"
+            # warning chain).
+            new_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(new_loop)
+            from lark_oapi.ws import client as _ws_mod  # type: ignore[import-untyped]
+            _ws_mod.loop = new_loop
+
             ws = self._lark.ws.Client(
                 self.cfg.app_id,
                 self.cfg.app_secret,
