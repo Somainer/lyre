@@ -23,7 +23,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from ..identity import compose_id, is_bootstrap, is_valid_agent_id
+from ..identity import compose_id, is_valid_agent_id
 from . import Tool, ToolContext, ToolError
 
 _MAX_BYTES = 64 * 1024  # 64 KiB; the index already shows description, body
@@ -267,14 +267,15 @@ async def _create_agent(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any
     persona_name = args.get("persona")
     if not isinstance(persona_name, str) or not persona_name:
         raise ToolError("persona required (string)")
-    if is_bootstrap(persona_name):
-        raise ToolError(
-            f"persona {persona_name!r} is reserved for bootstrap agents; "
-            f"pick a different persona"
-        )
     persona = await ctx.repos.personas.get(persona_name)
     if persona is None or persona.status != "approved":
         raise ToolError(f"persona '{persona_name}' not found or not approved")
+    if persona.kind == "singleton":
+        raise ToolError(
+            f"persona {persona_name!r} is a singleton role — only one "
+            f"agent of this persona ever exists (the bootstrap-seeded "
+            f"one). Pick a different persona to spawn."
+        )
 
     name = args.get("name")
     if name is None:
@@ -396,16 +397,18 @@ async def _archive_agent(
     agent_id = args.get("agent_id")
     if not isinstance(agent_id, str) or not agent_id:
         raise ToolError("agent_id required (string)")
-    bootstrap_ids = ctx.extras.get("bootstrap_agent_ids") or frozenset(
-        {"owner", "dispatcher", "analyst-1", "reviewer-1"}
-    )
-    if agent_id in bootstrap_ids:
+    # Bootstrap-seeded singletons (parent_agent_id IS NULL) are pinned —
+    # the runtime expects owner / dispatcher / analyst-1 / reviewer-1
+    # (or their custom-renamed equivalents) to always exist. Archiving
+    # one breaks auto-wake-on-mail, Phase 0, etc.
+    target = await ctx.repos.agents.get(agent_id)
+    if target is None:
+        raise ToolError(f"agent {agent_id!r} not found")
+    if target.parent_agent_id is None:
         raise ToolError(
-            f"refusing to archive well-known agent {agent_id!r}; "
+            f"refusing to archive bootstrap-seeded agent {agent_id!r}; "
             f"this would break system bootstrap"
         )
-    if not await ctx.repos.agents.exists(agent_id):
-        raise ToolError(f"agent {agent_id!r} not found")
     changed = await ctx.repos.agents.archive(agent_id)
     return {
         "agent_id": agent_id,

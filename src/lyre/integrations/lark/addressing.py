@@ -16,7 +16,8 @@ inbox. Three resolution rules, in priority order:
      bot account itself — separate concept; users address agents in
      body text, not via Lark mentions.
 
-  3. **Default** — fall through to ``config.bootstrap.dispatcher_id``.
+  3. **Default** — fall through to the dispatcher persona's
+     bootstrap-seeded agent id (its ``display_name`` from identity.md).
      Most natural "DM the team lead" semantics.
 
 The parser is pure (no I/O), so it tests cheaply.
@@ -66,7 +67,8 @@ def resolve(
         message_body: raw text from the Lark message (may begin with
             ``@<agent_id>`` and a separator).
         default_recipient: where to send when no other signal is
-            present (typically ``config.bootstrap.dispatcher_id``).
+            present (typically the dispatcher persona's seeded agent
+            id — its ``display_name`` from identity.md).
         thread_recipient: if the message is a reply inside a thread
             we previously published to Lark, the agent_id of the
             original mail's recipient (from

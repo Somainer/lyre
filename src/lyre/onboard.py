@@ -20,7 +20,7 @@ from __future__ import annotations
 import os
 import re
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -176,9 +176,6 @@ def write_config_toml(
     owner_email: str | None,
     models: list[ModelSpec] | None = None,
     default_model: str | None = None,
-    dispatcher_id: str = "dispatcher",
-    analyst_id: str = "analyst-1",
-    reviewer_id: str = "reviewer-1",
 ) -> None:
     """Write ``~/.lyre/config.toml`` with the minimum fields onboard sets.
 
@@ -208,21 +205,10 @@ def write_config_toml(
         lines.append(f'default_model = "{_toml_escape(default_model)}"')
         lines.append("")
 
-    # Owner-facing names for the three role agents (persona names — dispatcher
-    # / analyst / reviewer — stay fixed as they're system identifiers). Edit
-    # to taste; the names are what `lyre send <name>` and mailbox addressing
-    # use.
-    needs_bootstrap = (
-        dispatcher_id != "dispatcher"
-        or analyst_id != "analyst-1"
-        or reviewer_id != "reviewer-1"
-    )
-    if needs_bootstrap:
-        lines.append("[bootstrap]")
-        lines.append(f'dispatcher_id = "{_toml_escape(dispatcher_id)}"')
-        lines.append(f'analyst_id = "{_toml_escape(analyst_id)}"')
-        lines.append(f'reviewer_id = "{_toml_escape(reviewer_id)}"')
-        lines.append("")
+    # Persona display names (e.g. "luna" instead of "dispatcher") live in
+    # ~/.lyre/personas/<name>/identity.md as `display_name:` frontmatter —
+    # NOT in config.toml. SSOT: a persona's identity is one file. The
+    # wizard edits that file directly when the owner picks a new name.
 
     for model in models or []:
         # Endpoint: empty string ⇒ use adapter's SDK default (TOML can't
@@ -382,16 +368,11 @@ class OnboardPlan:
     default_model: str | None             # router fallback
     api_keys_in_env: list[str]            # env vars already present in shell
     api_keys_written_to_env_file: list[str]  # env vars pasted into ~/.lyre/.env
-    # Owner-facing names for the seeded bootstrap role agents. Defaults are
-    # the persona name itself ("dispatcher" etc.); owner can override here
-    # to give them personality ("luna" / "scribe" / "cassandra").
-    dispatcher_id: str = "dispatcher"
-    analyst_id: str = "analyst-1"
-    reviewer_id: str = "reviewer-1"
-    # If non-empty, written to ~/.lyre/personas/dispatcher/APPEND.md and
-    # injected at the bottom of dispatcher's system prompt every wakeup.
-    # This is where the owner gives the dispatcher its voice / style.
-    dispatcher_soul: str = ""
+    # Persona display names the wizard wrote back to each persona's
+    # ~/.lyre/personas/<name>/identity.md (the SSOT for this). The plan
+    # surfaces them for reporting only — identity.md already has them
+    # by the time wizard returns.
+    persona_display_names: dict[str, str] = field(default_factory=dict)
 
 
 async def bootstrap_runtime(cfg: Any) -> list[str]:  # noqa: ANN401 — Config
@@ -400,10 +381,16 @@ async def bootstrap_runtime(cfg: Any) -> list[str]:  # noqa: ANN401 — Config
     Used by ``lyre onboard`` after the wizard, and by tests as a
     non-interactive subset of the wizard. Idempotent.
     Returns the list of newly-created agent ids.
+
+    Bootstrap agent ids come from each persona's ``display_name`` (or
+    ``name`` if absent) — read from identity.md at seed time. No
+    config.toml [bootstrap] section involved; personas/<name>/identity.md
+    is the single source of truth for "what to call this persona".
     """
     # Populate ~/.lyre/personas/ from shipped if needed. Idempotent — only
     # copies what's missing, so user edits / deletions are preserved across
-    # subsequent boots.
+    # subsequent boots. Also seeds an empty APPEND.md alongside each
+    # identity.md so the customization slot is discoverable.
     ensure_user_personas(cfg.user_personas_dir)
 
     conn = await init_db(cfg.db_path)
@@ -417,15 +404,8 @@ async def bootstrap_runtime(cfg: Any) -> list[str]:  # noqa: ANN401 — Config
         )
         ensure_skeleton(cfg.memory_path)
         ensure_shipped_facts(cfg.memory_path)
-        from .personas.seed import _resolved_default_agents
-        bootstrap_pairs = _resolved_default_agents(
-            dispatcher_id=cfg.bootstrap.dispatcher_id,
-            analyst_id=cfg.bootstrap.analyst_id,
-            reviewer_id=cfg.bootstrap.reviewer_id,
-        )
         created_agents = await seed_default_agents(
-            repos.agents, memory_root=cfg.memory_path,
-            agents=bootstrap_pairs,
+            repos.personas, repos.agents, memory_root=cfg.memory_path,
         )
         ensure_skills_skeleton(cfg.lyre_home)
         return created_agents
@@ -433,12 +413,20 @@ async def bootstrap_runtime(cfg: Any) -> list[str]:  # noqa: ANN401 — Config
         await conn.close()
 
 
-def run_wizard(*, lyre_home: Path) -> OnboardPlan:
+def run_wizard(
+    *, lyre_home: Path, current_cfg: Any = None,  # noqa: ANN401 — Config
+) -> OnboardPlan:
     """Interactive flow. Writes ``config.toml`` / ``.env`` / ``user.md`` /
-    bootstrap directories under ``lyre_home``.
+    persona identity.md frontmatter under ``lyre_home``.
 
     DB initialization and persona seeding happen in the CLI command after
     this returns, so the wizard module stays free of async dependencies.
+
+    Incremental: when ``current_cfg`` is provided, every prompt pre-fills
+    the existing value as default so a re-run that wants to keep
+    everything is just Enter-Enter-Enter. Models section also gets a
+    "keep / add / remove / start over" menu instead of forcing a full
+    re-walk of every entry.
     """
     config_path = lyre_home / "config.toml"
     user_md_path = lyre_home / "user.md"
@@ -462,41 +450,71 @@ def run_wizard(*, lyre_home: Path) -> OnboardPlan:
     click.echo(
         "  Used for the dashboard greeting and any owner-addressed mail."
     )
+    # Pre-fill from current Config (re-run) before falling back to
+    # git config / USER. Re-running onboard with nothing to change is
+    # then literally Enter-Enter through every section.
+    existing_owner_name = (
+        current_cfg.owner.name
+        if current_cfg is not None and current_cfg.owner.name != "owner"
+        else None
+    )
     default_name = (
-        detect_git_user_name() or os.environ.get("USER") or "owner"
+        existing_owner_name
+        or detect_git_user_name()
+        or os.environ.get("USER")
+        or "owner"
     )
     owner_name = click.prompt(
         "  Owner name", default=default_name,
     ).strip() or default_name
 
-    default_email = detect_git_user_email() or ""
+    existing_owner_email = (
+        current_cfg.owner.email if current_cfg is not None else None
+    )
+    default_email = existing_owner_email or detect_git_user_email() or ""
     owner_email_raw = click.prompt(
         "  Owner email (optional, press Enter to skip)",
         default=default_email, show_default=bool(default_email),
     ).strip()
     owner_email = owner_email_raw or None
 
-    # ---- [2/3] models (loop until user picks "done") ----
+    # ---- [2/3] models (incremental: keep / add / remove / start over) ----
     click.echo("")
     click.echo(click.style("[2/3] Model endpoints", bold=True))
     click.echo(
         "  Configure one or more LLM endpoints. You can mix Anthropic and\n"
-        "  OpenAI-compatible providers, point at proxies, etc. Pick 'Done'\n"
-        "  when finished."
+        "  OpenAI-compatible providers, point at proxies, etc."
     )
-    models: list[ModelSpec] = []
     api_keys_in_env: list[str] = []
     api_keys_written: list[str] = []
 
-    while True:
-        spec = _prompt_for_one_model(
-            existing_count=len(models), env_path=env_path,
+    # Seed with existing entries (re-onboard) so owner sees them as the
+    # starting point. _entry_to_spec recovers the wizard-shaped ModelSpec
+    # from the persisted ModelEntry.
+    models: list[ModelSpec] = (
+        [_entry_to_spec(e) for e in current_cfg.models]
+        if current_cfg is not None else []
+    )
+
+    if models:
+        # Re-onboard with existing entries → menu mode. First run with
+        # zero entries → straight into the add loop (no menu cluttering).
+        models = _model_edit_loop(
+            models, env_path=env_path,
             api_keys_in_env=api_keys_in_env,
             api_keys_written=api_keys_written,
         )
-        if spec is None:
-            break  # user picked "Done"
-        models.append(spec)
+    else:
+        click.echo("  Pick 'Done' when finished.")
+        while True:
+            spec = _prompt_for_one_model(
+                existing_count=len(models), env_path=env_path,
+                api_keys_in_env=api_keys_in_env,
+                api_keys_written=api_keys_written,
+            )
+            if spec is None:
+                break  # user picked "Done"
+            models.append(spec)
 
     # ---- default_model picker (only when >1 configured) ----
     default_model: str | None
@@ -509,9 +527,19 @@ def run_wizard(*, lyre_home: Path) -> OnboardPlan:
         click.echo("Configured models:")
         for i, m in enumerate(models, start=1):
             click.echo(f"  {i}) {_model_summary_line(m)}")
+        # Pre-select the existing default if it survived the edit loop.
+        existing_default = (
+            current_cfg.default_model if current_cfg is not None else None
+        )
+        default_idx = 1
+        if existing_default:
+            for i, m in enumerate(models, start=1):
+                if m.id == existing_default:
+                    default_idx = i
+                    break
         idx = click.prompt(
             "Which one is the router's default (used when no persona preference matches)?",
-            type=click.IntRange(1, len(models)), default=1,
+            type=click.IntRange(1, len(models)), default=default_idx,
         )
         default_model = models[idx - 1].id
         click.echo("")
@@ -534,100 +562,56 @@ def run_wizard(*, lyre_home: Path) -> OnboardPlan:
         write_user_md_template(user_md_path)
         click.echo(f"  ✓ wrote {user_md_path}")
 
-    # ---- bootstrap agent names + soul ----
-    # The persona names (dispatcher / analyst / reviewer) are system
-    # identifiers — they stay. The AGENT ids are what the owner sees and
-    # addresses, so they're free to personalize: "luna" for the dispatcher,
-    # whatever. The soul question writes to APPEND.md, which the runtime
-    # injects at the bottom of the persona's system prompt every wakeup.
-    click.echo("")
-    click.echo(click.style("Bootstrap agents", bold=True))
-    click.echo(
-        "Lyre seeds three role agents. Persona roles are fixed (dispatcher /\n"
-        "analyst / reviewer) but the owner-facing AGENT names are yours to pick."
-    )
-    dispatcher_id = _prompt_agent_id(
-        "Dispatcher name (the agent you'll mostly talk to)",
-        default="dispatcher",
-    )
-    analyst_id = _prompt_agent_id(
-        "Analyst name (does research, writes specs)",
-        default="analyst-1",
-    )
-    reviewer_id = _prompt_agent_id(
-        "Reviewer name (reviews PRs and skill proposals)",
-        default="reviewer-1",
-    )
+    # ---- persona display names (writes to identity.md frontmatter) ----
+    # Must materialize user-personas/ first so identity.md exists for
+    # every shipped persona — that's the file the wizard is about to
+    # patch in place. Idempotent + non-overwriting on existing files
+    # (owner edits stick).
+    from .personas.seed import ensure_user_personas as _ensure_personas
+    user_personas_dir.mkdir(parents=True, exist_ok=True)
+    _ensure_personas(user_personas_dir)
 
     click.echo("")
+    click.echo(click.style("Persona display names", bold=True))
     click.echo(
-        f"Optional: describe {dispatcher_id}'s voice / style / quirks. This goes"
+        "  Each role agent gets a display name — what `lyre send <name>` and\n"
+        "  the dashboard use. Press Enter to keep the current one."
     )
-    click.echo(
-        "into ~/.lyre/personas/dispatcher/APPEND.md and is appended to its"
-    )
-    click.echo(
-        "system prompt every wakeup. Examples: 'Concise. British understatement.'"
-    )
-    click.echo("Press Enter to skip.")
-    dispatcher_soul = click.prompt(
-        f"{dispatcher_id}'s soul (one line)",
-        default="", show_default=False,
-    ).strip()
+    persona_display_names: dict[str, str] = {}
+    for identity_path in sorted(user_personas_dir.glob("*/identity.md")):
+        persona_name = identity_path.parent.name
+        front, _body = _read_persona_frontmatter(identity_path)
+        kind = front.get("kind", "spawn_only")
+        if kind not in ("singleton", "seeded"):
+            continue  # spawn_only: no default singleton to name
+        current = front.get("display_name") or persona_name
+        new_display = _prompt_agent_id(
+            f"  {persona_name}'s display name",
+            default=current,
+        )
+        persona_display_names[persona_name] = new_display
+        if new_display != current:
+            _rewrite_persona_display_name(identity_path, new_display)
+            click.echo(f"    ✓ updated {identity_path}")
 
     # ---- config.toml ----
-    if config_path.is_file():
-        if not click.confirm(
-            f"\n{config_path} already exists — overwrite with new owner/provider settings?",
-            default=False,
-        ):
-            click.echo(f"  ! kept existing {config_path}")
-        else:
-            write_config_toml(
-                config_path,
-                owner_name=owner_name,
-                owner_email=owner_email,
-                models=models,
-                default_model=default_model,
-                dispatcher_id=dispatcher_id,
-                analyst_id=analyst_id,
-                reviewer_id=reviewer_id,
-            )
-            click.echo(f"  ✓ wrote {config_path}")
-    else:
-        write_config_toml(
-            config_path,
-            owner_name=owner_name,
-            owner_email=owner_email,
-            models=models,
-            default_model=default_model,
-            dispatcher_id=dispatcher_id,
-            analyst_id=analyst_id,
-            reviewer_id=reviewer_id,
-        )
-        click.echo(f"  ✓ wrote {config_path}")
-
-    # Write dispatcher soul to APPEND.md if provided. We do this AFTER
-    # config.toml + skeleton dirs so the personas/ dir is guaranteed to exist.
-    if dispatcher_soul:
-        dispatcher_dir = user_personas_dir / "dispatcher"
-        dispatcher_dir.mkdir(parents=True, exist_ok=True)
-        append_path = dispatcher_dir / "APPEND.md"
-        # Preserve existing APPEND.md content if any — owner may have hand-
-        # crafted it across re-runs.
-        existing = append_path.read_text(encoding="utf-8") if append_path.exists() else ""
-        if dispatcher_soul not in existing:
-            sep = "\n" if existing and not existing.endswith("\n") else ""
-            append_path.write_text(
-                existing + sep + f"\n# Voice & style\n{dispatcher_soul}\n",
-                encoding="utf-8",
-            )
-            click.echo(f"  ✓ wrote {append_path}")
+    # Always rewrite. SSOT for what wizard owns lives in this file — we
+    # control its shape end-to-end. (Owner-added [runtime] knobs they
+    # care about persisting belong in a future "write-back unchanged"
+    # path; for now they need to re-add after onboard. Documented as a
+    # limitation.)
+    write_config_toml(
+        config_path,
+        owner_name=owner_name,
+        owner_email=owner_email,
+        models=models,
+        default_model=default_model,
+    )
+    click.echo(f"  ✓ wrote {config_path}")
 
     # ---- skeleton dirs ----
     memory_path.mkdir(parents=True, exist_ok=True)
     skills_path.mkdir(parents=True, exist_ok=True)
-    user_personas_dir.mkdir(parents=True, exist_ok=True)
 
     return OnboardPlan(
         config_path=config_path,
@@ -643,10 +627,7 @@ def run_wizard(*, lyre_home: Path) -> OnboardPlan:
         default_model=default_model,
         api_keys_in_env=api_keys_in_env,
         api_keys_written_to_env_file=api_keys_written,
-        dispatcher_id=dispatcher_id,
-        analyst_id=analyst_id,
-        reviewer_id=reviewer_id,
-        dispatcher_soul=dispatcher_soul,
+        persona_display_names=persona_display_names,
     )
 
 
@@ -718,6 +699,122 @@ def _prompt_agent_id(message: str, *, default: str) -> str:
         if hint:
             click.echo(hint)
         return value
+
+
+def _entry_to_spec(e: Any) -> ModelSpec:  # noqa: ANN401 — ModelEntry
+    """Convert a persisted ``ModelEntry`` (config.toml shape) back into a
+    wizard-shaped ``ModelSpec`` so re-onboard can show the entries the
+    owner already configured."""
+    ep = e.endpoint or {}
+    headers = tuple(sorted((ep.get("headers") or {}).items()))
+    return ModelSpec(
+        id=e.id,
+        provider=e.provider,
+        endpoint=ep.get("base_url") or "",
+        auth_env=ep.get("auth_env") or "",
+        headers=headers,
+        api=ep.get("api") or "chat-completions",
+    )
+
+
+def _model_edit_loop(
+    existing: list[ModelSpec],
+    *,
+    env_path: Path,
+    api_keys_in_env: list[str],
+    api_keys_written: list[str],
+) -> list[ModelSpec]:
+    """Menu-driven incremental editor: keep / add / remove / start over.
+
+    Re-onboard convenience — owner who's already configured 2 endpoints
+    shouldn't have to re-walk the add-loop just to tweak something else.
+    `[k]` exits keeping current list as-is; `[s]` zeros out and drops
+    into the add loop.
+    """
+    models = list(existing)
+    while True:
+        click.echo("")
+        click.echo(f"  Currently configured ({len(models)}):")
+        for i, m in enumerate(models, start=1):
+            click.echo(f"    {i}) {_model_summary_line(m)}")
+        click.echo("    [k] keep all and continue")
+        click.echo("    [a] add another")
+        click.echo("    [r] remove one")
+        click.echo("    [s] start over (drop all)")
+        choice = click.prompt("  > ", default="k").strip().lower()
+        if choice in ("k", ""):
+            return models
+        if choice == "a":
+            spec = _prompt_for_one_model(
+                existing_count=len(models), env_path=env_path,
+                api_keys_in_env=api_keys_in_env,
+                api_keys_written=api_keys_written,
+            )
+            if spec is not None:
+                models.append(spec)
+        elif choice == "r":
+            if not models:
+                click.echo("    (nothing to remove)")
+                continue
+            idx = click.prompt(
+                "    Remove which #?",
+                type=click.IntRange(1, len(models)),
+            )
+            removed = models.pop(idx - 1)
+            click.echo(f"    ✗ dropped {removed.id}")
+        elif choice == "s":
+            models = []
+            click.echo("    (cleared; pick 'Done' below when finished re-adding)")
+            while True:
+                spec = _prompt_for_one_model(
+                    existing_count=len(models), env_path=env_path,
+                    api_keys_in_env=api_keys_in_env,
+                    api_keys_written=api_keys_written,
+                )
+                if spec is None:
+                    break
+                models.append(spec)
+            return models
+        else:
+            click.echo("    (k/a/r/s only)")
+
+
+def _read_persona_frontmatter(path: Path) -> tuple[dict[str, Any], str]:
+    """Parse a persona identity.md into (frontmatter_dict, body_text).
+
+    Thin wrapper around :func:`lyre.personas.seed._parse_markdown_with_frontmatter`
+    so the wizard doesn't import private helpers directly."""
+    import yaml as _yaml  # local; wizard module is rarely imported
+
+    raw = path.read_text(encoding="utf-8")
+    if not raw.startswith("---\n"):
+        return {}, raw
+    end = raw.find("\n---\n", 4)
+    if end < 0:
+        return {}, raw
+    front_text = raw[4:end]
+    body = raw[end + 5 :].lstrip("\n")
+    front = _yaml.safe_load(front_text) or {}
+    return front, body
+
+
+def _rewrite_persona_display_name(path: Path, new_display: str) -> None:
+    """Set the ``display_name`` frontmatter field on ``path`` to
+    ``new_display`` and rewrite the file in place. Preserves every
+    other frontmatter field and the markdown body verbatim.
+
+    This is the SSOT write path for "owner renamed their dispatcher" —
+    config.toml has no notion of display_name."""
+    import yaml as _yaml
+
+    front, body = _read_persona_frontmatter(path)
+    front["display_name"] = new_display
+    new_front = _yaml.safe_dump(
+        front, sort_keys=False, allow_unicode=True,
+    ).strip()
+    path.write_text(
+        f"---\n{new_front}\n---\n\n{body}", encoding="utf-8",
+    )
 
 
 def _prompt_for_one_model(

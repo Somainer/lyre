@@ -16,7 +16,6 @@ from collections.abc import Awaitable, Callable
 import structlog
 import uvicorn
 
-from ..config import BootstrapConfig
 from ..persistence.repositories import Repositories
 from . import MailboxBroadcaster, create_app
 from .dashboard_broadcaster import DashboardBroadcaster
@@ -35,7 +34,6 @@ async def run_dashboard(
     model_context_windows: dict[str, int] | None = None,
     owner_name: str | None = None,
     blob_store: object | None = None,
-    bootstrap: BootstrapConfig | None = None,
 ) -> None:
     """Start the broadcaster + uvicorn server until `stop_event` is set
     (or the server otherwise exits). Designed for two callers:
@@ -68,7 +66,6 @@ async def run_dashboard(
         model_context_windows=model_context_windows,
         owner_name=owner_name,
         blob_store=blob_store,
-        bootstrap=bootstrap,
     )
     # lifespan="off": we don't use ASGI lifespan messages (the handler in
     # app.py is a no-op `yield`). With it on, Starlette's lifespan task

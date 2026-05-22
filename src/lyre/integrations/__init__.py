@@ -9,10 +9,11 @@ Two responsibilities per channel:
   1. **Inbound**: events from the external system that the
      ``authorized_user_id`` produced become mail rows with
      ``sender="owner"`` and a recipient chosen by addressing rules
-     (default → ``config.bootstrap.dispatcher_id``; ``@<agent_id>``
-     prefix override; thread-reply inherits its parent's recipient).
-     Goes through ``repos.mailbox.insert_message`` directly — no
-     outbox, since the owner sits at the system edge.
+     (default → dispatcher persona's seeded agent id, i.e. its
+     ``display_name`` from identity.md; ``@<agent_id>`` prefix
+     override; thread-reply inherits its parent's recipient). Goes
+     through ``repos.mailbox.insert_message`` directly — no outbox,
+     since the owner sits at the system edge.
 
   2. **Outbound**: mail addressed ``recipient="owner"`` is mirrored
      to every enabled channel via the ``channel_publish`` outbox

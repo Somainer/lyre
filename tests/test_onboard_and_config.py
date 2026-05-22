@@ -133,61 +133,57 @@ model_preference = { prefer = ["anthropic.claude-opus-4-7"] }
     assert o.model_preference == {"prefer": ["anthropic.claude-opus-4-7"]}
 
 
-def test_config_bootstrap_defaults_when_section_absent(
+def test_config_warns_on_deprecated_bootstrap_section(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    monkeypatch.setenv("LYRE_HOME", str(tmp_path))
-    monkeypatch.chdir(tmp_path)
-    cfg = Config.from_env()
-    assert cfg.bootstrap.dispatcher_id == "dispatcher"
-    assert cfg.bootstrap.analyst_id == "analyst-1"
-    assert cfg.bootstrap.reviewer_id == "reviewer-1"
+    """The old ``[bootstrap]`` section is ignored — display_name now lives
+    in each persona's identity.md. Loaders should log a warning on
+    encounter so the owner notices an obsolete config block."""
+    import logging
 
-
-def test_config_bootstrap_reads_custom_agent_ids(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
     monkeypatch.setenv("LYRE_HOME", str(tmp_path))
     monkeypatch.chdir(tmp_path)
     (tmp_path / "config.toml").write_text(
-        """
-[owner]
-name = "o"
-
-[bootstrap]
-dispatcher_id = "luna"
-analyst_id = "scribe"
-reviewer_id = "cassandra"
-""",
+        '[owner]\nname = "o"\n\n[bootstrap]\ndispatcher_id = "luna"\n',
         encoding="utf-8",
     )
-
-    cfg = Config.from_env()
-    assert cfg.bootstrap.dispatcher_id == "luna"
-    assert cfg.bootstrap.analyst_id == "scribe"
-    assert cfg.bootstrap.reviewer_id == "cassandra"
+    with caplog.at_level(logging.WARNING):
+        Config.from_env()
+    assert any("[bootstrap]" in rec.message for rec in caplog.records)
 
 
-def test_bootstrap_runtime_uses_custom_dispatcher_id(
+def test_bootstrap_runtime_seeds_from_persona_display_names(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """When config.toml [bootstrap] gives custom names, seeded agents use those."""
+    """Owner customizes a persona by editing identity.md — display_name
+    drives the seeded agent id."""
     import asyncio
 
     monkeypatch.setenv("LYRE_HOME", str(tmp_path))
     monkeypatch.chdir(tmp_path)
     (tmp_path / "config.toml").write_text(
-        '[owner]\nname = "o"\n\n[bootstrap]\ndispatcher_id = "luna"\n'
-        'analyst_id = "scribe"\nreviewer_id = "cassandra"\n',
+        '[owner]\nname = "o"\n', encoding="utf-8",
+    )
+
+    # First bootstrap copies shipped personas → user dir, seeds defaults.
+    cfg = Config.from_env()
+    asyncio.run(bootstrap_runtime(cfg))
+
+    # Owner edits identity.md to rename the dispatcher's display_name.
+    dispatcher_md = cfg.user_personas_dir / "dispatcher" / "identity.md"
+    text = dispatcher_md.read_text(encoding="utf-8")
+    dispatcher_md.write_text(
+        text.replace("display_name: dispatcher", "display_name: luna"),
         encoding="utf-8",
     )
-    cfg = Config.from_env()
-    created = asyncio.run(bootstrap_runtime(cfg))
-    assert {"luna", "scribe", "cassandra"} <= set(created)
-    # Notes files created under the custom names.
-    assert (cfg.memory_path / "facts" / "agent-luna-notes.md").is_file()
-    assert (cfg.memory_path / "facts" / "agent-scribe-notes.md").is_file()
-    assert (cfg.memory_path / "facts" / "agent-cassandra-notes.md").is_file()
+
+    # Re-bootstrap picks up the rename: new agent seeded under "luna",
+    # old "dispatcher" agent retired.
+    cfg2 = Config.from_env()
+    created = asyncio.run(bootstrap_runtime(cfg2))
+    assert "luna" in created
+    assert (cfg2.memory_path / "facts" / "agent-luna-notes.md").is_file()
 
 
 def test_config_integrations_lark_disabled_by_default(

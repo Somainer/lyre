@@ -133,10 +133,13 @@ class SqlitePersonaRepository:
         await self.conn.execute(
             """
             INSERT INTO personas (
-              name, role_description, system_prompt, allowed_lyre_tools,
+              name, display_name, kind,
+              role_description, system_prompt, allowed_lyre_tools,
               model_preference, needs_worktree, status, metadata
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(name) DO UPDATE SET
+              display_name     = excluded.display_name,
+              kind             = excluded.kind,
               role_description = excluded.role_description,
               system_prompt    = excluded.system_prompt,
               allowed_lyre_tools = excluded.allowed_lyre_tools,
@@ -148,6 +151,8 @@ class SqlitePersonaRepository:
             """,
             (
                 persona.name,
+                persona.display_name,
+                persona.kind,
                 persona.role_description,
                 persona.system_prompt,
                 json.dumps(persona.allowed_lyre_tools),
@@ -207,8 +212,19 @@ class SqlitePersonaRepository:
 
     @staticmethod
     def _row_to_persona(row: aiosqlite.Row) -> Persona:
+        keys = set(row.keys())
+        # display_name / kind columns added in migration 0006 — NULL on
+        # pre-0006 rows. The Persona model handles those defaults
+        # (display_name → None → label falls back to name; kind → "spawn_only").
         return Persona(
             name=row["name"],
+            display_name=(
+                row["display_name"] if "display_name" in keys else None
+            ),
+            kind=(
+                (row["kind"] or "spawn_only") if "kind" in keys
+                else "spawn_only"
+            ),
             role_description=row["role_description"],
             system_prompt=row["system_prompt"],
             allowed_lyre_tools=_parse_json(row["allowed_lyre_tools"]) or [],

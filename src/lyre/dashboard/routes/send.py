@@ -15,14 +15,11 @@ import uuid
 from fastapi import APIRouter, File, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse
 
-from ...config import BootstrapConfig
 from ...persistence.models import Blob, MailboxMessage
 from ...persistence.repositories import Repositories
 from ...runtime.identity import (
     compose_id,
-    is_bootstrap,
     is_valid_agent_id,
-    split_id,
 )
 
 # Hard cap on a single upload. The model burns vision tokens by
@@ -62,53 +59,78 @@ async def _personas_for_form(repos: Repositories) -> list[str]:
     return ["owner", *names] if any(p.name == "owner" for p in rows) else names
 
 
-# Persona names whose name input is force-disabled in the form UI — the
-# "send page" treats them as strict singletons (mail goes to the bootstrap
-# agent id from Config.bootstrap, no `<persona>/<name>` composition). Owner
-# and dispatcher are always in this set; analyst / reviewer remain
-# "name-optional" so the owner can still spawn parallel instances via the
-# same form by typing a name.
-_NAME_DISABLED_PERSONAS = ("owner", "dispatcher")
-# Persona names that have a seeded singleton (no name needed; resolves to
-# the configured bootstrap id). Includes analyst / reviewer because their
-# singleton CAN be addressed without a name even though spawning is allowed.
-_SEEDED_SINGLETON_PERSONAS = ("owner", "dispatcher", "analyst", "reviewer")
+async def _persona_seed_agent_id(
+    repos: Repositories, persona_name: str,
+) -> str | None:
+    """Resolve persona name → the bootstrap-seeded agent id, or None if
+    the persona doesn't have one (``kind == "spawn_only"``).
+
+    SSOT path: the persona's ``display_name`` (from identity.md) is the
+    agent id at seed time. Returns the live id by querying the persona
+    row (display_name fallback to name) — re-onboards that change
+    display_name propagate here on the next call.
+    """
+    p = await repos.personas.get(persona_name)
+    if p is None or p.kind == "spawn_only":
+        return None
+    return p.display_name or p.name
 
 
-def _bootstrap_singleton_id(persona: str, bootstrap: BootstrapConfig) -> str | None:
-    """Resolve persona name → the configured bootstrap agent id, or None
-    if this persona has no seeded singleton."""
-    if persona == "owner":
-        return "owner"
-    if persona == "dispatcher":
-        return bootstrap.dispatcher_id
-    if persona == "analyst":
-        return bootstrap.analyst_id
-    if persona == "reviewer":
-        return bootstrap.reviewer_id
-    return None
+async def _singleton_persona_names(repos: Repositories) -> list[str]:
+    """Persona names whose ``kind == "singleton"`` — exactly one agent
+    exists per persona, no spawning. Drives the name-input-disabled JS
+    in the send form so the owner can't try to address a non-existent
+    ``dispatcher/foo``.
+    """
+    rows = await repos.personas.list_active()
+    return sorted(p.name for p in rows if p.kind == "singleton")
+
+
+async def _resolve_preset(
+    repos: Repositories, preset_to: str | None,
+) -> tuple[str, str, str | None]:
+    """Decide form defaults (recipient, persona, name) from ?to=...
+
+    No ``to`` → fall back to the dispatcher persona's seeded agent id
+    (its display_name, e.g. ``dispatcher`` or ``luna``).  ``to`` with a
+    ``/`` splits to persona/name.  Bare ``to`` resolves to its persona
+    via the agents table (so an agent with display_name ``luna`` selects
+    the ``dispatcher`` row in the dropdown).
+    """
+    if not preset_to:
+        dispatcher = await repos.personas.get("dispatcher")
+        if dispatcher is not None:
+            seed_id = dispatcher.display_name or dispatcher.name
+            return seed_id, "dispatcher", None
+        return "owner", "owner", None
+    if "/" in preset_to:
+        persona, _, name = preset_to.partition("/")
+        return preset_to, persona, name or None
+    agent = await repos.agents.get(preset_to)
+    if agent is not None:
+        return preset_to, agent.persona_name, None
+    return preset_to, preset_to, None
 
 
 async def _ensure_agent(
-    repos, persona: str, name: str, bootstrap: BootstrapConfig,
+    repos: Repositories, persona: str, name: str,
     *, parent: str = "owner",
 ) -> str | tuple[None, str]:
     """Compose persona/name → agent_id. Create the agent if missing.
 
     Returns the agent_id on success or `(None, error)` on failure.
 
-    For seeded-singleton personas (owner / dispatcher / analyst / reviewer),
-    blank `name` resolves to the configured agent id (e.g. "luna" if the
-    owner customized dispatcher_id via [bootstrap] in config.toml).
+    For ``singleton`` / ``seeded`` personas, blank ``name`` resolves to
+    the persona's current bootstrap-seeded agent id (display_name in
+    identity.md). For ``spawn_only`` personas a name is required.
     """
-    singleton_id = _bootstrap_singleton_id(persona, bootstrap)
-    if singleton_id is not None and not name:
-        agent_id = singleton_id
+    seed_id = await _persona_seed_agent_id(repos, persona)
+    if seed_id is not None and not name:
+        agent_id = seed_id
     elif not name:
         return None, (
             f"persona {persona!r} needs a name (e.g. 'refactor-auth'); "
-            f"only seeded-singleton personas (owner, dispatcher, analyst, "
-            f"reviewer) can be addressed without one."
+            f"only singleton / seeded personas can be addressed without one."
         )
     else:
         agent_id = compose_id(persona, name)
@@ -122,15 +144,21 @@ async def _ensure_agent(
     if await repos.agents.exists(agent_id):
         return agent_id
 
-    # Bootstrap singleton should already exist; if not it's a setup bug,
-    # not a spawn-on-the-fly case.
-    if singleton_id is not None and agent_id == singleton_id:
-        return None, f"bootstrap agent {agent_id!r} missing from DB"
+    # Bootstrap-seeded agent should already exist; if not it's a setup
+    # bug, not a spawn-on-the-fly case.
+    if seed_id is not None and agent_id == seed_id:
+        return None, f"bootstrap-seeded agent {agent_id!r} missing from DB"
 
-    # Validate persona exists & is approved before spawning.
+    # Validate persona exists, is approved, and isn't a singleton role
+    # (which forbids further spawning).
     persona_row = await repos.personas.get(persona)
     if persona_row is None or persona_row.status != "approved":
         return None, f"persona {persona!r} is not approved"
+    if persona_row.kind == "singleton":
+        return None, (
+            f"persona {persona!r} is a singleton role — its one agent "
+            f"already exists and no more can be spawned"
+        )
 
     await repos.agents.create(
         agent_id=agent_id,
@@ -161,19 +189,6 @@ async def _known_agent_ids(repos) -> list[str]:
     )
 
 
-def _split_preset(preset_to: str, default_dispatcher_id: str) -> tuple[str, str | None]:
-    """Initial values for the persona+name pair when the form is opened
-    with ?to=<existing-agent-id>. Bootstrap stays bare; spawned splits
-    on /. Unknown shapes fall back to the dispatcher's CURRENT agent id
-    (`config.bootstrap.dispatcher_id`, e.g. "luna" if customized)."""
-    if not preset_to:
-        return default_dispatcher_id, None
-    if is_bootstrap(preset_to):
-        return preset_to, None
-    persona, name = split_id(preset_to)
-    return persona, name
-
-
 @router.get("/send", response_class=HTMLResponse)
 async def send_form(
     request: Request,
@@ -182,14 +197,13 @@ async def send_form(
 ) -> HTMLResponse:
     repos = request.app.state.repos
     templates = request.app.state.templates
-    bootstrap = request.app.state.bootstrap
     reply_ctx = None
-    preset_to = to or bootstrap.dispatcher_id
+    requested = to
     if reply_to is not None:
         reply_ctx = await _load_reply_context(repos, reply_to)
         if reply_ctx is not None:
-            preset_to = reply_ctx["sender"]
-    preset_persona, preset_name = _split_preset(preset_to, bootstrap.dispatcher_id)
+            requested = reply_ctx["sender"]
+    preset_to, preset_persona, preset_name = await _resolve_preset(repos, requested)
     return templates.TemplateResponse(
         request, "send.html",
         {
@@ -202,7 +216,7 @@ async def send_form(
             "sender_default": "owner",
             "known_agents": await _known_agent_ids(repos),
             "personas": await _personas_for_form(repos),
-            "bootstrap_personas": list(_NAME_DISABLED_PERSONAS),
+            "singleton_personas": await _singleton_persona_names(repos),
         },
     )
 
@@ -233,25 +247,25 @@ async def send_post(
     templates = request.app.state.templates
     repos = request.app.state.repos
     blob_store = getattr(request.app.state, "blob_store", None)
-    bootstrap = request.app.state.bootstrap
     spawn = spawn_if_missing in ("1", "on", "true")
 
     async def render_err(msg: str, status: int = 400) -> HTMLResponse:
+        preset_to, preset_persona, preset_name = await _resolve_preset(
+            repos, recipient or (compose_id(persona, name or "") if persona else None),
+        )
         return templates.TemplateResponse(
             request, "send.html",
             {
                 "tab": "send",
-                "preset_to": recipient or compose_id(
-                    persona or bootstrap.dispatcher_id, name or "",
-                ),
-                "preset_persona": persona or bootstrap.dispatcher_id,
-                "preset_name": name,
+                "preset_to": preset_to,
+                "preset_persona": preset_persona,
+                "preset_name": preset_name,
                 "reply_to": reply_to,
                 "error": msg,
                 "sender_default": sender or "owner",
                 "known_agents": await _known_agent_ids(repos),
                 "personas": await _personas_for_form(repos),
-                "bootstrap_personas": list(_NAME_DISABLED_PERSONAS),
+                "singleton_personas": await _singleton_persona_names(repos),
             },
             status_code=status,
         )
@@ -261,11 +275,11 @@ async def send_post(
 
     if persona:
         if spawn:
-            resolved = await _ensure_agent(repos, persona, name or "", bootstrap)
+            resolved = await _ensure_agent(repos, persona, name or "")
         else:
-            singleton_id = _bootstrap_singleton_id(persona, bootstrap)
-            if singleton_id is not None and not (name or "").strip():
-                agent_id = singleton_id
+            seed_id = await _persona_seed_agent_id(repos, persona)
+            if seed_id is not None and not (name or "").strip():
+                agent_id = seed_id
             else:
                 agent_id = compose_id(persona, name or "")
             if not is_valid_agent_id(agent_id):
@@ -349,12 +363,12 @@ async def send_post(
         + (f" (in reply to #{reply_to})" if reply_to else "")
         + (f" — {len(blob_ids)} attachment(s)" if blob_ids else "")
     )
-    preset_persona, preset_name = _split_preset(final_recipient, bootstrap.dispatcher_id)
+    preset_to, preset_persona, preset_name = await _resolve_preset(repos, final_recipient)
     return templates.TemplateResponse(
         request, "send.html",
         {
             "tab": "send",
-            "preset_to": final_recipient,
+            "preset_to": preset_to,
             "preset_persona": preset_persona,
             "preset_name": preset_name,
             "reply_to": None,
@@ -362,7 +376,7 @@ async def send_post(
             "sender_default": sender or "owner",
             "known_agents": await _known_agent_ids(repos),
             "personas": await _personas_for_form(repos),
-            "bootstrap_personas": list(_NAME_DISABLED_PERSONAS),
+            "singleton_personas": await _singleton_persona_names(repos),
         },
     )
 

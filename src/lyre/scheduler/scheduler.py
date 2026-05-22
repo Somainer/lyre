@@ -704,15 +704,10 @@ class Scheduler:
             # list_models / future router-aware tools read these.
             extras["model_registry"] = self.registry
             extras["health_tracker"] = self.health
-            # archive_agent reads this to refuse archiving bootstrap agents.
-            extras["bootstrap_agent_ids"] = frozenset(
-                {
-                    "owner",
-                    self.config.bootstrap.dispatcher_id,
-                    self.config.bootstrap.analyst_id,
-                    self.config.bootstrap.reviewer_id,
-                }
-            )
+            # archive_agent (tool) consults the agents table at call time
+            # for "is this a bootstrap-seeded singleton" via
+            # parent_agent_id IS NULL. No need to pre-compute a snapshot
+            # here — DB is the SSOT.
             tool_ctx = ToolContext(
                 repos=self.repos,
                 task_id=task_id,

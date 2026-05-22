@@ -21,9 +21,19 @@ async def ctx(repos: SqliteRepositories) -> ToolContext:
     so we seed one agent per persona with id == persona name (matches the
     bootstrap behaviour for owner/dispatcher).
     """
-    for name in ("worker", "dispatcher", "owner"):
+    # owner/dispatcher are kind="singleton" (mirrors the shipped personas):
+    # create_agent must refuse to spawn duplicates of those roles.
+    persona_kinds: dict[str, str] = {
+        "owner": "singleton",
+        "dispatcher": "singleton",
+        "worker": "spawn_only",
+    }
+    for name, kind in persona_kinds.items():
         await repos.personas.upsert(
-            Persona(name=name, role_description=name, system_prompt=name)
+            Persona(
+                name=name, kind=kind,  # type: ignore[arg-type]
+                role_description=name, system_prompt=name,
+            )
         )
         await repos.agents.create(agent_id=name, persona_name=name)
     task_id = await repos.tasks.create(
@@ -643,8 +653,8 @@ async def test_create_agent_validates_inputs(ctx: ToolContext) -> None:
         await CREATE_AGENT.handler(
             ctx, {"persona": "worker", "name": "Has Spaces"}
         )
-    # Bootstrap personas can't be respawned with this tool.
-    with pytest.raises(ToolError, match="reserved for bootstrap"):
+    # Singleton personas can't be respawned with this tool.
+    with pytest.raises(ToolError, match="singleton role"):
         await CREATE_AGENT.handler(ctx, {"persona": "dispatcher", "name": "x"})
 
 
@@ -702,8 +712,10 @@ async def test_create_agent_pre_creates_notes_file(
 async def test_seed_default_agents_pre_creates_notes_files(
     tmp_path,
 ) -> None:
-    """`lyre onboard` path: owner + dispatcher notes files materialize next to
-    the memory skeleton on first bootstrap."""
+    """`lyre onboard` path: owner + dispatcher notes files materialize
+    next to the memory skeleton on first bootstrap. Seeding walks the
+    personas table — singleton + seeded kinds get bootstrap agents
+    (id = display_name fallback to name), spawn_only is skipped."""
     from pathlib import Path
 
     from lyre.persistence.db import init_db
@@ -715,16 +727,24 @@ async def test_seed_default_agents_pre_creates_notes_files(
     conn = await init_db(":memory:")
     try:
         repos = SqliteRepositories(conn)
-        # Personas must exist before agents (FK). DEFAULT_AGENTS ships
-        # owner/dispatcher/analyst/reviewer; each needs its persona row.
-        for name in ("owner", "dispatcher", "analyst", "reviewer"):
+        persona_setup = [
+            ("owner",     "singleton", "owner"),
+            ("dispatcher","singleton", "dispatcher"),
+            ("analyst",   "seeded",    "analyst-1"),
+            ("reviewer",  "seeded",    "reviewer-1"),
+            ("worker",    "spawn_only", None),
+        ]
+        for name, kind, display in persona_setup:
             await repos.personas.upsert(
-                Persona(name=name, role_description=name, system_prompt=name)
+                Persona(
+                    name=name, kind=kind, display_name=display,  # type: ignore[arg-type]
+                    role_description=name, system_prompt=name,
+                )
             )
         created = await seed_default_agents(
-            repos.agents, memory_root=memory_root,
+            repos.personas, repos.agents, memory_root=memory_root,
         )
-        assert {"owner", "dispatcher", "analyst-1", "reviewer-1"} <= set(created)
+        assert {"owner", "dispatcher", "analyst-1", "reviewer-1"} == set(created)
         for aid in ("owner", "dispatcher", "analyst-1", "reviewer-1"):
             p = memory_root / "facts" / f"agent-{aid}-notes.md"
             assert p.exists(), f"missing notes file for {aid}"
@@ -732,7 +752,9 @@ async def test_seed_default_agents_pre_creates_notes_files(
         # Idempotent on re-run — notes content not clobbered.
         custom = memory_root / "facts" / "agent-owner-notes.md"
         custom.write_text("custom content", encoding="utf-8")
-        await seed_default_agents(repos.agents, memory_root=memory_root)
+        await seed_default_agents(
+            repos.personas, repos.agents, memory_root=memory_root,
+        )
         assert custom.read_text(encoding="utf-8") == "custom content"
     finally:
         await conn.close()
@@ -748,7 +770,7 @@ async def test_archive_agent_refuses_bootstrap(ctx: ToolContext) -> None:
     out = await ARCHIVE_AGENT.handler(ctx, {"agent_id": "worker/scratch"})
     assert out["archived"] is True
 
-    with pytest.raises(ToolError, match="well-known agent"):
+    with pytest.raises(ToolError, match="bootstrap-seeded agent"):
         await ARCHIVE_AGENT.handler(ctx, {"agent_id": "dispatcher"})
     with pytest.raises(ToolError, match="not found"):
         await ARCHIVE_AGENT.handler(ctx, {"agent_id": "no-such-agent"})

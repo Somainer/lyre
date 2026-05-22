@@ -28,7 +28,14 @@ async def activity_page(
     recipients = [a for a in agents if a.id != "owner"]
 
     templates = request.app.state.templates
-    bootstrap = request.app.state.bootstrap
+    # Compose dock default — dispatcher persona's seeded agent id from
+    # identity.md (display_name fallback to name). Falls back to owner
+    # if no dispatcher persona is registered.
+    dispatcher = await repos.personas.get("dispatcher")
+    if dispatcher is not None:
+        default_recipient = dispatcher.display_name or dispatcher.name
+    else:
+        default_recipient = "owner"
     return templates.TemplateResponse(
         request, "activity.html",
         {
@@ -37,7 +44,7 @@ async def activity_page(
             "active_wakeups": active,
             "window_minutes": minutes,
             "compose_recipients": recipients,
-            "default_recipient": bootstrap.dispatcher_id,
+            "default_recipient": default_recipient,
             # SSE stream URL params — global view, but honor the picked
             # time window so the broadcaster renders the same fragment
             # the page initially showed.

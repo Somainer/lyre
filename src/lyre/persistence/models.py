@@ -61,8 +61,27 @@ class Agent(BaseModel):
         return (self.metadata or {}).get("description")
 
 
+PersonaKind = Literal["singleton", "seeded", "spawn_only"]
+
+
 class Persona(BaseModel):
+    """Role definition. ``name`` is the immutable system identifier (file
+    name, FK target, hardcoded references). ``display_name`` is the
+    owner-visible label — defaults to ``name`` and can be edited freely
+    via identity.md frontmatter.
+
+    ``kind`` classifies the persona's spawn rules:
+
+      - ``singleton``  — seed one agent at onboard, refuse create_agent
+                         (owner, dispatcher).
+      - ``seeded``     — seed one agent at onboard, allow create_agent
+                         for parallel instances (analyst, reviewer).
+      - ``spawn_only`` — do NOT seed; only create_agent (worker-maintainer).
+    """
+
     name: str
+    display_name: str | None = None
+    kind: PersonaKind = "spawn_only"
     role_description: str
     system_prompt: str
     allowed_lyre_tools: list[str] = Field(default_factory=list)
@@ -78,6 +97,13 @@ class Persona(BaseModel):
     metadata: dict[str, Any] | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
+
+    @property
+    def label(self) -> str:
+        """User-facing label — display_name if set, otherwise name. Use
+        this anywhere the prompt / template needs to render the persona
+        for the owner to read; reserve ``name`` for system addressing."""
+        return self.display_name or self.name
 
 
 class Task(BaseModel):

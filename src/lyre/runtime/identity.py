@@ -1,59 +1,59 @@
-"""Agent identity — single source of truth for the agent_id format.
+"""Agent identity — single source of truth for the agent_id GRAMMAR.
 
 Format:
-  - Bootstrap agents: bare lowercase token (`owner`, `leader`).
-  - Spawned agents:   `<persona>/<name>` where each segment is
-    lowercase letters/digits/hyphens, persona must start with a letter,
-    name must start with a letter or digit.
+  - Bare ids:     lowercase token, used by bootstrap-seeded agents whose
+                  display_name owns the slot (owner; dispatcher / analyst-1
+                  / reviewer-1 by default, or custom display names like
+                  "luna" / "scribe" the owner picks in identity.md).
+  - Spawned ids:  ``<persona>/<name>`` where each segment is lowercase
+                  letters/digits/hyphens; persona starts with a letter,
+                  name starts with a letter or digit.
 
-The regex is enforced by `create_agent` (the only spawn path that
-takes external input) and by `mailbox_send` recipient validation. We
-deliberately do NOT enforce it on `agents.create` itself so the
+The regex is enforced by ``create_agent`` (the only spawn path that
+takes external input) and by ``mailbox_send`` recipient validation. We
+deliberately do NOT enforce it on ``agents.create`` itself so the
 bootstrap seed can keep its bare-id agents.
 
 Format guarantees:
-  * `splitId(id)` is unambiguous — at most one `/` per id.
-  * No collisions between persona names and spawn names (persona
-    can't contain `/`, names can't either).
-  * Filesystem-safe (matches the `agent-<id>-notes.md` file convention,
-    where `/` becomes a one-level directory).
+  * ``split_id(id)`` is unambiguous — at most one ``/`` per id.
+  * No collisions between persona names and spawn names (persona can't
+    contain ``/``, names can't either).
+  * Filesystem-safe (matches the ``agent-<id>-notes.md`` file convention,
+    where ``/`` becomes a one-level directory).
+
+This module is GRAMMAR-only. It deliberately does NOT export "is this id
+a bootstrap-seeded singleton?" — that's runtime state (live in
+``agents.parent_agent_id IS NULL`` in the DB), not a syntactic property.
+Callers needing that distinction query the agent table directly.
 """
 
 from __future__ import annotations
 
 import re
 
-# Two anchored patterns: the bootstrap form (bare) and the spawned form.
+# Two anchored patterns: the bare form and the spawned form.
 # Persona segment: starts with a letter, then letters/digits/hyphens.
 # Name segment: starts with a letter or digit, then letters/digits/hyphens.
 _PERSONA_RE = r"[a-z][a-z0-9-]*"
 _NAME_RE = r"[a-z0-9][a-z0-9-]*"
 AGENT_ID_RE = re.compile(rf"^{_PERSONA_RE}(/{_NAME_RE})?$")
 
-BOOTSTRAP_IDS: frozenset[str] = frozenset({"owner", "dispatcher"})
-
 
 def is_valid_agent_id(agent_id: str) -> bool:
-    """True iff `agent_id` matches the agent-id grammar."""
+    """True iff ``agent_id`` matches the agent-id grammar."""
     return bool(AGENT_ID_RE.fullmatch(agent_id))
 
 
-def is_bootstrap(agent_id: str) -> bool:
-    """`owner` and `dispatcher` are reserved bootstrap personas: no parent,
-    can't be spawned via `create_agent` (the system seeds exactly one).
-    Everything else must use `<persona>/<name>`.
-
-    Note: analyst and reviewer ALSO have bootstrap-seeded singletons
-    (`analyst-1`, `reviewer-1`) — but those personas are NOT reserved, so
-    `create_agent(persona="analyst", name="x")` is allowed for parallel
-    research. The set here is just the owner-facing singleton roles.
-    """
-    return agent_id in BOOTSTRAP_IDS
+def is_bare_id(agent_id: str) -> bool:
+    """True iff ``agent_id`` has no ``/`` — i.e. is in the bare form used
+    by bootstrap-seeded agents. NOT a check on whether the agent IS
+    bootstrap (that's DB state via ``parent_agent_id IS NULL``)."""
+    return "/" not in agent_id
 
 
 def split_id(agent_id: str) -> tuple[str, str | None]:
-    """`worker-maintainer/refactor-auth` → (`worker-maintainer`,
-    `refactor-auth`). Bare ids return (id, None)."""
+    """``worker-maintainer/refactor-auth`` → (``worker-maintainer``,
+    ``refactor-auth``). Bare ids return (id, None)."""
     if "/" in agent_id:
         persona, name = agent_id.split("/", 1)
         return persona, name
@@ -62,23 +62,23 @@ def split_id(agent_id: str) -> tuple[str, str | None]:
 
 def compose_id(persona: str, name: str | None) -> str:
     """Inverse of split_id. If name is None, returns just the persona
-    (caller is responsible for ensuring that's a bootstrap id)."""
+    (caller is responsible for ensuring that's a valid bare id)."""
     if name is None or name == "":
         return persona
     return f"{persona}/{name}"
 
 
 def validate_agent_id(agent_id: str) -> None:
-    """Raise ValueError if `agent_id` doesn't match the grammar.
+    """Raise ValueError if ``agent_id`` doesn't match the grammar.
 
-    Use at trust boundaries: the `create_agent` tool, the `mailbox_send`
-    recipient validator, the dashboard send form. Anti-hallucination
-    measure: the model invented agent ids like `leader-scheduler` before
-    we added validation.
+    Use at trust boundaries: the ``create_agent`` tool, the
+    ``mailbox_send`` recipient validator, the dashboard send form. Anti-
+    hallucination measure: models invent agent ids like
+    ``leader-scheduler`` from time to time.
     """
     if not is_valid_agent_id(agent_id):
         raise ValueError(
-            f"invalid agent_id {agent_id!r}: must be either a bootstrap "
-            f"id (`owner`, `leader`) or `persona/name` with each "
-            f"segment matching {_PERSONA_RE!r}."
+            f"invalid agent_id {agent_id!r}: must be a bare lowercase "
+            f"token or ``persona/name`` with each segment matching "
+            f"{_PERSONA_RE!r}."
         )
