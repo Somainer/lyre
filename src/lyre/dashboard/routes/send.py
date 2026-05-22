@@ -17,6 +17,7 @@ from fastapi.responses import HTMLResponse
 
 from ...config import BootstrapConfig
 from ...persistence.models import Blob, MailboxMessage
+from ...persistence.repositories import Repositories
 from ...runtime.identity import (
     compose_id,
     is_bootstrap,
@@ -45,17 +46,20 @@ _ACCEPTED_MEDIA_TYPES: frozenset[str] = frozenset({
 router = APIRouter()
 
 
-def _personas_for_form() -> list[str]:
-    """Persona choices shown in the dropdown. Bootstrap personas
-    (`owner`, `dispatcher`) appear so the owner can send to them; the rest
-    cover the shipped persona set."""
-    return [
-        "owner",
-        "dispatcher",
-        "analyst",
-        "reviewer",
-        "worker-maintainer",
-    ]
+async def _personas_for_form(repos: Repositories) -> list[str]:
+    """Persona choices shown in the dropdown — every approved persona in
+    the DB. Returning a live query (instead of the old hardcoded list)
+    means custom personas the owner adds under
+    ``~/.lyre/personas/<name>/identity.md`` show up here without any
+    code change, alongside the shipped ones.
+
+    Ordering: ``owner`` first (it's the human, not a role); everything
+    else alphabetical. Deprecated personas are filtered out by
+    list_active's default ``status="approved"`` filter.
+    """
+    rows = await repos.personas.list_active()
+    names = sorted(p.name for p in rows if p.name != "owner")
+    return ["owner", *names] if any(p.name == "owner" for p in rows) else names
 
 
 # Persona names whose name input is force-disabled in the form UI — the
@@ -197,7 +201,7 @@ async def send_form(
             "reply_ctx": reply_ctx,
             "sender_default": "owner",
             "known_agents": await _known_agent_ids(repos),
-            "personas": _personas_for_form(),
+            "personas": await _personas_for_form(repos),
             "bootstrap_personas": list(_NAME_DISABLED_PERSONAS),
         },
     )
@@ -246,7 +250,7 @@ async def send_post(
                 "error": msg,
                 "sender_default": sender or "owner",
                 "known_agents": await _known_agent_ids(repos),
-                "personas": _personas_for_form(),
+                "personas": await _personas_for_form(repos),
                 "bootstrap_personas": list(_NAME_DISABLED_PERSONAS),
             },
             status_code=status,
@@ -357,7 +361,7 @@ async def send_post(
             "success": success,
             "sender_default": sender or "owner",
             "known_agents": await _known_agent_ids(repos),
-            "personas": _personas_for_form(),
+            "personas": await _personas_for_form(repos),
             "bootstrap_personas": list(_NAME_DISABLED_PERSONAS),
         },
     )
