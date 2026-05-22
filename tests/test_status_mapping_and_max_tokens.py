@@ -1,7 +1,8 @@
 """Regression tests for the failure-report tracked at
-``docs/design/`` — three coupled issues uncovered when a real analyst
+``docs/design/`` — coupled issues uncovered when a real analyst
 wakeup wedged at max_turns and the post-loop write hit the
-``tasks.status`` CHECK constraint.
+``tasks.status`` CHECK constraint, plus the follow-up phantom-
+delegation report.
 
 The fixes verified here:
 
@@ -15,6 +16,9 @@ P2  ``AgentLoop._dispatch_tool`` recognises the adapter's ``_raw``
     fallback (set when the JSON parse fails — usually because of
     truncation) and surfaces a specific error so the model breaks
     out of the retry-with-same-malformed-args loop.
+P3  ``_check_phantom_delegation`` warns when a wakeup mailed the owner
+    without successfully dispatching anything in the same wakeup
+    (the body almost certainly claims work that didn't happen).
 """
 
 from __future__ import annotations
@@ -225,3 +229,102 @@ async def test_dispatch_tool_passes_through_well_formed_args(
     # invariant is: we did NOT short-circuit with the truncation
     # error — the handler was actually reached.
     assert "malformed arguments" not in out
+
+
+# ---------------------------------------------------------------------------
+# P3: phantom-delegation observability
+# ---------------------------------------------------------------------------
+
+
+def _tu(name: str, **input_kwargs: object) -> dict[str, object]:
+    """Shorthand for a tool-call dict matching the AgentLoop shape."""
+    return {"name": name, "id": f"tu_{name}", "input": dict(input_kwargs)}
+
+
+def test_phantom_delegation_warns_on_owner_mail_without_successful_dispatch(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The failure case from the report: create_agent fails twice,
+    list_models fails, then the model still sends owner mail
+    promising delegation. No successful dispatch_task — the warning
+    must fire so the pattern is discoverable in retro.
+
+    structlog writes to stdout in this project, not via stdlib
+    logging, so we read capsys, not caplog.
+    """
+    from lyre.runtime.agent_loop import _check_phantom_delegation
+
+    calls = [
+        _tu("create_agent", persona="worker-maintainer", model=""),
+        _tu("create_agent", persona="worker-maintainer", model="bad"),
+        _tu("list_models"),
+        _tu("mailbox_send", to="owner", body="will dispatch soon"),
+    ]
+    outcomes = [True, True, True, False]  # all but the final send errored
+
+    _check_phantom_delegation(calls, outcomes)
+
+    captured = capsys.readouterr()
+    assert "phantom_delegation_suspected" in captured.out
+
+
+def test_phantom_delegation_silent_when_dispatch_actually_succeeded(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Happy path: model successfully dispatches AND mails the owner.
+    No warning should fire."""
+    from lyre.runtime.agent_loop import _check_phantom_delegation
+
+    calls = [
+        _tu("create_agent", persona="worker-maintainer"),
+        _tu("dispatch_task", agent="worker-maintainer/x", goal="g",
+            acceptance="a"),
+        _tu("mailbox_send", to="owner", body="dispatched, task_id=..."),
+    ]
+    outcomes = [False, False, False]
+
+    _check_phantom_delegation(calls, outcomes)
+
+    captured = capsys.readouterr()
+    assert "phantom_delegation_suspected" not in captured.out
+
+
+def test_phantom_delegation_silent_when_owner_mail_is_legit_ack(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A wakeup that just reads + acks owner mail (no attempted
+    delegation at all) should NOT warn — the body is presumably a
+    legit "got your message" not a fake delegation claim. The
+    heuristic only fires when the model TRIED to delegate."""
+    from lyre.runtime.agent_loop import _check_phantom_delegation
+
+    calls = [
+        _tu("mailbox_read", min_urgency="normal"),
+        _tu("mailbox_send", to="owner", body="acknowledged, no action"),
+    ]
+    outcomes = [False, False]
+
+    _check_phantom_delegation(calls, outcomes)
+
+    captured = capsys.readouterr()
+    assert "phantom_delegation_suspected" not in captured.out
+
+
+def test_phantom_delegation_ignores_peer_directed_mail(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Mail to a non-owner recipient (peer agent) doesn't count
+    toward the heuristic — peer-to-peer chatter without dispatch
+    is normal and isn't the failure pattern we're guarding."""
+    from lyre.runtime.agent_loop import _check_phantom_delegation
+
+    calls = [
+        _tu("create_agent", persona="worker-maintainer"),
+        _tu("mailbox_send", to="analyst-1", body="please research X"),
+    ]
+    outcomes = [True, False]  # create_agent failed, mail went out
+
+    _check_phantom_delegation(calls, outcomes)
+
+    captured = capsys.readouterr()
+    assert "phantom_delegation_suspected" not in captured.out
