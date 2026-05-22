@@ -112,6 +112,66 @@ _MAX_SILENT_TURN_NUDGES = 2  # give the model 2 chances before giving up
 _MAX_COMPACTIONS = 3
 
 
+def _check_phantom_delegation(
+    tool_calls: list[dict[str, Any]],
+    outcomes: list[bool],
+) -> None:
+    """Warn when a wakeup mailed the owner without successfully
+    dispatching anything in the same wakeup.
+
+    The failure mode (see docs/design/) is: model attempts
+    ``create_agent`` / ``dispatch_task``, those fail (bad model id,
+    missing persona, etc.), but the model still composes a
+    ``mailbox_send(to="owner", body="I'll dispatch the worker...")``
+    and ends the wakeup. The owner sees a promise the database has
+    no record of.
+
+    We can't reliably tell from the body whether the mail CLAIMS a
+    delegation (paraphrases are infinite), so this is observability
+    only — a structured warning log surfaces the pattern for
+    retrospective review (`lyre wakeups list` / dashboard). The
+    prompt-level guard in dispatcher.md is the actual prevention.
+    """
+    if len(outcomes) != len(tool_calls):
+        return  # defensive: shouldn't happen, but don't crash on it
+
+    owner_sends = 0
+    successful_dispatches = 0
+    for tu, is_error in zip(tool_calls, outcomes, strict=True):
+        name = tu.get("name")
+        if name == "mailbox_send" and not is_error:
+            to = tu.get("input", {}).get("to")
+            recipients = to if isinstance(to, list) else [to]
+            if "owner" in recipients:
+                owner_sends += 1
+        elif name == "dispatch_task" and not is_error:
+            successful_dispatches += 1
+
+    if owner_sends > 0 and successful_dispatches == 0:
+        # Did the wakeup at least TRY to delegate? If yes, the
+        # claim-vs-reality gap is more likely a phantom; if no, the
+        # mail is probably a legit ack / status update that
+        # legitimately doesn't involve any dispatch.
+        attempted_delegation = any(
+            tu.get("name") in ("dispatch_task", "create_agent")
+            for tu in tool_calls
+        )
+        if attempted_delegation:
+            log.warning(
+                "phantom_delegation_suspected",
+                owner_mail_sends=owner_sends,
+                dispatch_attempts=sum(
+                    1 for tu in tool_calls
+                    if tu.get("name") == "dispatch_task"
+                ),
+                create_agent_attempts=sum(
+                    1 for tu in tool_calls
+                    if tu.get("name") == "create_agent"
+                ),
+                successful_dispatches=successful_dispatches,
+            )
+
+
 def _take_view_blocks(result: Any) -> list[LyreContentBlock]:
     """Pop and return any ``_lyre_view_blocks`` carried on a tool
     result dict, translating each entry into a ``LyreContentBlock``.
@@ -193,7 +253,7 @@ class AgentLoop:
         tool_registry: ToolRegistry | None = None,
         tool_context: ToolContext | None = None,
         allowed_tools: list[str] | None = None,
-        max_tokens: int = 4096,
+        max_tokens: int = 32768,
         max_turns: int = 24,
         health: HealthTracker | None = None,
         blocker_watcher: MailWatcher | None = None,
@@ -235,6 +295,12 @@ class AgentLoop:
         started = time.time()
         messages: list[LyreMessage] = list(initial_messages)
         all_tool_calls: list[dict[str, Any]] = []
+        # Parallel to all_tool_calls: True if the dispatch returned
+        # is_error. Used by the phantom-delegation observability log
+        # at wakeup end (see below) — we need to know which calls
+        # actually succeeded, not just which were attempted. Order
+        # matches all_tool_calls 1:1.
+        tool_outcomes: list[bool] = []
         total_usage = {"input_tokens": 0, "output_tokens": 0}
         final_text = ""
         final_stop_reason: str | None = None
@@ -344,6 +410,7 @@ class AgentLoop:
                         result, is_error = await self._dispatch_tool(
                             tu["name"], tu["id"], tu["input"]
                         )
+                        tool_outcomes.append(is_error)
                         view_blocks = _take_view_blocks(result)
                         tool_result_blocks.append(
                             LyreContentBlock(
@@ -446,6 +513,7 @@ class AgentLoop:
                 result, is_error = await self._dispatch_tool(
                     tu["name"], tu["id"], tu["input"]
                 )
+                tool_outcomes.append(is_error)
                 # Tools that produce multimodal output (today only
                 # mailbox_get_message with attachments) tuck a
                 # `_lyre_view_blocks` list onto the result dict — the
@@ -641,6 +709,16 @@ class AgentLoop:
             if final_stop_reason == "end_turn"
             else "needs_continuation"
         )
+
+        # Phantom-delegation observability: if this wakeup sent any
+        # mail to the owner BUT had no successful dispatch_task /
+        # create_agent, the body very likely claims work that never
+        # happened (see the docs/design failure report). We can't
+        # reliably parse the body to confirm, so this is a warning
+        # log only — not a hard block. Surfaces in `lyre wakeups list`
+        # / dashboard for retrospective review.
+        _check_phantom_delegation(all_tool_calls, tool_outcomes)
+
         log.info(
             "agent_run_complete",
             turns=turn_count,
@@ -936,6 +1014,33 @@ class AgentLoop:
         tool = self.tool_registry.get(name)
         if tool is None:
             return (f"Unknown tool '{name}'.", True)
+        # Adapters that couldn't parse the model's tool-call arguments
+        # JSON (e.g. truncated by max_tokens mid-emit) fall back to
+        # ``{"_raw": <partial-json-string>}``. The per-tool handler then
+        # sees a payload missing every required key and returns the
+        # generic "provide 'code'" / "provide 'to'" error — the model
+        # then re-tries the same malformed call, burns turns, and the
+        # task dies at max_turns. Surfacing the truncation directly
+        # lets the model break out of that loop on the next turn.
+        if (
+            len(tool_input) == 1
+            and "_raw" in tool_input
+            and isinstance(tool_input["_raw"], str)
+        ):
+            raw = tool_input["_raw"]
+            return (
+                f"Tool '{name}' was called with malformed arguments — "
+                f"the JSON could not be parsed and was probably "
+                f"truncated by the per-turn output budget "
+                f"(max_tokens={self.max_tokens}). "
+                f"Do NOT retry the same call. Either shrink the "
+                f"arguments (split a large input across multiple "
+                f"calls, omit verbose inline content, paste-link "
+                f"instead of inlining), or skip this tool for now and "
+                f"continue the task differently. "
+                f"Raw bytes received ({len(raw)} chars): {raw[:200]!r}…",
+                True,
+            )
         try:
             args = dict(tool_input)
             args.setdefault("_tool_use_id", tool_use_id)

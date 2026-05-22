@@ -608,6 +608,42 @@ async def _mailbox_react(
     inserted = await ctx.repos.mailbox.add_reaction(
         msg_id=msg_id, reactor=ctx.self_mailbox, kind=kind,
     )
+
+    # Forward the reaction to any external channel the original
+    # message was already published to (e.g. owner → Lark → ✓ emoji
+    # on the owner's message). Looks at ``metadata.channels.<name>``
+    # rather than the live ChannelRegistry: a publish that landed on
+    # a channel deserves a reaction echo on that channel, even if the
+    # channel later got disabled (the dispatch will retry once it's
+    # back). Only the FIRST react triggers the enqueue — repeats
+    # would just collide on the outbox UNIQUE.
+    if inserted:
+        channels_meta = (target.metadata or {}).get("channels") or {}
+        if isinstance(channels_meta, dict):
+            rows: list[OutboxRow] = []
+            for channel_name, ch_entry in channels_meta.items():
+                if not isinstance(ch_entry, dict):
+                    continue
+                ext_msg_id = ch_entry.get("message_id")
+                if not isinstance(ext_msg_id, str):
+                    continue
+                rows.append(OutboxRow(
+                    task_id=ctx.task_id,
+                    wakeup_id=ctx.wakeup_id,
+                    kind="channel_reaction_publish",
+                    payload={
+                        "channel": channel_name,
+                        "external_message_id": ext_msg_id,
+                        "kind": kind,
+                    },
+                    external_id=(
+                        f"channel:{channel_name}:reaction:"
+                        f"{msg_id}:{ctx.self_mailbox}:{kind}"
+                    ),
+                ))
+            if rows:
+                await ctx.repos.outbox.enqueue(rows)
+
     return {
         "status": "ok" if inserted else "already_reacted",
         "msg_id": msg_id,

@@ -132,6 +132,13 @@ class LarkChannel:
         handler = (
             self._lark.EventDispatcherHandler.builder("", "")
             .register_p2_im_message_receive_v1(self._on_lark_message)
+            # Read receipts: Lark pushes ``im.message.message_read_v1``
+            # whenever the user reads any message in the bot's thread.
+            # We don't surface that signal yet, but if no handler is
+            # registered the SDK floods stderr with "processor not
+            # found" errors on every read event. A no-op handler
+            # absorbs the events cleanly.
+            .register_p2_im_message_message_read_v1(self._on_lark_read)
             .build()
         )
         def _run_ws() -> None:
@@ -195,6 +202,16 @@ class LarkChannel:
     # ------------------------------------------------------------------
     # Inbound — Lark → mail
     # ------------------------------------------------------------------
+
+    def _on_lark_read(self, data: Any) -> None:
+        """No-op handler for ``im.message.message_read_v1`` events.
+
+        Registered purely to keep the SDK from spamming stderr with
+        "processor not found" errors on every owner-side read receipt.
+        We don't surface read state yet; if we ever do, swap this for
+        a real handler.
+        """
+        return
 
     def _on_lark_message(self, data: Any) -> None:
         """Synchronous callback invoked by lark-oapi from the WS
@@ -527,6 +544,68 @@ class LarkChannel:
                     )
 
         return lark_msg_id
+
+    async def publish_reaction(
+        self,
+        external_message_id: str,
+        kind: str,
+    ) -> None:
+        """Add a reaction emoji to a previously-published Lark message.
+
+        Used by ``mailbox_react(kind="ack")`` so an offline owner sees
+        a ✓ on their original message in Lark without us pushing a new
+        push notification. The map below decides which Lyre reaction
+        kind shows as which Lark emoji.
+        """
+        emoji_type = _REACTION_TO_LARK_EMOJI.get(kind)
+        if emoji_type is None:
+            log.warning(
+                "lark_reaction_unmapped_kind",
+                kind=kind,
+                external_message_id=external_message_id,
+            )
+            return
+
+        from lark_oapi.api.im.v1 import (
+            CreateMessageReactionRequest,
+            CreateMessageReactionRequestBody,
+            Emoji,
+        )
+
+        req = (
+            CreateMessageReactionRequest.builder()
+            .message_id(external_message_id)
+            .request_body(
+                CreateMessageReactionRequestBody.builder()
+                .reaction_type(
+                    Emoji.builder().emoji_type(emoji_type).build()
+                )
+                .build()
+            )
+            .build()
+        )
+        resp = await self._api_client.im.v1.message_reaction.acreate(req)
+        if not resp.success():
+            # Idempotency: Lark returns an error if the same emoji
+            # already exists on the message from the same actor. We
+            # don't have a stable error code documented for that case
+            # so we just log and swallow — the outbox row was already
+            # dispatched, repeating won't help.
+            log.warning(
+                "lark_reaction_post_failed",
+                external_message_id=external_message_id,
+                kind=kind,
+                emoji_type=emoji_type,
+                code=resp.code, msg=resp.msg,
+            )
+
+
+# Mapping: Lyre reaction kinds → Lark emoji_type. Keep small; this is
+# the per-channel render surface, the cross-channel kinds set lives
+# on ``MailReaction.kind``.
+_REACTION_TO_LARK_EMOJI: dict[str, str] = {
+    "ack": "OK",
+}
 
 
 # ---------------------------------------------------------------------------

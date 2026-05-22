@@ -178,6 +178,7 @@ def _make_channel_with_mocked_client(
     api.im.v1.message.acreate = AsyncMock()
     api.im.v1.image.acreate = AsyncMock()
     api.im.v1.message_resource.aget = AsyncMock()
+    api.im.v1.message_reaction.acreate = AsyncMock()
     ch._api_client = api
     return ch
 
@@ -343,5 +344,78 @@ async def test_image_download_writes_blob_and_upserts_metadata(
         assert blob.source == "owner"
         # Bytes round-trip via BlobStore.
         assert blob_store.read(blob.id, "image/png") == _PNG_BYTES
+    finally:
+        await conn.close()
+
+
+# ---------------------------------------------------------------------------
+# publish_reaction
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_publish_reaction_maps_ack_to_ok_emoji(tmp_path: Path) -> None:
+    """Lyre ``kind="ack"`` shows up on Lark as the ``OK`` emoji on the
+    previously-published message id. The request body should carry the
+    message_id in the path and ``reaction_type.emoji_type="OK"`` in the
+    body."""
+    conn = await init_db(tmp_path / "lyre.db")
+    try:
+        repos = SqliteRepositories(conn)
+        ch = _make_channel_with_mocked_client(repos, None)
+        ok = MagicMock()
+        ok.success.return_value = True
+        ch._api_client.im.v1.message_reaction.acreate.return_value = ok
+
+        await ch.publish_reaction(
+            external_message_id="om_target", kind="ack",
+        )
+
+        assert ch._api_client.im.v1.message_reaction.acreate.await_count == 1
+        call = ch._api_client.im.v1.message_reaction.acreate.await_args
+        req = call.args[0]
+        assert req.message_id == "om_target"
+        assert req.request_body.reaction_type.emoji_type == "OK"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_publish_reaction_swallows_lark_error(tmp_path: Path) -> None:
+    """Lark returns an error when the same actor adds the same emoji
+    twice. We log + swallow rather than raise — retrying wouldn't help
+    and the outbox row should mark dispatched."""
+    conn = await init_db(tmp_path / "lyre.db")
+    try:
+        repos = SqliteRepositories(conn)
+        ch = _make_channel_with_mocked_client(repos, None)
+        err = MagicMock()
+        err.success.return_value = False
+        err.code = 230002
+        err.msg = "reaction already exists"
+        ch._api_client.im.v1.message_reaction.acreate.return_value = err
+
+        # Should NOT raise.
+        await ch.publish_reaction(
+            external_message_id="om_target", kind="ack",
+        )
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_publish_reaction_unknown_kind_is_no_op(tmp_path: Path) -> None:
+    """If a future ReactionKind isn't in the Lark emoji map yet, do
+    nothing (logged) instead of calling Lark with ``None``."""
+    conn = await init_db(tmp_path / "lyre.db")
+    try:
+        repos = SqliteRepositories(conn)
+        ch = _make_channel_with_mocked_client(repos, None)
+
+        await ch.publish_reaction(
+            external_message_id="om_target", kind="future_unmapped_kind",
+        )
+
+        assert ch._api_client.im.v1.message_reaction.acreate.await_count == 0
     finally:
         await conn.close()

@@ -845,3 +845,95 @@ async def test_list_models_returns_registry_with_auth_state(
     assert m["id"] == "fake.fast"
     assert m["auth_ok"] is True
     assert m["healthy"] is None  # no HealthTracker in this ctx
+
+
+@pytest.mark.asyncio
+async def test_list_models_handles_header_only_entries(
+    ctx: ToolContext,
+) -> None:
+    """``auth_env=None`` is the header-only auth shape (internal
+    gateway with custom headers, no env-var-backed API key). Used
+    to crash list_models() with
+    ``TypeError: str expected, not NoneType`` because the impl
+    called ``os.environ.get(None)`` directly. After the fix
+    header-only entries report ``auth_ok=True`` and the call
+    succeeds."""
+    from lyre.runtime.tools.introspect import LIST_MODELS
+
+    class _HeaderOnlyEndpoint:
+        auth_env = None  # the header-only signal
+
+    class _HeaderOnlyEntry:
+        id = "internal.gateway"
+        provider = "openai"
+        tier = "workhorse"
+        capabilities = ("tool_use",)
+        status = "enabled"
+        context_window = 128_000
+        endpoint = _HeaderOnlyEndpoint()
+
+    class _Registry:
+        entries = [_HeaderOnlyEntry()]
+
+    ctx.extras["model_registry"] = _Registry()
+
+    out = await LIST_MODELS.handler(ctx, {})
+    assert out["count"] == 1
+    m = out["models"][0]
+    assert m["id"] == "internal.gateway"
+    # Header-only is treated as authenticated — startup already
+    # validated the configured headers.
+    assert m["auth_ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_create_agent_empty_string_model_is_treated_as_unset(
+    ctx: ToolContext,
+) -> None:
+    """The model emits ``model=""`` sometimes to mean "no override —
+    use persona default". Without coercion the empty string fell
+    through to a confusing ``model_id '' not in registry`` error
+    that prevented the dispatcher from recovering (a contributing
+    factor in the phantom-delegation failure report). After the
+    fix, empty string is normalised to "use persona default" —
+    same as omitting ``model`` entirely."""
+    from lyre.runtime.tools.introspect import CREATE_AGENT
+
+    out = await CREATE_AGENT.handler(
+        ctx, {"persona": "worker", "name": "alice-empty", "model": ""},
+    )
+    assert out["agent_id"] == "worker/alice-empty"
+    # No model_id should have been recorded (we want persona default).
+    assert out.get("metadata", {}).get("model_id") is None
+
+
+@pytest.mark.asyncio
+async def test_create_agent_invalid_model_hints_at_unset_fallback(
+    ctx: ToolContext,
+) -> None:
+    """An unknown ``model`` should not just say 'not in registry' —
+    the error needs to point the model at the right escape
+    hatch (omit `model` to use persona default), otherwise the
+    dispatcher tries to guess a model id, fails again, and burns
+    turns. Verify the hint text is present."""
+    from lyre.runtime.tools.introspect import CREATE_AGENT
+
+    class _Registry:
+        def by_id(self, _id: str) -> None:
+            return None
+
+    ctx.extras["model_registry"] = _Registry()
+
+    with pytest.raises(ToolError) as exc_info:
+        await CREATE_AGENT.handler(
+            ctx,
+            {
+                "persona": "worker", "name": "fred",
+                "model": "anthropic:made-up-model",
+            },
+        )
+    msg = str(exc_info.value)
+    assert "not in registry" in msg
+    # The recovery hint is the loop-breaker for a model trying to
+    # guess model ids.
+    assert "omit" in msg.lower()

@@ -55,6 +55,38 @@ from ..runtime.worktree import WorktreeHandle, WorktreeManager
 log = structlog.get_logger()
 
 
+# Wakeup-level statuses produced by AgentLoopResult are richer than
+# the task-level TaskStatus enum that tasks.status is CHECK-constrained
+# to. Translate them at the boundary:
+#
+#   completed          → completed  (passthrough)
+#   failed             → failed     (passthrough)
+#   cancelled          → cancelled  (passthrough)
+#   silent_close       → completed
+#       The wakeup ran but composed no user-facing reply. The task
+#       itself terminated normally — the silent-close detail lives
+#       on wakeups.end_status, not on the task.
+#   needs_continuation → failed
+#       The loop bailed because it hit max_turns or max_tokens —
+#       usually the model is stuck repeating a malformed tool call
+#       (e.g. truncated args). Marking the task failed is honest
+#       and prevents the scheduler from blindly re-enqueueing the
+#       same wedged state. Owner / dispatcher can re-dispatch with
+#       a fresh plan if recovery is desired.
+#
+# Without this mapping, writing the raw wakeup status to tasks.status
+# trips the DB CHECK constraint and the scheduler's post-loop write
+# crashes mid-tick, leaving the lease orphaned.
+_WAKEUP_TO_TASK_STATUS: dict[str, str] = {
+    "silent_close": "completed",
+    "needs_continuation": "failed",
+}
+
+
+def _wakeup_status_to_task_status(wakeup_status: str) -> str:
+    return _WAKEUP_TO_TASK_STATUS.get(wakeup_status, wakeup_status)
+
+
 class Scheduler:
     def __init__(
         self,
@@ -729,6 +761,7 @@ class Scheduler:
                 tool_registry=self.tool_registry,
                 tool_context=tool_ctx,
                 allowed_tools=list(persona.allowed_lyre_tools or []),
+                max_tokens=self.config.max_tokens,
                 health=self.health,
                 blocker_watcher=blocker_watcher,
                 kill_switch=self.kill_switch,
@@ -768,14 +801,7 @@ class Scheduler:
                     "compaction_count": result.compaction_count,
                 },
             )
-            # Wakeup-level statuses can be richer than task-level ones
-            # (e.g. silent_close exists at wakeup granularity to flag a
-            # wakeup that ran but didn't compose a reply). The task
-            # itself just terminated, so map richer wakeup statuses
-            # back to the TaskStatus enum.
-            task_status = (
-                "completed" if result.status == "silent_close" else result.status
-            )
+            task_status = _wakeup_status_to_task_status(result.status)
             # If a tool (e.g. await_subagents) already advanced the task to
             # `needs_input`, don't blanket-overwrite with result.status.
             # The subagent wait machinery owns the state until the children

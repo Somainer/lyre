@@ -268,6 +268,23 @@ class Config:
     # ---- defaults: existing runtime knobs ----
     model_override: str | None = None
     compact_threshold: float = 0.7
+    # Per-turn output budget passed to the LLM (``max_tokens``) — i.e.
+    # the cap on a single assistant message, NOT a lifetime budget.
+    # Long-running ≠ large per-turn output; what really sets this floor
+    # is the biggest single tool-call argument body Lyre agents emit:
+    #
+    #   dispatcher / reviewer  ≤ 3k   (mail bodies, dispatch args)
+    #   analyst                ≤ 8k   (spec writes via python_exec)
+    #   worker-maintainer      ≤ 20k+ (code / diffs via python_exec /
+    #                                  shell_exec — the hot path)
+    #
+    # Extended-thinking models also share this budget between thinking
+    # and output. 32k is generous enough for all of the above on any
+    # modern flagship; cheap-tier models that can't honor it return a
+    # clear API error rather than silently truncating, so the cost of
+    # overshooting is low. Set lower if you specifically want to box
+    # in a runaway worker.
+    max_tokens: int = 32768
 
     # ---- defaults: paths added with config.toml ----
     lyre_home: Path = field(default_factory=_default_home)
@@ -399,6 +416,21 @@ class Config:
             os.environ.get("LYRE_COMPACT_THRESHOLD"),
             default=float(runtime_raw.get("compact_threshold", 0.7)),
         )
+        # max_tokens: env > [runtime] > default. Floor at 256 so a
+        # misconfigured 0 / negative doesn't immediately starve every
+        # wakeup. Default 32k — see Config docstring on max_tokens for
+        # the per-turn-output reasoning.
+        max_tokens_raw = (
+            os.environ.get("LYRE_MAX_TOKENS")
+            or runtime_raw.get("max_tokens")
+        )
+        try:
+            max_tokens = (
+                max(256, int(max_tokens_raw)) if max_tokens_raw is not None
+                else 32768
+            )
+        except (ValueError, TypeError):
+            max_tokens = 32768
         dashboard_port_raw = os.environ.get("LYRE_DASHBOARD_PORT") or runtime_raw.get(
             "default_dashboard_port", 8765
         )
@@ -473,6 +505,7 @@ class Config:
             default_model=default_model,
             model_override=model_override,
             compact_threshold=compact_threshold,
+            max_tokens=max_tokens,
             lyre_home=home,
             user_md_path=user_md_path,
             env_path=env_path,

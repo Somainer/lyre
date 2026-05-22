@@ -299,6 +299,14 @@ async def _create_agent(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any
             raise ToolError("description must be a string")
         metadata["description"] = description
     model_id = args.get("model")
+    # Treat empty-string and None equivalently: both mean "use this
+    # persona's model_preference". Models occasionally emit
+    # ``model=""`` as a way of saying "no override" — without this
+    # coercion the empty string slipped past the None-check, then
+    # failed registry lookup, surfacing as a confusing
+    # ``model_id '' not in registry`` error.
+    if isinstance(model_id, str) and not model_id.strip():
+        model_id = None
     if model_id is not None:
         if not isinstance(model_id, str):
             raise ToolError("model must be a string (model_id from list_models)")
@@ -306,7 +314,9 @@ async def _create_agent(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any
         if registry is not None and registry.by_id(model_id) is None:
             raise ToolError(
                 f"model_id {model_id!r} not in registry. "
-                f"Call list_models() for the valid set."
+                f"Call list_models() for the valid set, or omit "
+                f"`model` entirely to let the new agent use its "
+                f"persona's model_preference (the common case)."
             )
         metadata["model_id"] = model_id
 
@@ -544,7 +554,17 @@ async def _list_models(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]
     health = ctx.extras.get("health_tracker")
     out = []
     for e in registry.entries:
-        auth_ok = bool(os.environ.get(e.endpoint.auth_env))
+        # ``auth_env`` is None for header-only auth (e.g. internal
+        # gateways that authenticate via custom headers configured in
+        # config.toml, not via an env-var-backed API key). Naive
+        # ``os.environ.get(None)`` raises ``TypeError: str expected``
+        # — which used to crash list_models() entirely the moment a
+        # header-only model entered the registry. Treat header-only
+        # as auth_ok=True since startup already validated the headers.
+        auth_ok = (
+            bool(os.environ.get(e.endpoint.auth_env))
+            if e.endpoint.auth_env else True
+        )
         healthy = (
             None if health is None else health.is_available(e.id)
         )
