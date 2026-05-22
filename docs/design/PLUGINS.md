@@ -36,8 +36,8 @@ Lyre already has several **file-drop extension points**: personas (markdown), sk
 | High-risk tools (`shell_exec`, `mailbox_send` to non-owner) gated by external IM confirmation | No interception before tool dispatch | hook `before_tool_dispatch`, return `block` |
 | Blocker mail surfaced through Discord/Slack/SMS in addition to Lark | No observer on mail insertion | hook `mail_inserted` (observe) |
 | Per-week cost rollup, exported to CSV | No cross-wakeup aggregation point | hook `wakeup_ended` + a registered CLI subcommand (deferred) |
-| New tools (Notion sync, Calendar lookup) | Would require editing `src/lyre/runtime/tools/` | registry: `tools` |
 | Register an MCP server to give agents external capabilities | No MCP integration point today | registry: `mcp_servers` (declarative) |
+| Notify owner / page workers when the system has been idle too long | Scheduler doesn't track idle gaps today | hook `idle_tick` (observe / first-cancel) |
 
 The core distinction: **file-drop is declarative** (data), **plugins are imperative** (code). Lyre's five iron laws still hold — plugins cannot bypass the mailbox, skip persistence, or violate kill-test recoverability — but plugins **can observe and rewrite** data flowing through key runtime nodes.
 
@@ -263,27 +263,12 @@ Some extension points are "I provide an X — please use it", not "I observe an 
 
 | Registry | What | Registration API |
 |---|---|---|
-| **tools** | `Tool` instances (name, description, input_schema, handler) | `host.tools.register(my_tool)` |
 | **outbox kinds** | (kind_name, async dispatch handler) | `host.outbox.register_kind("my_kind", my_handler)` |
 | **mcp_servers** | Declared in manifest-adjacent `mcp.toml`; Lyre spawns them at startup | declarative only — no Python registration |
 
-### 5.1 Tools registry
+> **Tools registry is intentionally absent.** Lyre's agents already have `python_exec` and `shell_exec` as general-purpose escape hatches — "Everything is Python or Bash" is a deliberate stance. Adding a Pi-style tools registry would mostly create a second way to do the same thing the agent can already do via Python, while introducing a confusing trust split (plugin author vs. persona author vs. owner). The right path for adding **structured external capabilities** is the MCP server registry below; the right path for adding **Lyre-internal coordination tools** (mailbox, dispatch, memory) is built-in tool development, not plugins.
 
-Lyre already has a `ToolRegistry` in `runtime/tools/__init__.py`. The plugin host wraps it:
-
-```python
-host.tools.register(Tool(
-    name="notion_search",
-    description="...",
-    input_schema={...},
-    handler=async_function,         # same contract as built-in Lyre tools
-    allowed_personas=None,          # None = visible to every persona's allowlist
-))
-```
-
-Persona `allowed_lyre_tools` still controls visibility — registering a tool ≠ every agent can use it; the persona must also list it in its allowlist. **This is by design**: plugins provide capabilities, personas decide which roles get them.
-
-### 5.2 Outbox kinds
+### 5.1 Outbox kinds
 
 ```python
 async def dispatch_my_kind(row, ctx):
@@ -295,7 +280,7 @@ host.outbox.register_kind("my_kind", dispatch_my_kind)
 
 High-risk — a new outbox kind introduces a new notion of "what counts as dispatched". The plugin must guarantee idempotence: a row retry must not double-fire the side effect. Documentation + examples must hammer this home.
 
-### 5.3 MCP servers
+### 5.2 MCP servers
 
 The manifest's adjacent `mcp.toml` declares server invocations:
 
@@ -307,12 +292,15 @@ args = ["lyre-mcp-weather", "--api-key", "${WEATHER_KEY}"]
 env_passthrough = ["WEATHER_KEY"]
 ```
 
-After registries are populated and before services start, `lyre serve` spawns these subprocesses, initializes them per the MCP protocol, and auto-registers their exposed tools into `host.tools` namespaced as `mcp:<server>:<tool>`. At shutdown, they're SIGTERM'd.
+After registries are populated and before services start, `lyre serve` spawns these subprocesses, initializes them per the MCP protocol, and auto-registers their exposed tools into Lyre's built-in `ToolRegistry` namespaced as `mcp:<server>:<tool>`. At shutdown, they're SIGTERM'd.
+
+Whether any given agent can use `mcp:<server>:<tool>` is then controlled by that agent's persona `allowed_lyre_tools` — the same gate that controls built-in tools. Plugins don't carry per-tool visibility metadata; persona allowlist is the single source of "who can call what".
 
 **Pure declarative** — a plugin can introduce MCP-backed tools without writing any Python.
 
-### 5.4 What's deliberately NOT a registry
+### 5.3 What's deliberately NOT a registry
 
+- **Built-in agent tools (typed `Tool` instances)**: as noted above, redundant with `python_exec` / `shell_exec`. Use MCP servers for structured external capabilities; use built-in tool development for Lyre-internal coordination.
 - **Dashboard routes / widgets**: complexity is high (HTML / JS / static assets); Lyre's own dashboard is already adequate; plugins that want visualization should emit data to external systems (Grafana / Prometheus / similar).
 - **Personas / Skills / Channels**: file-drop already works. Adding plugin-side registration would duplicate the mechanism.
 - **Custom output styles / message renderers**: the dashboard's Jinja filters aren't exposed to plugins.
@@ -321,7 +309,7 @@ After registries are populated and before services start, `lyre serve` spawns th
 
 ## 6. First-batch hook events
 
-For the "long-running, working for me overnight" use case, five hook points cover the highest-value extension scenarios. Each entry below lists: trigger location, fields, result type, policy, typical uses.
+For the "long-running, working for me overnight" use case, six hook points cover the highest-value extension scenarios. Each entry below lists: trigger location, fields, result type, policy, typical uses.
 
 ### 6.1 `system_prompt_assembly`
 
@@ -432,7 +420,42 @@ class MailInsertedEvent:
 **Result**: None.
 **Use cases**: blocker mail surfaced to Discord/Telegram/SMS; external audit stream; metric counters.
 
-> **Not in the first batch**: `wakeup_ended`, `task_status_changed`, `scheduler_tick`, `compact_triggered`, `provider_request`, `stream_event_received`. These are good ideas but fall into "let's see what plugins actually need first". Every new hook is API surface — once exposed, hard to take back.
+### 6.6 `idle_tick`
+
+**Trigger**: scheduler's idle-watchdog phase, when the runtime has gone N consecutive ticks without starting a wakeup AND there are unread mails OR pending tasks in the system. Default N → roughly 5 minutes of wall-clock silence on a 1s poll interval; configurable.
+
+**Policy**: observation (primary) + first-cancel optional override.
+
+**Event**:
+```python
+@dataclass
+class IdleTickEvent:
+    type: Literal["idle_tick"]
+    idle_for_seconds: float
+    unread_mail_count: int
+    pending_task_count: int
+    needs_input_task_count: int      # tasks awaiting owner / parent input
+    last_wakeup_at: str | None       # ISO8601, None if no wakeup ever
+```
+
+**Result**:
+```python
+class IdleTickResult(TypedDict, total=False):
+    suppress_default_nudge: bool     # tell scheduler NOT to auto-nudge dispatcher this tick
+                                     # — plugin will handle it (push notification / Lark ping / etc.)
+```
+
+**Use cases**:
+
+- **Why this exists**: the most-reported real-world Lyre failure is "dispatcher decided not to dispatch, system goes blank, owner doesn't realize until hours later". Scheduler core gets a watchdog phase that nudges the dispatcher with a synthetic blocker mail when this state persists — and `idle_tick` is the plugin hook on the same path so plugins can customize how the nudge surfaces:
+  - Push a notification to owner's phone via existing Lark/Discord channel
+  - Pause the nudge during quiet hours (return `suppress_default_nudge=True` after sending its own deferred message)
+  - Aggregate metrics: "system was idle X% of yesterday"
+- The hook never **prevents** the watchdog from firing — Lyre's invariant is "system should be making progress when there's work pending". `suppress_default_nudge` only tells the watchdog "I have it; don't double-page". Returning nothing leaves the default behavior intact.
+
+> **Implementation note**: the scheduler-side idle watchdog itself is independent infrastructure — it ships even if no plugin attaches to `idle_tick`. The hook is for *customizing* an already-correct default, not for *replacing* a missing one.
+
+> **Not in the first batch**: `wakeup_ended`, `task_status_changed`, `scheduler_tick`, `compact_triggered`, `provider_request`, `stream_event_received`, `subagent_completed`, `scheduled_mail_due`. These are good ideas but fall into "let's see what plugins actually need first". Every new hook is API surface — once exposed, hard to take back.
 
 ---
 
@@ -608,14 +631,14 @@ After the next `lyre serve` restart, every dispatcher wakeup's system prompt end
 |---|---|---|
 | **PR 1** | This spec doc | Design review + API freeze |
 | **PR 2** | PluginHost + hook bus framework | `src/lyre/plugins/__init__.py`, `hooks.py`, `PluginContext` facade. No real lifecycle wiring yet (dummy `emit` tested in isolation). |
-| **PR 3** | Wire the 5 first-batch hook points | `await host.hooks.emit(…)` inserted into `runtime/context.py`, `runtime/agent_loop.py`, `scheduler/scheduler.py`, `persistence/sqlite_impl.py`. Zero-cost when no plugin attaches. |
-| **PR 4** | Discovery + load chain | Manifest parsing, `importlib` bridge, `[plugins] enabled` config, `lyre plugin list` CLI. |
-| **PR 5** | Tools registry hookup | Plugin-registered tools surfaced to agents through `ToolRegistry`; `allowed_personas` gating. |
+| **PR 3** | Wire 5 of the 6 first-batch hook points | `await host.hooks.emit(…)` inserted into `runtime/context.py`, `runtime/agent_loop.py`, `persistence/sqlite_impl.py`. Zero-cost when no plugin attaches. Excludes `idle_tick`, which ships with PR 4. |
+| **PR 4** | Scheduler idle watchdog + `idle_tick` hook | New phase in scheduler: detects "no wakeup for N minutes + pending work", auto-nudges dispatcher with synthetic blocker mail. Emits `idle_tick` for plugin customization. Standalone improvement to Lyre regardless of plugin uptake — fixes the "dispatcher forgot to dispatch, system goes blank" failure. |
+| **PR 5** | Discovery + load chain | Manifest parsing, `importlib` bridge, `[plugins] enabled` config, `lyre plugin list` CLI. After this PR, plugins are fully usable for hook-based extension. |
 | **PR 6** | Outbox kinds registry hookup | Plugin can register a new kind + its dispatch handler. |
-| **PR 7** | MCP server declarative integration | Parse `mcp.toml`, spawn subprocesses, bridge their tools into `host.tools`. |
-| **PR 8**+ | Cookbook | 1-2 reference plugins: `working-hours-aware`, `tool-call-audit`, `daily-cost-cap`. |
+| **PR 7** | MCP server declarative integration | Parse `mcp.toml`, spawn subprocesses, bridge their tools into the built-in `ToolRegistry` namespaced as `mcp:<server>:<tool>`. |
+| **PR 8**+ | Cookbook | 1-2 reference plugins: `working-hours-aware`, `tool-call-audit`, `idle-pager`. |
 
-Each PR carries its own tests. PR 2 + PR 3 + PR 4 are the minimum useful set (plugins can register hooks); PR 5+ stack independently on top.
+Each PR carries its own tests. PR 2 + PR 3 + PR 5 are the minimum useful set (plugins can register hooks); PR 4 is independently useful (fixes real Lyre failure mode); PR 6 / 7 stack independently on top.
 
 ---
 
