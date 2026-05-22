@@ -134,20 +134,22 @@ class LarkChannel:
             .register_p2_im_message_receive_v1(self._on_lark_message)
             .build()
         )
-        ws = self._lark.ws.Client(
-            self.cfg.app_id,
-            self.cfg.app_secret,
-            event_handler=handler,
-        )
-
         def _run_ws() -> None:
-            # ws.start() does `loop.run_until_complete(self._connect())`
-            # internally. Under Python 3.12 a worker thread that never
-            # called set_event_loop falls through to the *main* thread's
-            # loop (which is already running), raising
-            # ``RuntimeError: This event loop is already running``.
-            # Giving the thread its own loop fixes the boot.
+            # ws.Client.__init__ captures ``asyncio.get_event_loop()``
+            # into ``self.loop`` and reuses it for every later
+            # ``run_until_complete``. If we built the Client on the main
+            # thread (where uvicorn / scheduler are running their loop),
+            # ``start()`` would call ``run_until_complete`` on the main
+            # loop — which is already running — and crash with
+            # ``RuntimeError: This event loop is already running``. So:
+            # set a fresh loop in this thread FIRST, then construct the
+            # Client so it captures *this* loop, then start it.
             asyncio.set_event_loop(asyncio.new_event_loop())
+            ws = self._lark.ws.Client(
+                self.cfg.app_id,
+                self.cfg.app_secret,
+                event_handler=handler,
+            )
             ws.start()
 
         thread = threading.Thread(
@@ -203,10 +205,19 @@ class LarkChannel:
                 sender.sender_id.open_id if sender else None
             )
             if sender_open_id != self.cfg.authorized_user_id:
-                log.debug(
+                # INFO (not debug) — during first-time config the owner
+                # needs to see their app-scoped open_id to put it in
+                # config.toml. Lark's open_id is per-app: an id obtained
+                # from one bot won't match here. Send a message to this
+                # bot, copy the ``got=ou_…`` value from this line.
+                log.info(
                     "lark_event_unauthorized_sender",
                     got=sender_open_id,
                     expected=self.cfg.authorized_user_id,
+                    hint=(
+                        "if this is YOUR open_id for this app, set "
+                        "[integrations.lark].authorized_user_id to it"
+                    ),
                 )
                 return
 
