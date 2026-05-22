@@ -59,8 +59,8 @@
         <div class="recipient-fields">
           <div class="rec-persona">
             <select name="persona" id="rec-persona">
-              {% for p in personas %}
-                <option value="{{ p }}"{% if p == preset_persona %} selected{% endif %}>{{ p }}</option>
+              {% for value, label in personas %}
+                <option value="{{ value }}"{% if value == preset_persona %} selected{% endif %}>{{ label }}</option>
               {% endfor %}
             </select>
           </div>

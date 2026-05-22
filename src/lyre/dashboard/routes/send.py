@@ -46,20 +46,38 @@ _ACCEPTED_MEDIA_TYPES: frozenset[str] = frozenset({
 router = APIRouter()
 
 
-async def _personas_for_form(repos: Repositories) -> list[str]:
-    """Persona choices shown in the dropdown — every approved persona in
-    the DB. Returning a live query (instead of the old hardcoded list)
-    means custom personas the owner adds under
-    ``~/.lyre/personas/<name>/identity.md`` show up here without any
-    code change, alongside the shipped ones.
+async def _personas_for_form(
+    repos: Repositories,
+) -> list[tuple[str, str]]:
+    """Persona choices for the dropdown as ``(value, label)`` pairs.
+
+    ``value`` is the persona name (what the form POSTs — the backend
+    still composes ``<persona>/<name>`` from it). ``label`` is what the
+    owner sees: ``display_name`` from identity.md when set, otherwise
+    the persona name. Singleton / seeded personas thus show as their
+    actual agent id (``analyst-1``, ``luna``) rather than the abstract
+    role (``analyst``, ``dispatcher``) — the owner addresses agents,
+    not types.
 
     Ordering: ``owner`` first (it's the human, not a role); everything
-    else alphabetical. Deprecated personas are filtered out by
-    list_active's default ``status="approved"`` filter.
+    else alphabetical by label. Deprecated personas are filtered out
+    by list_active's default ``status="approved"`` filter.
     """
     rows = await repos.personas.list_active()
-    names = sorted(p.name for p in rows if p.name != "owner")
-    return ["owner", *names] if any(p.name == "owner" for p in rows) else names
+    owner_row = next((p for p in rows if p.name == "owner"), None)
+    rest = sorted(
+        (
+            (p.name, p.display_name or p.name)
+            for p in rows if p.name != "owner"
+        ),
+        key=lambda pair: pair[1],
+    )
+    if owner_row is not None:
+        return [
+            (owner_row.name, owner_row.display_name or owner_row.name),
+            *rest,
+        ]
+    return rest
 
 
 async def _persona_seed_agent_id(
