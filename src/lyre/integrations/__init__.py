@@ -87,6 +87,29 @@ class ExternalChannel(Protocol):
         """
         ...
 
+    async def publish_reaction(
+        self,
+        external_message_id: str,
+        kind: str,
+    ) -> None:
+        """Add a reaction to a previously-published message.
+
+        ``external_message_id`` is the channel-side id stored on
+        ``mail.metadata.channels.<name>.message_id`` by an earlier
+        successful ``publish_owner_mail`` call. ``kind`` is the
+        runtime's ``ReactionKind`` (``"ack"`` today) — channels map
+        it to whatever native primitive they support (Lark emoji,
+        Slack reaction, …).
+
+        No return value: reactions are decorations, not addressable
+        items, so threading off a reaction is not a use case. If the
+        channel doesn't support reactions at all, an implementation
+        can choose to no-op or raise; the outbox dispatcher treats a
+        raised exception as a normal dispatch failure (row stays
+        queued, retried next tick).
+        """
+        ...
+
 
 class ChannelRegistry:
     """Small dict-like holder mapping ``name`` → channel instance.

@@ -283,3 +283,85 @@ def test_mailbox_react_in_persona_allowlists() -> None:
                 f"persona {name!r} has mailbox_send but not mailbox_react; "
                 f"agents need both — react is the loop-breaker for ack mail"
             )
+
+
+# ---------------------------------------------------------------------------
+# Cross-channel reaction echo (Lark / Slack / ...)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_react_enqueues_channel_reaction_publish_when_mail_was_published(
+    ctx,
+) -> None:
+    """If the target mail was previously published to an external channel
+    (``metadata.channels.<name>.message_id`` set), reacting on it enqueues
+    a ``channel_reaction_publish`` outbox row per such channel so the
+    chat surface mirrors the ack back to the owner."""
+    repos = ctx.repos
+    msg_id = await repos.mailbox.insert_message(
+        MailboxMessage(
+            recipient="dispatcher", external_id="ext-1",
+            sender="analyst-1", urgency="normal", body="closing",
+            metadata={
+                "channels": {
+                    "lark": {"message_id": "om_xxxx", "open_id": "ou_owner"},
+                },
+            },
+        )
+    )
+
+    result = await _mailbox_react(ctx, {"msg_id": msg_id, "kind": "ack"})
+    assert result["status"] == "ok"
+
+    outbox_rows = await repos.outbox.dequeue_batch(limit=10)
+    reaction_rows = [r for r in outbox_rows if r.kind == "channel_reaction_publish"]
+    assert len(reaction_rows) == 1
+    row = reaction_rows[0]
+    assert row.payload["channel"] == "lark"
+    assert row.payload["external_message_id"] == "om_xxxx"
+    assert row.payload["kind"] == "ack"
+    assert row.external_id == f"channel:lark:reaction:{msg_id}:dispatcher:ack"
+
+
+@pytest.mark.asyncio
+async def test_react_skips_enqueue_when_no_channel_metadata(ctx) -> None:
+    """Internal-only mail (no channel publish history) → reacting only
+    inserts the DB row, no outbox traffic. Avoids spamming the outbox
+    for peer↔peer acks the owner never needs to see."""
+    repos = ctx.repos
+    msg_id = await repos.mailbox.insert_message(
+        MailboxMessage(
+            recipient="dispatcher", external_id="ext-1",
+            sender="analyst-1", urgency="normal", body="closing",
+        )
+    )
+
+    await _mailbox_react(ctx, {"msg_id": msg_id, "kind": "ack"})
+
+    outbox_rows = await repos.outbox.dequeue_batch(limit=10)
+    assert not [r for r in outbox_rows if r.kind == "channel_reaction_publish"]
+
+
+@pytest.mark.asyncio
+async def test_react_duplicate_does_not_re_enqueue(ctx) -> None:
+    """Second react with the same (msg_id, reactor, kind) is a no-op at
+    the reaction layer AND does not re-enqueue an outbox row. The
+    outbox UNIQUE(kind, external_id) would also collapse a dupe, but
+    short-circuiting at the tool keeps the dispatcher's work queue tidy."""
+    repos = ctx.repos
+    msg_id = await repos.mailbox.insert_message(
+        MailboxMessage(
+            recipient="dispatcher", external_id="ext-1",
+            sender="analyst-1", urgency="normal", body="closing",
+            metadata={"channels": {"lark": {"message_id": "om_xxxx"}}},
+        )
+    )
+
+    await _mailbox_react(ctx, {"msg_id": msg_id, "kind": "ack"})
+    second = await _mailbox_react(ctx, {"msg_id": msg_id, "kind": "ack"})
+    assert second["status"] == "already_reacted"
+
+    outbox_rows = await repos.outbox.dequeue_batch(limit=10)
+    reaction_rows = [r for r in outbox_rows if r.kind == "channel_reaction_publish"]
+    assert len(reaction_rows) == 1

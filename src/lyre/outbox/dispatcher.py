@@ -117,6 +117,8 @@ class OutboxDispatcher:
             await self._dispatch_tier1_notification(row)
         elif row.kind == "channel_publish":
             await self._dispatch_channel_publish(row)
+        elif row.kind == "channel_reaction_publish":
+            await self._dispatch_channel_reaction_publish(row)
         else:
             raise ValueError(f"Unknown outbox kind: {row.kind!r}")
 
@@ -214,6 +216,47 @@ class OutboxDispatcher:
             await self.repos.mailbox.set_channel_external_id(
                 msg_id, channel_name, ext_id,
             )
+
+    async def _dispatch_channel_reaction_publish(
+        self, row: OutboxRow,
+    ) -> None:
+        """Forward a Lyre reaction to one external channel.
+
+        Payload shape:
+          channel:               ExternalChannel.name
+          external_message_id:   the channel-side id of the parent mail,
+                                 read at enqueue time from
+                                 ``mail.metadata.channels.<name>.message_id``
+          kind:                  the ReactionKind (``"ack"`` today). The
+                                 channel maps it to its native primitive.
+
+        Idempotency: the outbox row's ``external_id`` (e.g.
+        ``channel:lark:reaction:<msg_id>:<reactor>:<kind>``) plus the
+        outbox UNIQUE(kind, external_id) prevents enqueue dupes.
+        Channel-side dedup is best-effort (Lark returns an error if the
+        same reactor already added the same emoji — see
+        ``LarkChannel.publish_reaction``).
+        """
+        payload = row.payload
+        channel_name = payload.get("channel")
+        external_message_id = payload.get("external_message_id")
+        kind = payload.get("kind")
+        if not channel_name or not external_message_id or not kind:
+            raise ValueError(
+                "channel_reaction_publish payload missing "
+                f"channel/external_message_id/kind: {payload!r}"
+            )
+        channel = self.channel_registry.get(channel_name)
+        if channel is None:
+            raise ValueError(
+                f"channel {channel_name!r} not in registry "
+                f"(known: {self.channel_registry.names()}). Is the "
+                f"channel enabled in [integrations.{channel_name}]?"
+            )
+        await channel.publish_reaction(
+            external_message_id=external_message_id,
+            kind=kind,
+        )
 
 
 def _render_tier1_body(kind: str, payload: dict[str, Any]) -> str:
