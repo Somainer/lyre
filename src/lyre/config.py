@@ -268,6 +268,14 @@ class Config:
     # ---- defaults: existing runtime knobs ----
     model_override: str | None = None
     compact_threshold: float = 0.7
+    # Per-turn output budget passed to the LLM (``max_tokens``). 4096
+    # is the SDK default but it's too small for tool-call argument
+    # bodies that include long file contents / large diffs — the model
+    # truncates mid-JSON and the adapter falls back to ``{"_raw": ...}``,
+    # which then trips tool input validation, the loop re-tries, hits
+    # max_turns, and the task dies. 8192 is a safer floor for
+    # workhorse-class models; flagship can usually go higher.
+    max_tokens: int = 8192
 
     # ---- defaults: paths added with config.toml ----
     lyre_home: Path = field(default_factory=_default_home)
@@ -399,6 +407,20 @@ class Config:
             os.environ.get("LYRE_COMPACT_THRESHOLD"),
             default=float(runtime_raw.get("compact_threshold", 0.7)),
         )
+        # max_tokens: env > [runtime] > default. Floor at 256 so a
+        # misconfigured 0 / negative doesn't immediately starve every
+        # wakeup.
+        max_tokens_raw = (
+            os.environ.get("LYRE_MAX_TOKENS")
+            or runtime_raw.get("max_tokens")
+        )
+        try:
+            max_tokens = (
+                max(256, int(max_tokens_raw)) if max_tokens_raw is not None
+                else 8192
+            )
+        except (ValueError, TypeError):
+            max_tokens = 8192
         dashboard_port_raw = os.environ.get("LYRE_DASHBOARD_PORT") or runtime_raw.get(
             "default_dashboard_port", 8765
         )
@@ -473,6 +495,7 @@ class Config:
             default_model=default_model,
             model_override=model_override,
             compact_threshold=compact_threshold,
+            max_tokens=max_tokens,
             lyre_home=home,
             user_md_path=user_md_path,
             env_path=env_path,

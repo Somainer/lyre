@@ -22,6 +22,7 @@ All env vars are optional unless noted. Set them in your shell or a
 | `LYRE_MODEL_OVERRIDE` | Force every wakeup to this specific `model_id`, ignoring persona routing. Useful for testing one provider. | unset (per-persona routing) |
 | `LYRE_DEFAULT_MODEL` | Fallback if a persona doesn't specify a `model_preference`. | `claude-sonnet-4-6` |
 | `LYRE_COMPACT_THRESHOLD` | Fraction of context window above which auto-compaction fires. Must be `0 < x < 1`. | `0.7` |
+| `LYRE_MAX_TOKENS` | Per-turn output budget passed to the LLM (`max_tokens`). Increase if you see tool-call arguments getting truncated mid-JSON (typical symptom: a wakeup wedges at max_turns repeating the same malformed tool call). Min clamp 256. | `8192` |
 
 ### Storage paths
 

@@ -193,7 +193,7 @@ class AgentLoop:
         tool_registry: ToolRegistry | None = None,
         tool_context: ToolContext | None = None,
         allowed_tools: list[str] | None = None,
-        max_tokens: int = 4096,
+        max_tokens: int = 8192,
         max_turns: int = 24,
         health: HealthTracker | None = None,
         blocker_watcher: MailWatcher | None = None,
@@ -936,6 +936,33 @@ class AgentLoop:
         tool = self.tool_registry.get(name)
         if tool is None:
             return (f"Unknown tool '{name}'.", True)
+        # Adapters that couldn't parse the model's tool-call arguments
+        # JSON (e.g. truncated by max_tokens mid-emit) fall back to
+        # ``{"_raw": <partial-json-string>}``. The per-tool handler then
+        # sees a payload missing every required key and returns the
+        # generic "provide 'code'" / "provide 'to'" error — the model
+        # then re-tries the same malformed call, burns turns, and the
+        # task dies at max_turns. Surfacing the truncation directly
+        # lets the model break out of that loop on the next turn.
+        if (
+            len(tool_input) == 1
+            and "_raw" in tool_input
+            and isinstance(tool_input["_raw"], str)
+        ):
+            raw = tool_input["_raw"]
+            return (
+                f"Tool '{name}' was called with malformed arguments — "
+                f"the JSON could not be parsed and was probably "
+                f"truncated by the per-turn output budget "
+                f"(max_tokens={self.max_tokens}). "
+                f"Do NOT retry the same call. Either shrink the "
+                f"arguments (split a large input across multiple "
+                f"calls, omit verbose inline content, paste-link "
+                f"instead of inlining), or skip this tool for now and "
+                f"continue the task differently. "
+                f"Raw bytes received ({len(raw)} chars): {raw[:200]!r}…",
+                True,
+            )
         try:
             args = dict(tool_input)
             args.setdefault("_tool_use_id", tool_use_id)
