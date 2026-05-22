@@ -59,7 +59,7 @@ def onboard_cmd() -> None:
     from .onboard import bootstrap_runtime, run_wizard
 
     cfg = Config.from_env()
-    plan = run_wizard(lyre_home=cfg.lyre_home)
+    plan = run_wizard(lyre_home=cfg.lyre_home, current_cfg=cfg)
 
     # Wizard wrote config.toml + env + user.md + dirs; reload Config so the
     # bootstrap sees fresh owner_name / paths.
@@ -241,12 +241,22 @@ def serve_cmd(
             channel_registry = ChannelRegistry()
             if cfg.integrations.lark.enabled:
                 from .integrations.lark import LarkChannel
+                # The default recipient for unaddressed inbound messages
+                # is the dispatcher persona's current bootstrap-seeded
+                # agent id (display_name from identity.md). Resolved at
+                # startup; restart picks up renames.
+                dispatcher_persona = await repos.personas.get("dispatcher")
+                dispatcher_id = (
+                    (dispatcher_persona.display_name
+                     or dispatcher_persona.name)
+                    if dispatcher_persona is not None else "dispatcher"
+                )
                 try:
                     channel_registry.register(LarkChannel(
                         cfg.integrations.lark,
                         repos,
                         blob_store,
-                        dispatcher_id=cfg.bootstrap.dispatcher_id,
+                        dispatcher_id=dispatcher_id,
                     ))
                 except ValueError as exc:
                     click.echo(
@@ -338,7 +348,6 @@ def serve_cmd(
                             model_context_windows=ctx_windows,
                             owner_name=cfg.owner.name,
                             blob_store=blob_store,
-                            bootstrap=cfg.bootstrap,
                         ),
                         name="dashboard",
                     )
@@ -503,7 +512,6 @@ def dashboard_cmd(host: str, port: int) -> None:
                 model_context_windows=ctx_windows,
                 owner_name=cfg.owner.name,
                 blob_store=BlobStore(cfg.object_store_path),
-                bootstrap=cfg.bootstrap,
             )
         finally:
             await conn.close()
@@ -574,9 +582,9 @@ def send_cmd(
 ) -> None:
     """Send a mailbox message to an agent.
 
-    `recipient` is an AGENT ID (post-A3: agents are first-class). Bare
-    ids (`owner`, `dispatcher`, `analyst-1`, `reviewer-1`) reach bootstrap
-    agents directly. Spawned
+    `recipient` is an AGENT ID. Bare ids (`owner`, `dispatcher`,
+    `analyst-1`, `reviewer-1` — or whatever display_names the owner set
+    in identity.md) reach bootstrap-seeded agents directly. Spawned
     agents use `persona/name` (e.g. `worker-maintainer/refactor-auth`);
     if that id doesn't exist yet the CLI auto-creates it (use
     `--no-spawn` to disable). `lyre agent list` shows live agent ids.
@@ -584,7 +592,6 @@ def send_cmd(
 
     async def _run() -> None:
         from .runtime.identity import (
-            is_bootstrap,
             is_valid_agent_id,
             split_id,
         )
@@ -614,7 +621,7 @@ def send_cmd(
                 persona, name = split_id(recipient)
                 # Bare names (no `/`) must already exist — they can't be
                 # spawned because there's no persona side to validate.
-                if name is None or is_bootstrap(recipient):
+                if name is None:
                     live = sorted({a.id for a in await repos.agents.list_all()} | {"owner"})
                     click.echo(
                         f"unknown agent {recipient!r}. Known: {live}. "
@@ -1354,13 +1361,12 @@ def agent_archive_cmd(agent_id: str) -> None:
         conn = await init_db(cfg.db_path)
         try:
             repos = SqliteRepositories(conn)
-            bootstrap_ids = {
-                "owner",
-                cfg.bootstrap.dispatcher_id,
-                cfg.bootstrap.analyst_id,
-                cfg.bootstrap.reviewer_id,
-            }
-            if agent_id in bootstrap_ids:
+            # Bootstrap-pinned set is derived from the agents table at
+            # call time — every row with parent_agent_id IS NULL is a
+            # seeded singleton (or `owner`, the human). SSOT: DB state,
+            # not a static config.
+            target = await repos.agents.get(agent_id)
+            if target is not None and target.parent_agent_id is None:
                 click.echo(
                     f"refusing to archive bootstrap agent {agent_id!r}",
                     err=True,

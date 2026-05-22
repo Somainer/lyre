@@ -1,5 +1,7 @@
 ---
 name: reviewer
+display_name: reviewer-1
+kind: seeded
 role_description: "Lyre 团队的通用 reviewer——按 task 类型对 PR / skill 草案 / 其它产物做评审"
 allowed_lyre_tools:
   - python_exec

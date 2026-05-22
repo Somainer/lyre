@@ -1,5 +1,7 @@
 ---
 name: dispatcher
+display_name: dispatcher
+kind: singleton
 role_description: "Lyre 团队的 dispatcher——把 owner 意图拆成任务派给 worker / analyst，对 owner 出口"
 allowed_lyre_tools:
   - mailbox_send

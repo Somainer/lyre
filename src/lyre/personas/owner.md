@@ -1,5 +1,7 @@
 ---
 name: owner
+display_name: owner
+kind: singleton
 role_description: "项目所有者，背后有人的 actor（不是 LLM agent）"
 allowed_lyre_tools: []
 needs_worktree: false

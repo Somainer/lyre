@@ -115,7 +115,7 @@ def assemble_system_prompt(
     # Peer bootstrap agents — first parent-less agent per persona name,
     # excluding self. Lets persona bodies stay generic ("hand off to the
     # analyst") while the preamble names the actual agent ids the owner
-    # customized via [bootstrap] in config.toml.
+    # set via ``display_name`` in each persona's identity.md.
     peer_bootstrap: dict[str, str] = {}
     if other_agents:
         for a in other_agents:
@@ -247,11 +247,11 @@ def _build_identity_preamble(
     without that line, preserving cache reuse for them too.
 
     ``peer_bootstrap`` maps persona name → current agent id for each
-    bootstrap singleton OTHER than self. Persona bodies refer to peers
-    generically ("the analyst", "your reviewer") so they stay correct
-    when the owner customizes the agent ids via ``[bootstrap]`` in
-    config.toml; this section in the preamble grounds those generic
-    references to the actual ids."""
+    bootstrap-seeded peer OTHER than self. Persona bodies refer to
+    peers generically ("the analyst", "your reviewer") so they stay
+    correct when the owner customizes agent ids via ``display_name``
+    in each persona's identity.md; this section in the preamble
+    grounds those generic references to the actual ids."""
     # `persona/name` ids would otherwise hint at a directory layer in
     # the notes path; flatten `/` to `-` to match
     # ensure_agent_notes_file's filename convention.

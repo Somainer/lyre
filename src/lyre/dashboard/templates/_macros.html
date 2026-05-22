@@ -77,8 +77,8 @@
 
 {# ---- Agent id pill — persona/name w/ dim slash ----------------------- #}
 {# Bare ids (no `/`) render as a single bubble — this covers owner,
-   dispatcher / analyst-1 / reviewer-1 AND any custom-named bootstrap
-   agents the owner set via config.toml [bootstrap]. Spawned agents have
+   dispatcher / analyst-1 / reviewer-1 AND any custom display_names the
+   owner set in each persona's identity.md. Spawned agents have
    `persona/name` ids and render two segments with a dim slash. Long names
    get max-width ellipsis via CSS. #}
 {% macro agent_id_pill(agent_id, dim=False, size="md", show_persona=True) -%}

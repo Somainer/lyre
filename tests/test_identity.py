@@ -1,10 +1,10 @@
 """Agent-id grammar tests.
 
-The format (`<persona>` for bootstrap, `<persona>/<name>` for spawned)
-is enforced at every trust boundary — create_agent, mailbox_send,
-dashboard, CLI. The shape of those rules lives in one place
-(`lyre.runtime.identity`) so this test file is the single point of
-truth for what we consider valid.
+The format (bare lowercase token for bootstrap-seeded singletons,
+``<persona>/<name>`` for spawned) is enforced at every trust boundary
+— create_agent, mailbox_send, dashboard, CLI. The shape of those
+rules lives in one place (`lyre.runtime.identity`) so this test file
+is the single point of truth for what we consider valid.
 """
 
 from __future__ import annotations
@@ -12,9 +12,8 @@ from __future__ import annotations
 import pytest
 
 from lyre.runtime.identity import (
-    BOOTSTRAP_IDS,
     compose_id,
-    is_bootstrap,
+    is_bare_id,
     is_valid_agent_id,
     split_id,
     validate_agent_id,
@@ -108,21 +107,24 @@ def test_compose_id_roundtrip() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Bootstrap predicate
+# Bare-id predicate
 # ---------------------------------------------------------------------------
 
 
-def test_bootstrap_ids_are_well_known() -> None:
-    assert is_bootstrap("owner")
-    assert is_bootstrap("dispatcher")
-    # analyst & reviewer are NOT bootstrap personas — they can spawn for
-    # parallelism. Only the owner-facing singleton is locked.
-    assert not is_bootstrap("analyst")
-    assert not is_bootstrap("reviewer")
-    assert not is_bootstrap("worker")
-    assert not is_bootstrap("worker/scout")
-
-
-def test_bootstrap_set_is_frozen() -> None:
-    """Frozenset → can't be mutated at runtime."""
-    assert isinstance(BOOTSTRAP_IDS, frozenset)
+@pytest.mark.parametrize(
+    "agent_id,bare",
+    [
+        ("owner", True),
+        ("dispatcher", True),
+        ("luna", True),         # custom display_name for the dispatcher persona
+        ("analyst-1", True),
+        ("worker-maintainer/refactor-auth", False),
+        ("reviewer/pr-142", False),
+    ],
+)
+def test_is_bare_id(agent_id: str, bare: bool) -> None:
+    """``is_bare_id`` is purely syntactic — it's TRUE iff the id has no
+    ``/``. It deliberately does NOT know about which personas are
+    bootstrap-seeded (that's DB state, queried via
+    ``parent_agent_id IS NULL`` at call sites that need it)."""
+    assert is_bare_id(agent_id) == bare

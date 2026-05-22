@@ -71,9 +71,10 @@ class LarkChannel:
         dispatcher_id: str,
     ) -> None:
         """``dispatcher_id`` is the default recipient for unaddressed
-        Lark messages — passed in (vs. read off the config) so the
-        bootstrap rename feature works without LarkChannel re-reading
-        config on every event."""
+        Lark messages — resolved from the dispatcher persona's
+        display_name at lyre-serve startup and passed in so the
+        WS-callback path doesn't need to re-query the DB on each
+        event."""
         if not cfg.app_id or not cfg.app_secret:
             raise ValueError(
                 "LarkChannel requires LARK_APP_ID + LARK_APP_SECRET "

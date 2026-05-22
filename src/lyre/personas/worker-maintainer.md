@@ -1,5 +1,7 @@
 ---
 name: worker-maintainer
+display_name: worker-maintainer
+kind: spawn_only
 role_description: "Lyre 团队的 worker——在 per-task tmpdir 改代码、跑测试、提 PR"
 allowed_lyre_tools:
   - python_exec

@@ -16,6 +16,12 @@ both exist for the same name):
 Plus optional per-field overrides from ``Config.persona_overrides`` (loaded
 from ``config.toml [personas.<name>]``), applied last on whichever file won.
 
+Persona's ``kind`` frontmatter field drives bootstrap-agent seeding:
+  - ``singleton``   — seed one agent; create_agent refuses (owner, dispatcher)
+  - ``seeded``      — seed one agent; create_agent allowed for parallel
+                      instances (analyst, reviewer)
+  - ``spawn_only``  — never auto-seed; create_agent required (worker-maintainer)
+
 Idempotent on re-runs (upserts by name).
 """
 
@@ -31,43 +37,6 @@ import yaml
 from ..config import PersonaOverride
 from ..persistence.models import Persona
 from ..persistence.repositories import AgentRepository, PersonaRepository
-
-# Agent ids that always exist after `lyre onboard`. The owner agent id is
-# pinned to literal "owner" (it's the human's identity in the mail graph;
-# renaming would just be confusing). The three role agents have configurable
-# ids — see Config.bootstrap — so the owner can give them names with personality
-# ("luna" for the dispatcher, "scribe" for the analyst, etc.). Persona names
-# stay fixed; only the agent identity is owner-customizable.
-DEFAULT_PERSONA_TO_AGENT_ID: dict[str, str] = {
-    "owner": "owner",
-    "dispatcher": "dispatcher",
-    "analyst": "analyst-1",
-    "reviewer": "reviewer-1",
-}
-
-
-def _resolved_default_agents(
-    dispatcher_id: str = "dispatcher",
-    analyst_id: str = "analyst-1",
-    reviewer_id: str = "reviewer-1",
-) -> tuple[tuple[str, str], ...]:
-    """Resolve (agent_id, persona_name) pairs for bootstrap seeding.
-
-    The default identifiers are used when no overrides are provided; otherwise
-    the wizard / config.toml supplies custom owner-facing names.
-    """
-    return (
-        ("owner", "owner"),
-        (dispatcher_id, "dispatcher"),
-        (analyst_id, "analyst"),
-        (reviewer_id, "reviewer"),
-    )
-
-
-# Back-compat alias for any external caller that imported the tuple directly.
-# Resolves to the default ids; runtime callers should use _resolved_default_agents
-# with the active Config.bootstrap fields.
-DEFAULT_AGENTS: tuple[tuple[str, str], ...] = _resolved_default_agents()
 
 
 def _parse_markdown_with_frontmatter(text: str) -> tuple[dict[str, Any], str]:
@@ -89,6 +58,8 @@ def load_persona_from_file(path: Path) -> Persona:
 
     return Persona(
         name=front["name"],
+        display_name=front.get("display_name"),  # None → label falls back to name
+        kind=front.get("kind", "spawn_only"),
         role_description=front["role_description"],
         system_prompt=body,
         allowed_lyre_tools=front.get("allowed_lyre_tools", []) or [],
@@ -100,6 +71,12 @@ def load_persona_from_file(path: Path) -> Persona:
 
 
 SHIPPED_PERSONAS_EXCLUDED = {"__init__.py", "seed.py"}
+
+# APPEND.md template: empty so the prompt-assembly path naturally
+# skips it. Existing here as a marker file the owner can edit to inject
+# voice / style without touching identity.md. Seeded alongside every
+# user-personas/<name>/identity.md so the mechanism is discoverable.
+APPEND_TEMPLATE = ""
 
 
 def _shipped_personas_dir() -> Path:
@@ -118,7 +95,10 @@ def ensure_user_personas(
 ) -> list[str]:
     """Copy shipped personas into ``user_personas_dir`` using directory layout.
 
-    Each shipped ``<name>.md`` becomes ``<user_personas_dir>/<name>/identity.md``.
+    Each shipped ``<name>.md`` becomes ``<user_personas_dir>/<name>/identity.md``,
+    accompanied by an empty ``APPEND.md`` so the discoverable customization
+    slot exists in the owner's filesystem from day one.
+
     Skips any name that already has either layout present in the user dir
     (so user edits, renames, and deletions are preserved across re-runs).
 
@@ -131,9 +111,21 @@ def ensure_user_personas(
         flat_target = user_personas_dir / f"{name}.md"
         dir_target = user_personas_dir / name / "identity.md"
         if not overwrite and (flat_target.exists() or dir_target.exists()):
+            # Persona itself stays as-is; still make sure APPEND.md
+            # exists alongside an existing directory layout so re-onboards
+            # heal missing companion files without touching content.
+            append_target = user_personas_dir / name / "APPEND.md"
+            if dir_target.exists() and not append_target.exists():
+                append_target.write_text(APPEND_TEMPLATE, encoding="utf-8")
             continue
         dir_target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy(src, dir_target)
+        # Touch APPEND.md alongside so the owner sees both files and
+        # learns the customization slot exists. Empty content → runtime
+        # appends an empty string, which is harmless in prompt assembly.
+        (dir_target.parent / "APPEND.md").write_text(
+            APPEND_TEMPLATE, encoding="utf-8"
+        )
         copied.append(name)
     return copied
 
@@ -185,8 +177,11 @@ def _apply_field_override(persona: Persona, override: PersonaOverride) -> Person
     """Apply single-field ``[personas.<name>]`` overrides from config.toml.
 
     Each field replaces the persona's value if non-None; the persona's
-    ``system_prompt`` and ``role_description`` are never touched by this
-    path (use a whole-file override in ``~/.lyre/personas/`` for that).
+    ``system_prompt``, ``role_description``, ``display_name``, and ``kind``
+    are NEVER touched by this path — those are identity facts that live
+    in identity.md as the single source of truth. config.toml override
+    is reserved for deployment-level runtime knobs (model_preference,
+    allowed_lyre_tools).
     """
     updates: dict[str, Any] = {}
     if override.model_preference is not None:
@@ -220,82 +215,81 @@ async def seed_personas(
 
 
 async def seed_default_agents(
-    repo: AgentRepository,
+    persona_repo: PersonaRepository,
+    agent_repo: AgentRepository,
     memory_root: Path | None = None,
-    *,
-    agents: tuple[tuple[str, str], ...] | None = None,
 ) -> list[str]:
-    """Ensure the well-known bootstrap agents exist.
+    """Seed one bootstrap agent for every persona whose ``kind`` is
+    ``singleton`` or ``seeded`` — those declare "I deserve a default
+    standing instance the owner can mailbox out of the box".
 
-    Pass ``agents`` to override the (agent_id, persona_name) list — typically
-    constructed from ``Config.bootstrap`` so the owner can pick names like
-    "luna" instead of literal "dispatcher". Defaults to ``DEFAULT_AGENTS``.
+    Each such agent's id comes from the persona's ``display_name`` (or
+    ``name`` if display_name is unset). That's the one-time-at-seed-time
+    copy: once the agent row exists, its id is immutable even if the
+    owner later re-edits identity.md's display_name (mail rows already
+    reference it via FK).
 
-    Idempotent: skips any agent that already exists. Workers are NOT seeded —
-    dispatcher (or owner via CLI) creates them on demand. If `memory_root` is
-    provided, a notes file is pre-created at
-    `<memory_root>/facts/agent-<id>-notes.md` for each seeded agent — this
-    is the "agent's private scratchpad for cross-wakeup memory" that the
-    identity preamble teaches about (Codex-style: pre-create the path so
-    the agent naturally `ls` / `cat`s it).
+    ``spawn_only`` personas (workers) are skipped here — the dispatcher
+    creates instances of those on demand via the ``create_agent`` tool.
 
-    After seeding, calls :func:`archive_stale_bootstrap_agents` to soft-
-    delete any *other* parentless agents of the same bootstrap personas —
-    this handles the "owner re-ran onboard with new names" case, so the
-    dashboard stops showing both `dispatcher` and `luna` side-by-side.
+    Idempotent: agents that already exist are not re-created. Notes file
+    pre-creation runs unconditionally (so re-onboards heal missing files).
+
+    Returns the list of newly-created agent ids.
     """
-    pairs = agents if agents is not None else DEFAULT_AGENTS
+    personas = await persona_repo.list_active()
     created: list[str] = []
-    for agent_id, persona_name in pairs:
-        if not await repo.exists(agent_id):
-            await repo.create(
+    for p in personas:
+        if p.kind == "spawn_only":
+            continue
+        agent_id = p.display_name or p.name
+        if not await agent_repo.exists(agent_id):
+            await agent_repo.create(
                 agent_id=agent_id,
-                persona_name=persona_name,
-                parent_agent_id=None,  # bootstrap roots
+                persona_name=p.name,
+                parent_agent_id=None,  # bootstrap root
             )
             created.append(agent_id)
         if memory_root is not None:
             ensure_agent_notes_file(memory_root, agent_id)
-    await archive_stale_bootstrap_agents(repo, pairs)
+    await archive_stale_bootstrap_agents(persona_repo, agent_repo)
     return created
 
 
 async def archive_stale_bootstrap_agents(
-    repo: AgentRepository,
-    canonical: tuple[tuple[str, str], ...],
+    persona_repo: PersonaRepository,
+    agent_repo: AgentRepository,
 ) -> list[str]:
-    """Soft-archive bootstrap agents that no longer match ``canonical``.
+    """Soft-archive bootstrap-seeded agents whose persona's display_name
+    has been re-pointed.
 
-    ``canonical`` is the freshly-resolved (agent_id, persona_name) list
-    from ``Config.bootstrap`` (what *should* be seeded right now).
+    Owner edits ``identity.md`` to change ``display_name`` from
+    ``dispatcher`` to ``luna``. We seed ``luna``; the old ``dispatcher``
+    agent row should retire (mail history preserved, but mail can no
+    longer go to it).
 
-    A row qualifies for archival when ALL these hold:
-      - persona_name appears in ``canonical`` (it's a bootstrap persona)
-      - row's id is NOT in ``canonical`` (it's the wrong id for this slot)
-      - row.parent_agent_id IS NULL (truly bootstrap-seeded, not a
-        user-spawned child like `dispatcher/refactor-x`)
-      - row.status != 'archived' (don't re-archive)
+    Eligibility: every parentless agent (``parent_agent_id IS NULL``)
+    whose persona is still ``singleton``/``seeded`` but whose id doesn't
+    match the persona's CURRENT ``display_name``. User-spawned agents
+    (``parent_agent_id`` non-NULL) are untouched.
 
-    Mail and wakeups attached to the archived row stay queryable from
-    the dashboard, but new mail / new dispatch is refused. Owner can
-    `lyre agent` un-archive later if needed.
-
-    Returns the list of archived ids.
+    Returns the list of archived agent ids.
     """
-    canonical_ids = {aid for aid, _ in canonical}
-    canonical_personas = {p for _, p in canonical}
+    personas = {p.name: p for p in await persona_repo.list_active()}
 
     archived: list[str] = []
-    for agent in await repo.list_all(include_archived=False):
-        if agent.persona_name not in canonical_personas:
-            continue
-        if agent.id in canonical_ids:
-            continue
+    for agent in await agent_repo.list_all(include_archived=False):
         if agent.parent_agent_id is not None:
             continue  # user-spawned, leave alone
         if agent.status == "archived":
             continue
-        ok = await repo.archive(agent.id)
+        p = personas.get(agent.persona_name)
+        if p is None or p.kind == "spawn_only":
+            continue  # not currently a bootstrap-eligible persona
+        expected_id = p.display_name or p.name
+        if agent.id == expected_id:
+            continue
+        ok = await agent_repo.archive(agent.id)
         if ok:
             archived.append(agent.id)
     return archived

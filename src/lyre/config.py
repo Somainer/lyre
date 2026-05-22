@@ -208,7 +208,8 @@ class LarkConfig:
 
     The bot becomes the owner's mailbox over IM: agent→owner mail
     surfaces in Lark; messages from ``authorized_user_id`` become
-    mail to agents (default recipient `bootstrap.dispatcher_id`,
+    mail to agents (default recipient: dispatcher persona's seeded
+    singleton — its current display_name from identity.md);
     overridable with `@<agent_id>` prefix or by replying in an
     existing thread).
 
@@ -244,27 +245,6 @@ class IntegrationsConfig:
     # Future: slack: SlackConfig, discord: DiscordConfig, etc.
 
 
-@dataclass(frozen=True)
-class BootstrapConfig:
-    """Customizable agent identities for the bootstrap-seeded agents.
-
-    The PERSONA is always one of the shipped roles (dispatcher / analyst /
-    reviewer) — this is a system identifier the runtime keys off. The
-    AGENT id, however, is what the owner sees and addresses — `lyre send
-    luna "..."`, dashboard column "Luna's mailbox", etc. Owner-personal,
-    purely cosmetic from runtime's perspective.
-
-    Soul / style customization goes through the existing APPEND.md
-    mechanism on the persona directory — see runtime.context system-prompt
-    assembly. There's no field here for it because it's a file-content
-    affair, not a config affair.
-    """
-
-    dispatcher_id: str = "dispatcher"
-    analyst_id: str = "analyst-1"
-    reviewer_id: str = "reviewer-1"
-
-
 def _default_home() -> Path:
     return lyre_home()
 
@@ -295,7 +275,6 @@ class Config:
     owner: OwnerConfig = field(default_factory=lambda: OwnerConfig(name="owner"))
     models: list[ModelEntry] = field(default_factory=list)
     persona_overrides: dict[str, PersonaOverride] = field(default_factory=dict)
-    bootstrap: BootstrapConfig = field(default_factory=BootstrapConfig)
     integrations: IntegrationsConfig = field(default_factory=IntegrationsConfig)
 
     # ---- defaults: runtime knobs added with config.toml ----
@@ -452,13 +431,18 @@ class Config:
             # signal is honored.
             max_concurrent = 1
 
-        # ---- bootstrap agent id overrides ----
-        bootstrap_raw = raw.get("bootstrap") or {}
-        bootstrap = BootstrapConfig(
-            dispatcher_id=str(bootstrap_raw.get("dispatcher_id", "dispatcher")),
-            analyst_id=str(bootstrap_raw.get("analyst_id", "analyst-1")),
-            reviewer_id=str(bootstrap_raw.get("reviewer_id", "reviewer-1")),
-        )
+        # ---- legacy [bootstrap] deprecation warning ----
+        # The old [bootstrap] section let the owner pin dispatcher_id /
+        # analyst_id / reviewer_id. Those moved to persona identity.md
+        # frontmatter (display_name field). Surface a one-shot warning
+        # so anyone with a stale config notices the migration.
+        if raw.get("bootstrap"):
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "config.toml [bootstrap] section is deprecated and ignored. "
+                "Set display_name in each persona's identity.md frontmatter "
+                "instead (~/.lyre/personas/<name>/identity.md)."
+            )
 
         # ---- external channel integrations ----
         # config.toml carries non-sensitive identifiers + the enable
@@ -490,7 +474,6 @@ class Config:
             owner=owner,
             models=models,
             persona_overrides=persona_overrides,
-            bootstrap=bootstrap,
             integrations=integrations,
             default_dashboard_port=dashboard_port,
             auto_wake_on_mail=bool(auto_wake),

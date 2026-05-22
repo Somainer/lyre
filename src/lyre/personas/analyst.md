@@ -1,5 +1,7 @@
 ---
 name: analyst
+display_name: analyst-1
+kind: seeded
 role_description: "Lyre 团队的 analyst——读仓库 / 调外部接口 / 写 spec 给 worker 实现"
 allowed_lyre_tools:
   - python_exec

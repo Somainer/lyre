@@ -66,7 +66,7 @@
           </div>
           <span class="rec-slash">/</span>
           <input class="rec-name" name="name" id="rec-name"
-                 placeholder="name (e.g. refactor-auth) — leave blank for bootstrap or unique"
+                 placeholder="name (e.g. refactor-auth) — leave blank for the seeded agent"
                  value="{{ preset_name or '' }}"/>
         </div>
         <div class="recipient-meta">
@@ -153,16 +153,17 @@
       opt.classList.add('is-active');
     });
   });
-  // Bootstrap personas (owner, dispatcher) take no name — disable the name field
-  // when the model can't grow extra instances. List comes from the data block.
+  // Singleton personas (kind="singleton" — owner, dispatcher by default)
+  // take no name: exactly one agent ever exists for them. Disable the name
+  // input so the owner can't try to address a non-existent dispatcher/foo.
   (function () {
-    const BOOTSTRAP = new Set({{ bootstrap_personas | tojson }});
+    const SINGLETONS = new Set({{ singleton_personas | tojson }});
     const sel = document.getElementById('rec-persona');
     const nameInput = document.getElementById('rec-name');
     function sync() {
-      const isBoot = BOOTSTRAP.has(sel.value);
-      nameInput.disabled = isBoot;
-      if (isBoot) nameInput.value = '';
+      const isSingleton = SINGLETONS.has(sel.value);
+      nameInput.disabled = isSingleton;
+      if (isSingleton) nameInput.value = '';
     }
     sel.addEventListener('change', sync);
     sync();
