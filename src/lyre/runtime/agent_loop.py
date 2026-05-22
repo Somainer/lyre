@@ -193,7 +193,7 @@ class AgentLoop:
         tool_registry: ToolRegistry | None = None,
         tool_context: ToolContext | None = None,
         allowed_tools: list[str] | None = None,
-        max_tokens: int = 8192,
+        max_tokens: int = 32768,
         max_turns: int = 24,
         health: HealthTracker | None = None,
         blocker_watcher: MailWatcher | None = None,

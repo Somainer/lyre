@@ -66,18 +66,20 @@ def test_wakeup_status_maps_to_valid_task_status(
 # ---------------------------------------------------------------------------
 
 
-def test_max_tokens_defaults_to_8192_when_unset(
+def test_max_tokens_defaults_to_32k_when_unset(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """8192 is the new floor: 4096 was small enough to truncate tool-
-    call argument JSON for python_exec / mailbox_send with rich
-    bodies, which is the root cause behind the original failure
-    report."""
+    """32k is the floor for per-turn output. max_tokens is a single-
+    turn cap, not a lifetime budget — what bounds it is the biggest
+    single tool-call argument an agent writes (worker_maintainer
+    writing code via python_exec is the hot path, easily 5–20k).
+    4096 / 8192 truncated mid-JSON for those callers; 32k is
+    generous on every modern flagship."""
     monkeypatch.setenv("LYRE_HOME", str(tmp_path))
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("LYRE_MAX_TOKENS", raising=False)
     cfg = Config.from_env()
-    assert cfg.max_tokens == 8192
+    assert cfg.max_tokens == 32768
 
 
 def test_max_tokens_reads_from_runtime_toml(
@@ -100,7 +102,7 @@ def test_max_tokens_env_overrides_toml(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("LYRE_MAX_TOKENS", "32768")
     (tmp_path / "config.toml").write_text(
-        '[owner]\nname = "o"\n\n[runtime]\nmax_tokens = 8192\n',
+        '[owner]\nname = "o"\n\n[runtime]\nmax_tokens = 16384\n',
         encoding="utf-8",
     )
     assert Config.from_env().max_tokens == 32768
