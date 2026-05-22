@@ -139,7 +139,15 @@ async def test_mailbox_react_skips_silent_close(silent_setup) -> None:
     "I gathered context but didn't reply" apology mail — undoing the
     whole point of using react instead of send.
 
-    Regression guard: read + react → status="completed", no fallback.
+    Both the silent-turn NUDGE (mid-loop synthetic user msg asking the
+    model to keep going) and the silent-close FALLBACK (wakeup-end
+    apology mail) consult the same ``made_user_facing_action`` flag,
+    which is set by ``tu['name'] in _USER_FACING_TOOLS``. The FakeAdapter
+    below only has 3 turns queued (read / react / end_turn) — if the
+    nudge fired after the end_turn it would demand a 4th turn the
+    adapter doesn't have and the loop would crash, so a clean
+    ``result.status == "completed"`` proves both layers ignored the
+    react path correctly.
     """
     adapter, ctx, transcript = silent_setup
 
