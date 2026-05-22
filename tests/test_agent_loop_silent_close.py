@@ -129,6 +129,76 @@ async def test_silent_close_fires_fallback_mail(silent_setup) -> None:
 
 
 @pytest.mark.asyncio
+async def test_mailbox_react_skips_silent_close(silent_setup) -> None:
+    """Acking a mail with ``mailbox_react`` is a legitimate response —
+    it's specifically the "silent ack" primitive that closes a thread
+    without pushing a notification. The silent-close detector USED to
+    miss this: ``mailbox_react`` wasn't in ``_USER_FACING_TOOLS``, so a
+    wakeup that read mail and reacted (instead of sending) still
+    triggered the silent-close fallback, which then sent an unwanted
+    "I gathered context but didn't reply" apology mail — undoing the
+    whole point of using react instead of send.
+
+    Both the silent-turn NUDGE (mid-loop synthetic user msg asking the
+    model to keep going) and the silent-close FALLBACK (wakeup-end
+    apology mail) consult the same ``made_user_facing_action`` flag,
+    which is set by ``tu['name'] in _USER_FACING_TOOLS``. The FakeAdapter
+    below only has 3 turns queued (read / react / end_turn) — if the
+    nudge fired after the end_turn it would demand a 4th turn the
+    adapter doesn't have and the loop would crash, so a clean
+    ``result.status == "completed"`` proves both layers ignored the
+    react path correctly.
+    """
+    adapter, ctx, transcript = silent_setup
+
+    # Reusing the seed mail planted by the fixture (id=1, from owner).
+    adapter.push_turn(
+        [
+            ToolUseComplete(id="tu_r", name="mailbox_read", input={}),
+            TurnComplete(stop_reason="tool_use"),
+        ]
+    )
+    adapter.push_turn(
+        [
+            ToolUseComplete(
+                id="tu_react",
+                name="mailbox_react",
+                input={"msg_id": 1, "kind": "ack"},
+            ),
+            TurnComplete(stop_reason="tool_use"),
+        ]
+    )
+    adapter.push_turn([TurnComplete(stop_reason="end_turn")])
+
+    loop = AgentLoop(
+        candidates=[fake_entry(id="m")],
+        adapter_for=lambda e: adapter,
+        model_name_for=lambda e: e.id,
+        transcript=transcript,
+        tool_registry=build_default_registry(),
+        tool_context=ctx,
+        allowed_tools=["mailbox_read", "mailbox_react"],
+    )
+    result = await loop.run(
+        system_prompt="",
+        initial_messages=[
+            LyreMessage(role="user", content=[LyreContentBlock(type="text", text="go")])
+        ],
+    )
+    transcript.close()
+
+    assert result.status == "completed"
+    # No silent-close apology mail enqueued — the react itself is
+    # the response.
+    outbox_rows = await ctx.repos.outbox.dequeue_batch(limit=10)
+    silent_close_rows = [
+        r for r in outbox_rows
+        if (r.payload.get("metadata") or {}).get("silent_close")
+    ]
+    assert not silent_close_rows
+
+
+@pytest.mark.asyncio
 async def test_reply_in_same_wakeup_skips_silent_close(silent_setup) -> None:
     """Happy path: model reads then replies. status=completed, no fallback."""
     adapter, ctx, transcript = silent_setup
