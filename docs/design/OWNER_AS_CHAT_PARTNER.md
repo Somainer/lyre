@@ -28,14 +28,15 @@ dispatcher 是 owner 的唯一对话伙伴（singleton kind）。**它的 wakeup
 active task 就跳过 Phase 0 auto-wake-on-mail，owner 等于在没事干的时候被拒接。
 
 具体落实：
-- **dispatcher.allowed_lyre_tools 不含 `await_subagents`**——物理上调不到
+- `await_subagents` 工具和支持机制（`find_parents_ready_to_wake` /
+  `wake_parent`）**整套从 runtime 删除**——不只 dispatcher 不能用，
+  没人能用。Event-driven 是所有 agent 共同的约束
 - 模型在 prompt 里被反复教育：dispatch 完后停止调 tool，让 wakeup 关闭
 - worker / analyst 跑完会 `mailbox_send` 回 dispatcher，auto-wake-on-mail 起新 wakeup
 - 同期 owner 新消息走同一通路，互不阻塞
-
-`await_subagents` 工具本身保留，给 **analyst / reviewer** 这种「我必须凑齐所有 child
-输出再写 final answer」的合成型角色继续用——它们的 task 就是 composed answer，
-等所有 child 完成是合理的；它们也不是 owner-facing singleton。
+- **合成型角色**（analyst / reviewer 拆并行子调研）也走同一模式：dispatch +
+  scheduled_mail 到自己做 soft-timeout + scratchpad 记「等谁」。每来一份增量
+  消化，全凑齐了再综合发回去——没有 blocking await
 
 ### 2. owner-bound 邮件 = chat 推送通道，必须节流
 

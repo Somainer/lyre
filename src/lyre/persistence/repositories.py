@@ -122,9 +122,7 @@ class TaskRepository(Protocol):
     async def update_status(self, task_id: str, status: str) -> None: ...
     async def find_pending(self, limit: int = 10) -> list[Task]: ...
     async def find_expired_leases(self, limit: int = 10) -> list[Task]: ...
-    async def find_parents_ready_to_wake(self, limit: int = 10) -> list[Task]: ...
     async def find_children(self, parent_task_id: str) -> list[Task]: ...
-    async def wake_parent(self, task_id: str) -> bool: ...
 
     # Dashboard helpers (Sprint D1)
     async def find_recent(
@@ -189,6 +187,16 @@ class WakeupRepository(Protocol):
 
     async def list_active(self) -> list[Wakeup]:
         """Wakeups still in flight (ended_at IS NULL)."""
+        ...
+
+    async def has_active_for_agent(self, agent_id: str) -> bool:
+        """True iff a wakeup is currently running for this agent
+        (``ended_at IS NULL``). The scheduler consults this before
+        claiming a pending task so two wakeups of the same agent
+        never run concurrently. Parallelism within a persona uses
+        multiple AGENT INSTANCES (e.g. ``analyst/topic-A`` +
+        ``analyst/topic-B``), not multiple wakeups of one agent.
+        """
         ...
 
 

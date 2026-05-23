@@ -176,9 +176,8 @@ Add whatever role-specific tools the persona needs:
 |---|---|
 | `shell_exec` | Run arbitrary shell commands (`git`, `gh`, `make`, etc.) |
 | `python_exec` | Run a Python snippet (file ops, HTTP, parsing) |
-| `dispatch_task` | Spawn a subagent (typically leader-only) |
-| `await_subagents` | Wait for spawned subagents (typically leader-only) |
-| `query_task_status` | Inspect any task |
+| `dispatch_task` | Spawn a child task (dispatcher / analyst / reviewer; workers are leaves) |
+| `query_task_status` | Inspect any task — used to poll child task progress |
 | `create_agent` / `archive_agent` | Manage agent instances |
 | `list_personas` / `list_tasks` / `list_models` | Introspection |
 | `report_progress` | Crash-recovery checkpoint (NOT visible externally) |
@@ -343,9 +342,11 @@ notes:
 
    Leader will `create_agent(persona="web-researcher")` → call
    `dispatch_task(agent="web-researcher-1", goal="...", acceptance="...")`
-   → `await_subagents()` → idle. The new worker wakes up, fetches the
-   pages, writes the file, mails leader. Leader wakes back up, reads
-   the worker's reply, mails you.
+   → just stop calling tools, wakeup ends. The new worker runs,
+   fetches the pages, writes the file, then `mailbox_send`s leader.
+   Auto-wake-on-mail starts a fresh wakeup of leader; it reads the
+   worker's reply and mails you. Two wakeups, one mail thread; no
+   blocking wait — the runtime is event-driven all the way down.
 
 5. **Verify**:
 
