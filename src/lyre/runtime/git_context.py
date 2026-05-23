@@ -3,7 +3,10 @@
 Used only when a task's ``TaskSpec.git_context`` is set. Two-step
 preparation:
 
-  1. Ephemeral ed25519 SSH keypair under ``<worktree>/.ssh/``
+  1. Ephemeral ed25519 SSH keypair under ``<worktree>.ssh/`` (a
+     sibling of the worktree, NOT inside it — ``git clone . .`` from
+     inside the worktree refuses non-empty targets, so the SSH key
+     can't live in the worktree itself)
   2. Dedicated ``ssh-agent`` process holding that key in memory
   3. ``git clone <repo_url>`` into the worktree
   4. ``git switch -c <target_branch>`` based on ``<base_branch>``
@@ -13,16 +16,19 @@ edits. ``SSH_AUTH_SOCK`` + ``SSH_AGENT_PID`` are returned in
 ``env_overlay()`` so shell_exec / python_exec subprocesses can ``git
 push`` and ``gh pr create`` over SSH transparently.
 
-Cleanup tears down the ssh-agent. Tmpdir cleanup is the
-``WorktreeManager``'s responsibility — the two layers stay independent
-so a non-git task path doesn't touch any of this code.
+Cleanup tears down the ssh-agent and removes the sibling ssh dir.
+Worktree dir cleanup is the ``WorktreeManager``'s responsibility —
+the two layers stay independent so a non-git task path doesn't touch
+any of this code.
 """
 
 from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import signal
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -129,7 +135,11 @@ class GitContextProvisioner:
         task marked failed, owner can re-dispatch after the
         underlying issue is fixed).
         """
-        ssh_dir = worktree_dir / ".ssh"
+        # SSH key MUST live outside the worktree — ``git clone <url> .``
+        # refuses to clone into a non-empty target dir, and a ``.ssh``
+        # subdir would count as non-empty. Sibling path keeps it
+        # task-scoped without polluting the worker's view of its sandbox.
+        ssh_dir = worktree_dir.parent / f"{worktree_dir.name}.ssh"
         ssh_dir.mkdir(mode=0o700, exist_ok=True)
         try:
             ssh_dir.chmod(0o700)
@@ -185,9 +195,9 @@ class GitContextProvisioner:
         # ``git switch -c target_branch`` to put the worker on the
         # task's working branch.
         #
-        # Cloning INTO an existing dir is allowed when the dir is
-        # empty modulo .ssh/. ``git clone <url> .`` from inside the
-        # worktree handles that.
+        # ``git clone <url> .`` from inside the worktree only works
+        # because the worktree itself is empty — the SSH key lives in
+        # the sibling ``<worktree>.ssh/`` dir (see ssh_dir above).
         rc, _out, err = await _run(
             [
                 self.git, "clone",
@@ -239,10 +249,13 @@ class GitContextProvisioner:
         )
 
     async def cleanup(self, handle: GitContextHandle) -> None:
-        """Kill the SSH agent. Worktree dir removal is the
-        WorktreeManager's job — kept separate so a non-git task path
-        doesn't need to know GitContext exists."""
+        """Kill the SSH agent and remove the sibling ssh dir. Worktree
+        dir removal is the WorktreeManager's job — kept separate so a
+        non-git task path doesn't need to know GitContext exists."""
         self._kill_agent(handle.ssh_agent_pid)
+        ssh_dir = handle.ssh_priv_key_path.parent
+        if ssh_dir.is_dir():
+            shutil.rmtree(ssh_dir, ignore_errors=True)
         log.info(
             "git_context_cleaned",
             task_id=handle.task_id,
@@ -251,9 +264,31 @@ class GitContextProvisioner:
 
     @staticmethod
     def _kill_agent(pid: int) -> None:
+        """Terminate ssh-agent and wait briefly for it to exit.
+
+        SIGTERM then poll up to ~500ms for the process to actually be
+        gone (ssh-agent is not our child, so ``waitpid`` doesn't work).
+        Escalate to SIGKILL if it didn't yield. Without the wait, the
+        cleanup contract is "the kernel will get to it" which is racy
+        against any caller that wants to assert the agent is gone.
+        """
         try:
             os.kill(pid, signal.SIGTERM)
         except ProcessLookupError:
             return
         except PermissionError as exc:
             log.warning("git_context_agent_kill_perm", pid=pid, error=str(exc))
+            return
+
+        deadline = time.monotonic() + 0.5
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return
+            time.sleep(0.02)
+
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
