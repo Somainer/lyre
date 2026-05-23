@@ -12,10 +12,12 @@ import os
 import time
 import uuid as _uuid
 from datetime import datetime
-from typing import Any
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 import aiosqlite
 
+from .fs_personas import FilesystemPersonaRepository
 from .models import (
     Agent,
     Artifact,
@@ -24,7 +26,6 @@ from .models import (
     MailboxMessage,
     MailReaction,
     OutboxRow,
-    Persona,
     ScheduledMail,
     Skill,
     Task,
@@ -44,6 +45,9 @@ from .repositories import (
     TaskRepository,
     WakeupRepository,
 )
+
+if TYPE_CHECKING:
+    from ..config import PersonaOverride
 
 
 def _uuid7() -> str:
@@ -121,130 +125,11 @@ def _parse_json(value: Any) -> Any:
 
 
 # -----------------------------------------------------------------------
-# Persona
+# Persona — the SQLite implementation was deleted in migration 0009.
+# Personas are filesystem-only (~/.lyre/personas/<name>/identity.md),
+# served via ``lyre.persistence.fs_personas.FilesystemPersonaRepository``,
+# which ``SqliteRepositories`` instantiates below.
 # -----------------------------------------------------------------------
-class SqlitePersonaRepository:
-    def __init__(self, conn: aiosqlite.Connection):
-        self.conn = conn
-
-    async def get(self, name: str) -> Persona | None:
-        async with self.conn.execute(
-            "SELECT * FROM personas WHERE name = ?", (name,)
-        ) as cur:
-            row = await cur.fetchone()
-        if not row:
-            return None
-        return self._row_to_persona(row)
-
-    async def list_active(self, status: str = "approved") -> list[Persona]:
-        async with self.conn.execute(
-            "SELECT * FROM personas WHERE status = ?", (status,)
-        ) as cur:
-            rows = await cur.fetchall()
-        return [self._row_to_persona(r) for r in rows]
-
-    async def upsert(self, persona: Persona) -> None:
-        await self.conn.execute(
-            """
-            INSERT INTO personas (
-              name, display_name, kind,
-              role_description, system_prompt, allowed_lyre_tools,
-              model_preference, status, metadata
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(name) DO UPDATE SET
-              display_name     = excluded.display_name,
-              kind             = excluded.kind,
-              role_description = excluded.role_description,
-              system_prompt    = excluded.system_prompt,
-              allowed_lyre_tools = excluded.allowed_lyre_tools,
-              model_preference = excluded.model_preference,
-              status           = excluded.status,
-              metadata         = excluded.metadata,
-              updated_at       = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-            """,
-            (
-                persona.name,
-                persona.display_name,
-                persona.kind,
-                persona.role_description,
-                persona.system_prompt,
-                json.dumps(persona.allowed_lyre_tools),
-                _json(persona.model_preference),
-                persona.status,
-                _json(persona.metadata),
-            ),
-        )
-        await self.conn.commit()
-
-    async def propose(
-        self,
-        name: str,
-        role_description: str,
-        system_prompt: str,
-        allowed_lyre_tools: list[str],
-        source_task_id: str,
-        **kwargs: Any,
-    ) -> None:
-        await self.conn.execute(
-            """
-            INSERT INTO personas (
-              name, role_description, system_prompt, allowed_lyre_tools,
-              model_preference, status, proposed_by_task_id, metadata
-            ) VALUES (?, ?, ?, ?, ?, 'proposed', ?, ?)
-            """,
-            (
-                name,
-                role_description,
-                system_prompt,
-                json.dumps(allowed_lyre_tools),
-                _json(kwargs.get("model_preference")),
-                source_task_id,
-                _json(kwargs.get("metadata")),
-            ),
-        )
-        await self.conn.commit()
-
-    async def approve(
-        self,
-        persona_name: str,
-        reviewer: str,
-        status: str,
-        comment: str | None = None,
-    ) -> None:
-        await self.conn.execute(
-            """
-            UPDATE personas SET status = ?, reviewer = ?, reviewed_at = ?,
-                                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-            WHERE name = ?
-            """,
-            (status, reviewer, _now_iso(), persona_name),
-        )
-        await self.conn.commit()
-
-    @staticmethod
-    def _row_to_persona(row: aiosqlite.Row) -> Persona:
-        keys = set(row.keys())
-        # display_name / kind columns added in migration 0006 — NULL on
-        # pre-0006 rows. The Persona model handles those defaults
-        # (display_name → None → label falls back to name; kind → "spawn_only").
-        return Persona(
-            name=row["name"],
-            display_name=(
-                row["display_name"] if "display_name" in keys else None
-            ),
-            kind=(
-                (row["kind"] or "spawn_only") if "kind" in keys
-                else "spawn_only"
-            ),
-            role_description=row["role_description"],
-            system_prompt=row["system_prompt"],
-            allowed_lyre_tools=_parse_json(row["allowed_lyre_tools"]) or [],
-            model_preference=_parse_json(row["model_preference"]),
-            status=row["status"],
-            proposed_by_task_id=row["proposed_by_task_id"],
-            reviewer=row["reviewer"],
-            metadata=_parse_json(row["metadata"]),
-        )
 
 
 # -----------------------------------------------------------------------
@@ -1764,9 +1649,31 @@ class SqliteRepositories:
     local_hot: LocalHotRepository
     blobs: BlobRepository
 
-    def __init__(self, conn: aiosqlite.Connection):
+    def __init__(
+        self,
+        conn: aiosqlite.Connection,
+        *,
+        personas_dir: Path | None = None,
+        persona_overrides: dict[str, PersonaOverride] | None = None,
+    ):
+        """``personas_dir`` is the filesystem root for persona definitions
+        (``~/.lyre/personas/`` in production; a tmp dir in most tests).
+        When omitted, the persona repo points at a never-existing path —
+        ``list_active`` returns ``[]`` and ``get`` returns ``None``, which
+        is what every persistence-only test wants.
+
+        ``persona_overrides`` overlays single fields from ``config.toml
+        [personas.<name>]`` on every persona read (model_preference,
+        allowed_lyre_tools). Identity.md remains the SSOT for everything
+        else.
+        """
         self.conn = conn
-        self.personas = SqlitePersonaRepository(conn)
+        # A Path that doesn't exist makes ``list_active`` cheaply return [].
+        # Mostly used in persistence-only tests that don't touch personas.
+        _personas_dir = personas_dir or Path("/nonexistent/lyre-personas-unset")
+        self.personas = FilesystemPersonaRepository(
+            _personas_dir, persona_overrides=persona_overrides,
+        )
         self.agents = SqliteAgentRepository(conn)
         self.tasks = SqliteTaskRepository(conn)
         self.wakeups = SqliteWakeupRepository(conn)

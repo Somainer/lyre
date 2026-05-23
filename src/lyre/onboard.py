@@ -28,7 +28,7 @@ import click
 
 from .persistence.db import init_db
 from .persistence.sqlite_impl import SqliteRepositories
-from .personas.seed import ensure_user_personas, seed_default_agents, seed_personas
+from .personas.seed import ensure_user_personas, seed_default_agents
 from .runtime.identity import is_valid_agent_id
 from .runtime.memory import ensure_shipped_facts, ensure_skeleton
 from .runtime.skills import ensure_skills_skeleton
@@ -390,18 +390,19 @@ async def bootstrap_runtime(cfg: Any) -> list[str]:  # noqa: ANN401 — Config
     # Populate ~/.lyre/personas/ from shipped if needed. Idempotent — only
     # copies what's missing, so user edits / deletions are preserved across
     # subsequent boots. Also seeds an empty APPEND.md alongside each
-    # identity.md so the customization slot is discoverable.
+    # identity.md so the customization slot is discoverable. The personas
+    # ARE the SSOT now (FilesystemPersonaRepository reads them directly);
+    # no DB sync follows.
     ensure_user_personas(cfg.user_personas_dir)
 
     conn = await init_db(cfg.db_path)
     try:
-        repos = SqliteRepositories(conn)
-        await repos.mailbox.ensure_mailbox("owner")
-        await seed_personas(
-            repos.personas,
-            user_personas_dir=cfg.user_personas_dir,
+        repos = SqliteRepositories(
+            conn,
+            personas_dir=cfg.user_personas_dir,
             persona_overrides=cfg.persona_overrides,
         )
+        await repos.mailbox.ensure_mailbox("owner")
         ensure_skeleton(cfg.memory_path)
         ensure_shipped_facts(cfg.memory_path)
         created_agents = await seed_default_agents(

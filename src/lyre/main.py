@@ -223,7 +223,11 @@ def serve_cmd(
 
         conn = await init_db(cfg.db_path)
         try:
-            repos = SqliteRepositories(conn)
+            repos = SqliteRepositories(
+                conn,
+                personas_dir=cfg.user_personas_dir,
+                persona_overrides=cfg.persona_overrides,
+            )
 
             # One BlobStore per process — adapter factory resolves
             # image/document blocks through it at send-time; dashboard
@@ -392,7 +396,11 @@ def dispatch_cmd(persona: str, goal: str, acceptance: str) -> None:
         cfg = Config.from_env()
         conn = await init_db(cfg.db_path)
         try:
-            repos = SqliteRepositories(conn)
+            repos = SqliteRepositories(
+                conn,
+                personas_dir=cfg.user_personas_dir,
+                persona_overrides=cfg.persona_overrides,
+            )
             spec = TaskSpec(persona_name=persona, goal=goal, acceptance=acceptance)
             task_id = await repos.tasks.create(spec)
             click.echo(f"Task dispatched: {task_id} (persona={persona})")
@@ -415,7 +423,11 @@ def status_cmd(task_id: str) -> None:
         cfg = Config.from_env()
         conn = await init_db(cfg.db_path)
         try:
-            repos = SqliteRepositories(conn)
+            repos = SqliteRepositories(
+                conn,
+                personas_dir=cfg.user_personas_dir,
+                persona_overrides=cfg.persona_overrides,
+            )
             task = await repos.tasks.get(task_id)
             if task is None:
                 click.echo(f"No such task: {task_id}", err=True)
@@ -448,7 +460,11 @@ def run_task_cmd(task_id: str) -> None:
         cfg = Config.from_env()
         conn = await init_db(cfg.db_path)
         try:
-            repos = SqliteRepositories(conn)
+            repos = SqliteRepositories(
+                conn,
+                personas_dir=cfg.user_personas_dir,
+                persona_overrides=cfg.persona_overrides,
+            )
             adapter_for_test = None
             mock_script = os.getenv("LYRE_MOCK_ADAPTER_SCRIPT")
             if mock_script:
@@ -503,7 +519,11 @@ def dashboard_cmd(host: str, port: int) -> None:
         }
         conn = await init_db(cfg.db_path)
         try:
-            repos = SqliteRepositories(conn)
+            repos = SqliteRepositories(
+                conn,
+                personas_dir=cfg.user_personas_dir,
+                persona_overrides=cfg.persona_overrides,
+            )
             stop_event = asyncio.Event()
             loop = asyncio.get_running_loop()
             for sig in (signal.SIGINT, signal.SIGTERM):
@@ -605,7 +625,11 @@ def send_cmd(
         try:
             import uuid as _uuid
 
-            repos = SqliteRepositories(conn)
+            repos = SqliteRepositories(
+                conn,
+                personas_dir=cfg.user_personas_dir,
+                persona_overrides=cfg.persona_overrides,
+            )
             # Resolve / auto-spawn:
             #   - "owner": always valid (human mailbox at the edge)
             #   - bare bootstrap id: must exist (no spawning bootstrap agents)
@@ -832,7 +856,11 @@ def mailbox_cmd(recipient: str, since: int, unread_only: bool) -> None:
         cfg = Config.from_env()
         conn = await init_db(cfg.db_path)
         try:
-            repos = SqliteRepositories(conn)
+            repos = SqliteRepositories(
+                conn,
+                personas_dir=cfg.user_personas_dir,
+                persona_overrides=cfg.persona_overrides,
+            )
             await repos.mailbox.ensure_mailbox(recipient)
             if unread_only:
                 msgs = await repos.mailbox.read_unread(recipient, limit=200)
@@ -1294,7 +1322,11 @@ def agent_create_cmd(
         cfg = Config.from_env()
         conn = await init_db(cfg.db_path)
         try:
-            repos = SqliteRepositories(conn)
+            repos = SqliteRepositories(
+                conn,
+                personas_dir=cfg.user_personas_dir,
+                persona_overrides=cfg.persona_overrides,
+            )
             p = await repos.personas.get(persona)
             if p is None or p.status != "approved":
                 click.echo(
@@ -1341,7 +1373,11 @@ def agent_list_cmd(include_archived: bool) -> None:
         cfg = Config.from_env()
         conn = await init_db(cfg.db_path)
         try:
-            repos = SqliteRepositories(conn)
+            repos = SqliteRepositories(
+                conn,
+                personas_dir=cfg.user_personas_dir,
+                persona_overrides=cfg.persona_overrides,
+            )
             agents = await repos.agents.list_all(include_archived=include_archived)
             if not agents:
                 click.echo("(no agents)")
@@ -1377,7 +1413,11 @@ def agent_archive_cmd(agent_id: str) -> None:
         cfg = Config.from_env()
         conn = await init_db(cfg.db_path)
         try:
-            repos = SqliteRepositories(conn)
+            repos = SqliteRepositories(
+                conn,
+                personas_dir=cfg.user_personas_dir,
+                persona_overrides=cfg.persona_overrides,
+            )
             ok = await repos.agents.archive(agent_id)
             if not ok:
                 click.echo(f"no active agent {agent_id!r} to archive", err=True)
@@ -1407,7 +1447,11 @@ def agent_unarchive_cmd(agent_id: str) -> None:
         cfg = Config.from_env()
         conn = await init_db(cfg.db_path)
         try:
-            repos = SqliteRepositories(conn)
+            repos = SqliteRepositories(
+                conn,
+                personas_dir=cfg.user_personas_dir,
+                persona_overrides=cfg.persona_overrides,
+            )
             target = await repos.agents.get(agent_id)
             if target is None:
                 click.echo(f"no such agent {agent_id!r}", err=True)
@@ -1774,7 +1818,11 @@ def mail_list_scheduled_cmd(
         cfg = Config.from_env()
         conn = await init_db(cfg.db_path)
         try:
-            repos = SqliteRepositories(conn)
+            repos = SqliteRepositories(
+                conn,
+                personas_dir=cfg.user_personas_dir,
+                persona_overrides=cfg.persona_overrides,
+            )
             rows = await repos.scheduled_mail.list_filtered(
                 recipient=recipient, sender=sender, status=status, limit=limit
             )
@@ -1814,7 +1862,11 @@ def mail_cancel_cmd(mail_id: int, reason: str | None) -> None:
         cfg = Config.from_env()
         conn = await init_db(cfg.db_path)
         try:
-            repos = SqliteRepositories(conn)
+            repos = SqliteRepositories(
+                conn,
+                personas_dir=cfg.user_personas_dir,
+                persona_overrides=cfg.persona_overrides,
+            )
             existing = await repos.scheduled_mail.get(mail_id)
             if existing is None:
                 click.echo(f"scheduled_mail id={mail_id} not found", err=True)

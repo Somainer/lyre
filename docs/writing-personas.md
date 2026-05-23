@@ -313,12 +313,11 @@ notes:
    context. Prefer bullet lists with sources over flowing prose.
    ```
 
-2. **Re-seed the personas table.** Personas auto-upsert on every
-   `lyre serve` start, so the simplest path is just restart serve. If
-   you want a one-shot bootstrap from a clean state, use
-   `lyre onboard` — it upserts personas as part of its bootstrap step
-   (re-run is safe; existing config.toml stays unless you confirm
-   overwrite).
+2. **Copy the shipped persona into your home dir.** `lyre onboard`'s
+   `ensure_user_personas` step copies every `src/lyre/personas/*.md` into
+   `~/.lyre/personas/<name>/identity.md` (skipping ones already present
+   so user edits stick). There's no separate seed step — personas are
+   read straight off disk every lookup.
 
    ```bash
    uv run lyre onboard

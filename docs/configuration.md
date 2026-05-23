@@ -156,10 +156,11 @@ The body below the frontmatter is the persona's system prompt. It's
 appended after the runtime-generated **identity preamble** (which
 explains wakeups, mailbox protocol, ack-and-stop anti-pattern, etc.).
 
-Personas are read at process start by `lyre onboard` and re-applied on
-`lyre serve` startup; they're upserted into the `personas` table. Edit
-`~/.lyre/personas/<name>/identity.md` and restart `lyre serve` to apply
-changes.
+Personas are read directly from `~/.lyre/personas/<name>/identity.md`
+on every persona lookup — there's no DB sync, the filesystem is the SSOT.
+Edit identity.md and the change shows up on the next read; no restart
+needed for content changes (config.toml overrides are loaded at process
+start and DO require a restart).
 
 **Two layouts supported** in `~/.lyre/personas/` (directory wins if both
 exist for the same name):

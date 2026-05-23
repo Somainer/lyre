@@ -31,7 +31,7 @@ from lyre.config import Config
 from lyre.persistence.db import init_db
 from lyre.persistence.models import TaskSpec
 from lyre.persistence.sqlite_impl import SqliteRepositories
-from lyre.personas.seed import seed_personas
+from lyre.personas.seed import ensure_user_personas
 from lyre.runtime.memory import ensure_skeleton
 from lyre.scheduler.scheduler import Scheduler
 
@@ -46,10 +46,15 @@ def sandbox(tmp_path: Path) -> Iterator[dict]:
     db = tmp_path / "lyre.db"
     obj = tmp_path / "objstore"
     mem = tmp_path / "memory"
+    personas_dir = tmp_path / "personas"
     obj.mkdir()
     ensure_skeleton(mem)
+    ensure_user_personas(personas_dir)
     env = {
         **os.environ,
+        # LYRE_HOME pins the subprocess's persona discovery to the same
+        # tmp dir the parent test wrote shipped personas into.
+        "LYRE_HOME": str(tmp_path),
         "LYRE_DB_PATH": str(db),
         "LYRE_OBJECT_STORE": str(obj),
         "LYRE_MEMORY_PATH": str(mem),
@@ -63,13 +68,13 @@ def sandbox(tmp_path: Path) -> Iterator[dict]:
         "db": db,
         "obj": obj,
         "mem": mem,
+        "personas_dir": personas_dir,
         "env": env,
         "tmp": tmp_path,
     }
 
 
 async def _seed(repos: SqliteRepositories) -> None:
-    await seed_personas(repos.personas)
     await repos.mailbox.ensure_mailbox("owner")
 
 
@@ -106,7 +111,7 @@ async def test_subprocess_runs_scripted_task_to_completion(
 ) -> None:
     conn = await init_db(sandbox["db"])
     try:
-        repos = SqliteRepositories(conn)
+        repos = SqliteRepositories(conn, personas_dir=sandbox["personas_dir"])
         await _seed(repos)
 
         # Override worker-maintainer's worktree to off so we don't need
@@ -178,7 +183,7 @@ async def test_subprocess_sigkill_mid_task_recovers_via_expired_lease(
     """
     conn = await init_db(sandbox["db"])
     try:
-        repos = SqliteRepositories(conn)
+        repos = SqliteRepositories(conn, personas_dir=sandbox["personas_dir"])
         await _seed(repos)
         worker = await repos.personas.get("worker-maintainer")
         assert worker is not None
@@ -283,7 +288,7 @@ async def test_scheduler_subprocess_mode_dispatches_and_completes(
     `lyre run-task` and the task completes."""
     conn = await init_db(sandbox["db"])
     try:
-        repos = SqliteRepositories(conn)
+        repos = SqliteRepositories(conn, personas_dir=sandbox["personas_dir"])
         await _seed(repos)
 
         task_id = await repos.tasks.create(
@@ -354,7 +359,7 @@ async def test_scheduler_runs_two_tasks_concurrently(
     writes); both tasks complete and update their rows correctly."""
     conn = await init_db(sandbox["db"])
     try:
-        repos = SqliteRepositories(conn)
+        repos = SqliteRepositories(conn, personas_dir=sandbox["personas_dir"])
         await _seed(repos)
         await repos.agents.create(
             agent_id="worker-a", persona_name="worker-maintainer",
@@ -426,7 +431,7 @@ async def test_scheduler_respects_max_concurrent_cap(
     are needed to clear two pending tasks."""
     conn = await init_db(sandbox["db"])
     try:
-        repos = SqliteRepositories(conn)
+        repos = SqliteRepositories(conn, personas_dir=sandbox["personas_dir"])
         await _seed(repos)
         await repos.agents.create(
             agent_id="worker-a", persona_name="worker-maintainer",
@@ -499,7 +504,7 @@ async def test_concurrent_subprocess_writes_dont_corrupt_db(
     landed cleanly."""
     conn = await init_db(sandbox["db"])
     try:
-        repos = SqliteRepositories(conn)
+        repos = SqliteRepositories(conn, personas_dir=sandbox["personas_dir"])
         await _seed(repos)
         await repos.agents.create(
             agent_id="worker-a", persona_name="worker-maintainer",

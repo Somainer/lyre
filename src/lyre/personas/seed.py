@@ -1,10 +1,12 @@
-"""Seed personas into the database from markdown files.
+"""Persona file loading + bootstrap-agent seeding.
 
 After ``lyre onboard`` (or the first ``lyre serve``), the single source of
-truth for personas is ``~/.lyre/personas/``. Shipped personas at
+truth for personas is ``~/.lyre/personas/<name>/identity.md`` — read
+directly by ``FilesystemPersonaRepository``. Shipped personas at
 ``src/lyre/personas/*.md`` are only used to populate that directory on
-bootstrap — once they're there, the user can edit / rename / delete
-freely without further surprise from the runtime.
+first bootstrap (``ensure_user_personas``); once they're there, the user
+can edit / rename / delete freely without further surprise from the
+runtime.
 
 Two layouts are supported in ``~/.lyre/personas/`` (directory wins if
 both exist for the same name):
@@ -13,16 +15,15 @@ both exist for the same name):
                 — preferred. Allows companion files like APPEND.md.
   * Flat:       ``<name>.md`` — legacy / minimal-fuss alternative.
 
-Plus optional per-field overrides from ``Config.persona_overrides`` (loaded
-from ``config.toml [personas.<name>]``), applied last on whichever file won.
+Per-field overrides from ``Config.persona_overrides`` (loaded from
+``config.toml [personas.<name>]``) are applied on read by the repo,
+not baked into the files.
 
 Persona's ``kind`` frontmatter field drives bootstrap-agent seeding:
   - ``singleton``   — seed one agent; create_agent refuses (owner, dispatcher)
   - ``seeded``      — seed one agent; create_agent allowed for parallel
                       instances (analyst, reviewer)
   - ``spawn_only``  — never auto-seed; create_agent required (worker-maintainer)
-
-Idempotent on re-runs (upserts by name).
 """
 
 from __future__ import annotations
@@ -34,7 +35,6 @@ from typing import Any
 
 import yaml
 
-from ..config import PersonaOverride
 from ..persistence.models import Persona
 from ..persistence.repositories import AgentRepository, PersonaRepository
 
@@ -174,47 +174,6 @@ def discover_persona_files(user_personas_dir: Path | None = None) -> list[Path]:
     # Fallback: shipped personas (test fixtures only — production paths
     # always populate user_personas_dir first via bootstrap_runtime).
     return _shipped_persona_files()
-
-
-def _apply_field_override(persona: Persona, override: PersonaOverride) -> Persona:
-    """Apply single-field ``[personas.<name>]`` overrides from config.toml.
-
-    Each field replaces the persona's value if non-None; the persona's
-    ``system_prompt``, ``role_description``, ``display_name``, and ``kind``
-    are NEVER touched by this path — those are identity facts that live
-    in identity.md as the single source of truth. config.toml override
-    is reserved for deployment-level runtime knobs (model_preference,
-    allowed_lyre_tools).
-    """
-    updates: dict[str, Any] = {}
-    if override.model_preference is not None:
-        updates["model_preference"] = override.model_preference
-    if override.allowed_lyre_tools is not None:
-        updates["allowed_lyre_tools"] = list(override.allowed_lyre_tools)
-    if not updates:
-        return persona
-    return persona.model_copy(update=updates)
-
-
-async def seed_personas(
-    repo: PersonaRepository,
-    user_personas_dir: Path | None = None,
-    persona_overrides: dict[str, PersonaOverride] | None = None,
-) -> list[str]:
-    """Upsert all persona files into DB. Returns list of persona names seeded.
-
-    Lookup order per name: ``user_personas_dir/<name>.md`` > shipped.
-    Per-field overrides from ``persona_overrides`` apply last.
-    """
-    overrides = persona_overrides or {}
-    seeded: list[str] = []
-    for path in discover_persona_files(user_personas_dir):
-        persona = load_persona_from_file(path)
-        if persona.name in overrides:
-            persona = _apply_field_override(persona, overrides[persona.name])
-        await repo.upsert(persona)
-        seeded.append(persona.name)
-    return seeded
 
 
 async def seed_default_agents(
