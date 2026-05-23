@@ -228,19 +228,6 @@ class Scheduler:
         if self.auto_wake_on_mail:
             await self._auto_dispatch_for_unread_mail()
 
-        # Phase 1 (subagent fan-in): wake any parent whose children all
-        # terminated. Transition them pending → next tick (or this one's
-        # later phases) picks up via find_pending.
-        wake_candidates = await self.repos.tasks.find_parents_ready_to_wake(limit=5)
-        for parent in wake_candidates:
-            ok = await self.repos.tasks.wake_parent(parent.id)
-            if ok:
-                log.info(
-                    "scheduler_woke_parent",
-                    task_id=parent.id,
-                    persona=parent.persona_name,
-                )
-
         # Phase 2 (chaos recovery): pick up tasks whose lease has expired
         # (process died, SIGKILL, etc.) BEFORE looking for new pending work.
         # Skip any task already covered by an in-flight subprocess —
@@ -263,10 +250,44 @@ class Scheduler:
         slots = self._available_slots()
         if slots <= 0:
             return
-        pending = await self.repos.tasks.find_pending(limit=slots)
+        # Over-fetch: ``has_active_for_agent`` may force us to skip some
+        # candidates (an agent already running blocks any second
+        # wakeup of itself). Fetching slots*4 gives the scan room to
+        # find tasks for OTHER agents without exhausting the pool too
+        # eagerly. The hard cap stays at ``slots`` actual dispatches.
+        candidate_limit = max(slots * 4, slots)
+        pending = await self.repos.tasks.find_pending(limit=candidate_limit)
         pending = [t for t in pending if t.id not in self._active_subprocesses]
-        for t in pending[:slots]:
+
+        # Agents are sequential actors: a second pending task for the
+        # same agent must wait until that agent's current wakeup ends.
+        # Without this guard two subprocesses for the same agent_id
+        # race on shared filesystem state (scratchpad, notes,
+        # auto-summary log) — last writer wins, lost updates,
+        # interleaved log entries. Parallelism within a persona =
+        # multiple agent INSTANCES, not multiple wakeups of one
+        # agent. See docs/design/AGENT_RUNTIME.md.
+        dispatched = 0
+        # Track agents we've already claimed work for in this tick so
+        # we don't dispatch two pending tasks of the same agent in
+        # the same tick (the DB has_active check wouldn't notice yet).
+        claimed_in_this_tick: set[str] = set()
+        for t in pending:
+            if dispatched >= slots:
+                break
+            agent_id = t.agent_id
+            if agent_id is not None:
+                if agent_id in claimed_in_this_tick:
+                    continue
+                if await self.repos.wakeups.has_active_for_agent(agent_id):
+                    log.debug(
+                        "scheduler_skip_task_agent_busy",
+                        task_id=t.id, agent_id=agent_id,
+                    )
+                    continue
+                claimed_in_this_tick.add(agent_id)
             await self._run_task(t.id)
+            dispatched += 1
             if self._available_slots() <= 0:
                 break
 
@@ -802,19 +823,8 @@ class Scheduler:
                 },
             )
             task_status = _wakeup_status_to_task_status(result.status)
-            # If a tool (e.g. await_subagents) already advanced the task to
-            # `needs_input`, don't blanket-overwrite with result.status.
-            # The subagent wait machinery owns the state until the children
-            # finish and `wake_parent` flips it back to `pending`.
-            current = await self.repos.tasks.get(task_id)
-            yielded_to_subagents = (
-                current is not None and current.status == "needs_input"
-            )
-            if not yielded_to_subagents:
-                await self.repos.tasks.update_status(task_id, task_status)
-            else:
-                log.info("task_yielded_to_subagents", task_id=task_id)
-            succeeded = task_status == "completed" and not yielded_to_subagents
+            await self.repos.tasks.update_status(task_id, task_status)
+            succeeded = task_status == "completed"
             log.info(
                 "task_done",
                 task_id=task_id,

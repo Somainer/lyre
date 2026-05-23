@@ -65,7 +65,6 @@ _TOOL_POLICY: dict[str, str] = {
     "create_agent": "trace",
     "archive_agent": "trace",
     "dispatch_task": "trace",        # task_id MUST be quoted in trace
-    "await_subagents": "drop",
 }
 # All other tools (shell_exec, python_exec, read_memory, cancel_scheduled_mail,
 # mailbox_get_message error cases, …) fall through to "trace".

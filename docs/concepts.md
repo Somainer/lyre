@@ -116,8 +116,9 @@ A unit of work an agent is pursuing. Lifecycle states:
 
 - `pending` — queued, no agent has it yet
 - `in_progress` — an agent has the lease and is running a wakeup
-- `needs_input` — waiting for dispatched subagents to finish (set by
-  `await_subagents`), or otherwise blocked
+- `needs_input` — blocked on external input (rarely used; the runtime
+  has no blocking primitive — agents that delegate work end their
+  wakeup and rely on auto-wake-on-mail when children mail back)
 - `completed` / `failed` / `cancelled` — terminal
 
 Tasks have an optional `parent_task_id` (set when one agent
@@ -203,11 +204,13 @@ To make this concrete, here's what happens when you `lyre send leader
 
 If the task was bigger and `leader` decided to delegate — e.g., "have
 a worker-maintainer do this" — step 4 instead calls
-`dispatch_task(agent="worker-maintainer-1", ...)`, then
-`await_subagents()`, then the wakeup ends with the task in
-`needs_input`. The worker runs its own wakeup; when it finishes,
-scheduler's Phase 1 wakes `leader` back up to read the worker's reply
-and forward findings to you. Two wakeups, one task chain.
+`dispatch_task(agent="worker-maintainer-1", ...)` and then **just
+stops calling tools**. The wakeup ends; `leader`'s task completes.
+The worker runs its own wakeup; when it finishes, it `mailbox_send`s
+back to `leader`. Auto-wake-on-mail starts a fresh wakeup of `leader`
+to read the worker's reply and forward findings to you. Two wakeups,
+one mail thread — the runtime has no blocking "wait for children"
+primitive, all synchronisation is mail-driven.
 
 This is what "long-running" means in Lyre. The conversation isn't one
 session — it's a chain of wakeups, possibly spread over hours or days,

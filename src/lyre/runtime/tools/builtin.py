@@ -25,7 +25,7 @@ from .mailbox import (
 from .progress import REPORT_PROGRESS, REPORT_SIDE_EFFECT
 from .python import PYTHON_EXEC
 from .shell import SHELL_EXEC
-from .tasks import AWAIT_SUBAGENTS, DISPATCH_TASK, QUERY_TASK_STATUS
+from .tasks import DISPATCH_TASK, QUERY_TASK_STATUS
 
 
 def build_default_registry() -> ToolRegistry:
@@ -41,7 +41,6 @@ def build_default_registry() -> ToolRegistry:
         REPORT_PROGRESS,
         REPORT_SIDE_EFFECT,
         DISPATCH_TASK,
-        AWAIT_SUBAGENTS,
         QUERY_TASK_STATUS,
         READ_MEMORY,
         UPDATE_SCRATCHPAD,

@@ -524,32 +524,6 @@ class SqliteTaskRepository:
             rows = await cur.fetchall()
         return [self._row_to_task(r) for r in rows]
 
-    async def find_parents_ready_to_wake(self, limit: int = 10) -> list[Task]:
-        """Find parent tasks where:
-          - status = 'needs_input' (was yielded via await_subagents)
-          - has at least one child
-          - ALL children are in a terminal status (completed/failed/cancelled)
-        """
-        async with self.conn.execute(
-            """
-            SELECT t.* FROM tasks t
-            WHERE t.status = 'needs_input'
-              AND EXISTS (
-                SELECT 1 FROM tasks c WHERE c.parent_task_id = t.id
-              )
-              AND NOT EXISTS (
-                SELECT 1 FROM tasks c
-                WHERE c.parent_task_id = t.id
-                  AND c.status NOT IN ('completed', 'failed', 'cancelled')
-              )
-            ORDER BY t.updated_at
-            LIMIT ?
-            """,
-            (limit,),
-        ) as cur:
-            rows = await cur.fetchall()
-        return [self._row_to_task(r) for r in rows]
-
     async def find_children(self, parent_task_id: str) -> list[Task]:
         """Return all direct child tasks (status doesn't matter)."""
         async with self.conn.execute(
@@ -558,35 +532,6 @@ class SqliteTaskRepository:
         ) as cur:
             rows = await cur.fetchall()
         return [self._row_to_task(r) for r in rows]
-
-    async def wake_parent(self, task_id: str) -> bool:
-        """Transition a parent from 'needs_input' back to 'pending' so the
-        scheduler picks it up. Only acts on parents whose children are all
-        terminal — returns False otherwise."""
-        async with self.conn.execute(
-            """
-            UPDATE tasks
-            SET status = 'pending',
-                lease_holder = NULL,
-                lease_until = NULL,
-                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-            WHERE id = ?
-              AND status = 'needs_input'
-              AND EXISTS (
-                SELECT 1 FROM tasks c WHERE c.parent_task_id = tasks.id
-              )
-              AND NOT EXISTS (
-                SELECT 1 FROM tasks c
-                WHERE c.parent_task_id = tasks.id
-                  AND c.status NOT IN ('completed', 'failed', 'cancelled')
-              )
-            RETURNING id
-            """,
-            (task_id,),
-        ) as cur:
-            row = await cur.fetchone()
-        await self.conn.commit()
-        return row is not None
 
     # Dashboard helpers
     async def find_recent(
@@ -817,6 +762,21 @@ class SqliteWakeupRepository:
         ) as cur:
             rows = await cur.fetchall()
         return [self._row_to_wakeup(r) for r in rows]
+
+    async def has_active_for_agent(self, agent_id: str) -> bool:
+        """True iff some wakeup of ``agent_id`` is currently running
+        (``ended_at IS NULL``). The scheduler uses this to enforce the
+        "agents are sequential actors" invariant: a second pending
+        task for the same agent must wait until the first one's
+        wakeup finishes, otherwise concurrent processes can race on
+        the agent's shared filesystem state (scratchpad, notes,
+        ## Auto-summary log).
+        """
+        async with self.conn.execute(
+            "SELECT 1 FROM wakeups WHERE agent_id = ? AND ended_at IS NULL LIMIT 1",
+            (agent_id,),
+        ) as cur:
+            return (await cur.fetchone()) is not None
 
     @staticmethod
     def _row_to_wakeup(r: aiosqlite.Row) -> Wakeup:

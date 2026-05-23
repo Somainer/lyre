@@ -238,9 +238,9 @@ MVP Lyre 工具集：
 | `list_models()` | 查 model registry + 健康状态 |
 | `create_agent(persona, name?, model?, description?)` | 注册一个新 agent 实例；返回 agent_id（同时预创建 `~/.lyre/memory/facts/agent-<id>-notes.md` 笔记文件）|
 | `archive_agent(agent_id)` | 软删（不能 archive bootstrap 的 owner / leader）|
-| `dispatch_task(agent, goal, acceptance, lease_duration_s?)` | 派活给指定 agent_id；返回 task_id |
-| `await_subagents()` | 当前 wakeup 等所有 dispatched children 终止；task 进 needs_input，wakeup 让出 |
-| `query_task_status(task_id)` | 查 task 当前 status + checkpoint summary |
+| `dispatch_task(agent, goal, acceptance, lease_duration_s?)` | 派活给指定 agent_id；返回 task_id。派完直接停止调 tool，让 wakeup 关闭；child 完成会 mail 回来，auto-wake-on-mail 续起 |
+| `query_task_status(task_id)` | 查 task 当前 status + checkpoint summary。用来轮询 child progress |
+| `update_scratchpad(content, mode)` | 写 agent 自己的短期记忆文件 `memory/scratchpad/<id>.md`，append / overwrite |
 | `list_scheduled_mail(recipient?, sender?, status?)` | 列 future-mail 队列 |
 | `cancel_scheduled_mail(id, reason?)` | 取消未来 mail（recurring 时停止所有未来 occurrence）|
 | `python_exec(code)` | 在 worktree 或主进程跑 python 代码片段 |

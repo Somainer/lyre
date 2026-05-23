@@ -105,77 +105,6 @@ async def _query_task_status(ctx: ToolContext, args: dict[str, Any]) -> dict[str
     }
 
 
-_TERMINAL = {"completed", "failed", "cancelled"}
-
-
-async def _await_subagents(
-    ctx: ToolContext, args: dict[str, Any]
-) -> dict[str, Any]:
-    """Yield this wakeup until all subagent children terminate.
-
-    Marks the current task `status='needs_input'` and records the list of
-    children we're waiting on in the task checkpoint. The scheduler's
-    `find_parents_ready_to_wake` query will see this task once all its
-    children land in terminal status, and re-pend it for a fresh wakeup.
-
-    Returns immediately (without yielding) if all children are already
-    terminal — the agent can then continue and consume their results in the
-    same turn.
-
-    Note from the patterns elsewhere in the codebase: this is the
-    "wakeup pauses here" tool. After this returns `status='awaiting'`,
-    the agent should stop calling tools — the wakeup will close
-    naturally on the next no-tool response. The scheduler respects
-    needs_input and won't run this task again until the children
-    finish, at which point it dispatches a fresh wakeup.
-    """
-    children = await ctx.repos.tasks.find_children(ctx.task_id)
-    if not children:
-        raise ToolError(
-            "no subagent children found for this task; "
-            "dispatch_task first, then await_subagents"
-        )
-
-    summary = [
-        {"id": c.id, "persona": c.persona_name, "status": c.status}
-        for c in children
-    ]
-    pending = [c for c in summary if c["status"] not in _TERMINAL]
-
-    if not pending:
-        # All done already — no yielding needed, agent can use the results.
-        return {
-            "status": "all_done",
-            "children": summary,
-        }
-
-    # Persist intent + transition. The current wakeup holds the lease, so the
-    # checkpoint update succeeds. Status update advances to needs_input; the
-    # scheduler's post-loop logic detects this and won't overwrite it back
-    # to completed/failed.
-    current_task = await ctx.repos.tasks.get(ctx.task_id)
-    # The caller holds the lease — the row must exist.
-    assert current_task is not None  # noqa: S101 — narrows for mypy
-    existing_checkpoint = current_task.checkpoint or {}
-    new_checkpoint = {
-        **existing_checkpoint,
-        "awaiting_children": [c["id"] for c in pending],
-    }
-    await ctx.repos.tasks.update_checkpoint(
-        ctx.task_id, new_checkpoint, ctx.wakeup_id
-    )
-    await ctx.repos.tasks.update_status(ctx.task_id, "needs_input")
-    return {
-        "status": "awaiting",
-        "waiting_for": pending,
-        "children": summary,
-        "note": (
-            "Your task has been marked needs_input. End this turn; the "
-            "scheduler will wake you when all children terminate."
-        ),
-    }
-
-
 DISPATCH_TASK = Tool(
     name="dispatch_task",
     description=(
@@ -224,25 +153,4 @@ QUERY_TASK_STATUS = Tool(
         "required": ["task_id"],
     },
     handler=_query_task_status,
-)
-
-
-AWAIT_SUBAGENTS = Tool(
-    name="await_subagents",
-    description=(
-        "Yield this wakeup until ALL subagent children you dispatched "
-        "earlier terminate (completed/failed/cancelled). Use this AFTER "
-        "dispatch_task calls; after it returns status='awaiting', just "
-        "stop calling tools and the wakeup will close. If all children "
-        "are already terminal when called, returns immediately so you "
-        "can consume their results in this same wakeup. Otherwise, your "
-        "task is marked needs_input and the scheduler will wake you "
-        "when they're all done — your next wakeup will see their "
-        "statuses in the initial user message."
-    ),
-    input_schema={
-        "type": "object",
-        "properties": {},
-    },
-    handler=_await_subagents,
 )
