@@ -219,80 +219,64 @@ async def seed_default_agents(
     agent_repo: AgentRepository,
     memory_root: Path | None = None,
 ) -> list[str]:
-    """Seed one bootstrap agent for every persona whose ``kind`` is
-    ``singleton`` or ``seeded`` — those declare "I deserve a default
-    standing instance the owner can mailbox out of the box".
+    """Ensure one live bootstrap agent exists for every persona whose
+    ``kind`` is ``singleton`` or ``seeded``. Their addressable id comes
+    from the persona's ``display_name`` (or ``name`` if unset).
 
-    Each such agent's id comes from the persona's ``display_name`` (or
-    ``name`` if display_name is unset). That's the one-time-at-seed-time
-    copy: once the agent row exists, its id is immutable even if the
-    owner later re-edits identity.md's display_name (mail rows already
-    reference it via FK).
+    Behaviour, three cases:
 
-    ``spawn_only`` personas (workers) are skipped here — the dispatcher
+      * agent_id doesn't exist  → create (parent=None, idle)
+      * agent_id exists, idle   → no-op
+      * agent_id exists, archived → **unarchive** (revive)
+
+    The unarchive path is the self-healing recovery from owner-typo
+    cascades. Previously a separate ``archive_stale_bootstrap_agents``
+    pass silently killed any parentless agent whose id didn't match
+    the persona's CURRENT display_name — so a fat-fingered identity.md
+    edit + restart would archive the live agent; correcting the edit +
+    restart would archive the freshly-seeded one too. Two typos in a
+    row wiped every dispatcher / analyst / reviewer. The auto-archive
+    pass has been removed: changing display_name is now treated as
+    declaring a NEW agent, never as a rename. Owners clean up the old
+    agent manually (``lyre agent archive <id>`` or via the dashboard).
+
+    ``spawn_only`` personas (workers) are skipped — the dispatcher
     creates instances of those on demand via the ``create_agent`` tool.
 
-    Idempotent: agents that already exist are not re-created. Notes file
-    pre-creation runs unconditionally (so re-onboards heal missing files).
+    Notes file pre-creation runs unconditionally so re-onboards heal
+    any missing companion files.
 
-    Returns the list of newly-created agent ids.
+    Returns the list of agent ids that were newly created OR
+    unarchived (i.e. agents the runtime brought to life this call).
     """
     personas = await persona_repo.list_active()
-    created: list[str] = []
+    seeded: list[str] = []
     for p in personas:
         if p.kind == "spawn_only":
             continue
         agent_id = p.display_name or p.name
-        if not await agent_repo.exists(agent_id):
+
+        existing = await agent_repo.get(agent_id)
+        if existing is None:
             await agent_repo.create(
                 agent_id=agent_id,
                 persona_name=p.name,
                 parent_agent_id=None,  # bootstrap root
             )
-            created.append(agent_id)
+            seeded.append(agent_id)
+        elif existing.status == "archived":
+            # The display_name flipped back to a previously-archived id
+            # (typical owner-rollback scenario). Bring it back to life
+            # with full mail / task history intact — don't create a
+            # duplicate row.
+            if await agent_repo.unarchive(agent_id):
+                seeded.append(agent_id)
+        # else: exists + active → no-op
+
         if memory_root is not None:
             ensure_agent_notes_file(memory_root, agent_id)
-    await archive_stale_bootstrap_agents(persona_repo, agent_repo)
-    return created
-
-
-async def archive_stale_bootstrap_agents(
-    persona_repo: PersonaRepository,
-    agent_repo: AgentRepository,
-) -> list[str]:
-    """Soft-archive bootstrap-seeded agents whose persona's display_name
-    has been re-pointed.
-
-    Owner edits ``identity.md`` to change ``display_name`` from
-    ``dispatcher`` to ``luna``. We seed ``luna``; the old ``dispatcher``
-    agent row should retire (mail history preserved, but mail can no
-    longer go to it).
-
-    Eligibility: every parentless agent (``parent_agent_id IS NULL``)
-    whose persona is still ``singleton``/``seeded`` but whose id doesn't
-    match the persona's CURRENT ``display_name``. User-spawned agents
-    (``parent_agent_id`` non-NULL) are untouched.
-
-    Returns the list of archived agent ids.
-    """
-    personas = {p.name: p for p in await persona_repo.list_active()}
-
-    archived: list[str] = []
-    for agent in await agent_repo.list_all(include_archived=False):
-        if agent.parent_agent_id is not None:
-            continue  # user-spawned, leave alone
-        if agent.status == "archived":
-            continue
-        p = personas.get(agent.persona_name)
-        if p is None or p.kind == "spawn_only":
-            continue  # not currently a bootstrap-eligible persona
-        expected_id = p.display_name or p.name
-        if agent.id == expected_id:
-            continue
-        ok = await agent_repo.archive(agent.id)
-        if ok:
-            archived.append(agent.id)
-    return archived
+            ensure_agent_scratchpad_file(memory_root, agent_id)
+    return seeded
 
 
 def ensure_agent_notes_file(memory_root: Path, agent_id: str) -> Path:
@@ -341,4 +325,42 @@ Suggested sections (free-form — edit as you like):
 ## Decisions / facts worth remembering
 """
     path.write_text(seed, encoding="utf-8")
+    return path
+
+
+def _flatten_agent_id(agent_id: str) -> str:
+    return agent_id.replace("/", "-")
+
+
+def scratchpad_rel_path(agent_id: str) -> str:
+    """Path of the agent's scratchpad relative to ``memory_root``.
+
+    Used both for ``read_memory(rel_path)`` and inside the
+    ``update_scratchpad`` tool's sandbox check. Centralised so the
+    runtime and the tool never disagree on where a scratchpad lives.
+    """
+    return f"scratchpad/{_flatten_agent_id(agent_id)}.md"
+
+
+def ensure_agent_scratchpad_file(memory_root: Path, agent_id: str) -> Path:
+    """Create ``<memory_root>/scratchpad/<flat-id>.md`` if absent.
+    Returns the absolute path either way.
+
+    Scratchpad is the agent's working / short-term memory — distinct
+    from ``facts/agent-<id>-notes.md`` (long-term notes that the
+    runtime also appends auto-summary entries to). Owner-curated
+    knowledge stays in ``facts/<topic>.md``. Three separate purposes,
+    three separate buckets under ``memory/``.
+
+    Seeded empty (no frontmatter, no template) on purpose: the model
+    owns this file end-to-end. Any starter text would tempt models to
+    feel constrained by the template instead of using it as a clean
+    workspace.
+    """
+    scratchpad_dir = memory_root / "scratchpad"
+    scratchpad_dir.mkdir(parents=True, exist_ok=True)
+    flat_id = _flatten_agent_id(agent_id)
+    path = scratchpad_dir / f"{flat_id}.md"
+    if not path.exists():
+        path.write_text("", encoding="utf-8")
     return path

@@ -14,6 +14,7 @@ allowed_lyre_tools:
   - report_progress
   - query_task_status
   - read_memory
+  - update_scratchpad
   - list_agents
 needs_worktree: false
 model_preference:

@@ -91,8 +91,10 @@ These are **settled**. PRs that violate them won't land.
   Holds a lease on the task, runs the streaming LLM tool-loop. **Wakeups are
   stateless across boundaries** — the in-memory messages list is discarded
   when the wakeup ends. Cross-wakeup state lives in: the mailbox, the
-  per-agent notes file at `~/.lyre/memory/facts/agent-<id>-notes.md`, or
-  `task.checkpoint`.
+  per-agent **scratchpad** at `~/.lyre/memory/scratchpad/<flat-id>.md`
+  (short-term working memory, model-managed via `update_scratchpad`), the
+  per-agent **notes** at `~/.lyre/memory/facts/agent-<id>-notes.md` (long-term,
+  runtime also appends `## Auto-summary log` here), or `task.checkpoint`.
 - **Task** = a goal an agent pursues across many wakeups. States: `pending`
   → `in_progress` → (`needs_input` while awaiting subagents) →
   `completed`/`failed`/`cancelled`. Tasks can have `parent_task_id`, enabling

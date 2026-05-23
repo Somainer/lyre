@@ -321,6 +321,20 @@ class SqliteAgentRepository:
         await self.conn.commit()
         return bool(changed)
 
+    async def unarchive(self, agent_id: str) -> bool:
+        async with self.conn.execute(
+            """
+            UPDATE agents
+            SET status = 'idle',
+                archived_at = NULL
+            WHERE id = ? AND status = 'archived'
+            """,
+            (agent_id,),
+        ) as cur:
+            changed = cur.rowcount
+        await self.conn.commit()
+        return bool(changed)
+
     async def exists(self, agent_id: str) -> bool:
         async with self.conn.execute(
             "SELECT 1 FROM agents WHERE id = ?", (agent_id,)

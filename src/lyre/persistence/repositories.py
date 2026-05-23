@@ -66,6 +66,17 @@ class AgentRepository(Protocol):
         """Soft delete. Returns True if the agent was active and got archived."""
         ...
 
+    async def unarchive(self, agent_id: str) -> bool:
+        """Bring an archived agent back to ``status='idle'``. Returns True
+        if a row actually flipped (i.e. it was archived); False if the
+        row was already active or doesn't exist.
+
+        The original ``created_at`` is preserved; ``archived_at`` is
+        cleared. Mail / task history attached to this id is untouched
+        — the unarchive is purely a revive of the addressable slot.
+        """
+        ...
+
     async def exists(self, agent_id: str) -> bool: ...
 
     async def update_metadata(

@@ -1362,29 +1362,70 @@ def agent_list_cmd(include_archived: bool) -> None:
 @agent_group.command("archive")
 @click.argument("agent_id")
 def agent_archive_cmd(agent_id: str) -> None:
-    """Soft-archive an agent. In-flight tasks finish."""
+    """Soft-archive an agent. In-flight tasks finish.
+
+    Unlike the agent-facing ``archive_agent`` tool (which refuses
+    parentless / seeded agents to prevent self-foot-shooting from a
+    persona), the CLI lets the owner archive any agent. If you
+    accidentally zero out every live agent of a singleton / seeded
+    persona, restart ``lyre serve`` — ``seed_default_agents`` will
+    bring back the persona's current ``display_name`` agent (and
+    unarchive it if a matching archived row exists).
+    """
 
     async def _run() -> None:
         cfg = Config.from_env()
         conn = await init_db(cfg.db_path)
         try:
             repos = SqliteRepositories(conn)
-            # Bootstrap-pinned set is derived from the agents table at
-            # call time — every row with parent_agent_id IS NULL is a
-            # seeded singleton (or `owner`, the human). SSOT: DB state,
-            # not a static config.
-            target = await repos.agents.get(agent_id)
-            if target is not None and target.parent_agent_id is None:
-                click.echo(
-                    f"refusing to archive bootstrap agent {agent_id!r}",
-                    err=True,
-                )
-                sys.exit(1)
             ok = await repos.agents.archive(agent_id)
             if not ok:
                 click.echo(f"no active agent {agent_id!r} to archive", err=True)
                 sys.exit(1)
             click.echo(f"archived {agent_id}")
+        finally:
+            await conn.close()
+
+    asyncio.run(_run())
+
+
+@agent_group.command("unarchive")
+@click.argument("agent_id")
+def agent_unarchive_cmd(agent_id: str) -> None:
+    """Bring an archived agent back to ``idle``.
+
+    Recovery path when a typo'd ``display_name`` edit (or a previous
+    overzealous auto-archive) silently retired a working agent. Mail
+    history attached to the id is preserved either way; this just
+    flips ``status='archived' → 'idle'`` and clears ``archived_at``.
+
+    Idempotent: re-running on an already-active agent is a no-op
+    with an explanatory message, not an error.
+    """
+
+    async def _run() -> None:
+        cfg = Config.from_env()
+        conn = await init_db(cfg.db_path)
+        try:
+            repos = SqliteRepositories(conn)
+            target = await repos.agents.get(agent_id)
+            if target is None:
+                click.echo(f"no such agent {agent_id!r}", err=True)
+                sys.exit(1)
+            if target.status != "archived":
+                click.echo(
+                    f"agent {agent_id!r} is already {target.status} — nothing to do"
+                )
+                return
+            ok = await repos.agents.unarchive(agent_id)
+            if not ok:
+                click.echo(
+                    f"unarchive of {agent_id!r} did not change anything; "
+                    f"check status with `lyre agent list`",
+                    err=True,
+                )
+                sys.exit(1)
+            click.echo(f"unarchived {agent_id} (status: idle)")
         finally:
             await conn.close()
 

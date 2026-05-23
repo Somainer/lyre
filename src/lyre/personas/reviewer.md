@@ -13,6 +13,7 @@ allowed_lyre_tools:
   - mailbox_react
   - report_side_effect
   - read_memory
+  - update_scratchpad
   - list_agents
 needs_worktree: true
 model_preference:

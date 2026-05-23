@@ -11,6 +11,7 @@ from .introspect import (
     LIST_PERSONAS,
     LIST_TASKS,
     READ_MEMORY,
+    UPDATE_SCRATCHPAD,
 )
 from .mailbox import (
     CANCEL_SCHEDULED_MAIL,
@@ -43,6 +44,7 @@ def build_default_registry() -> ToolRegistry:
         AWAIT_SUBAGENTS,
         QUERY_TASK_STATUS,
         READ_MEMORY,
+        UPDATE_SCRATCHPAD,
         LIST_PERSONAS,
         LIST_AGENTS,
         LIST_MODELS,
