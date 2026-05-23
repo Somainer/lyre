@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import time
 import uuid as _uuid
 from datetime import datetime
@@ -1658,9 +1659,9 @@ class SqliteRepositories:
     ):
         """``personas_dir`` is the filesystem root for persona definitions
         (``~/.lyre/personas/`` in production; a tmp dir in most tests).
-        When omitted, the persona repo points at a never-existing path —
-        ``list_active`` returns ``[]`` and ``get`` returns ``None``, which
-        is what every persistence-only test wants.
+        When omitted, a fresh writable tempdir is allocated so tests that
+        construct ``SqliteRepositories(conn)`` without thinking about
+        personas can still ``upsert`` / ``list_active`` against it.
 
         ``persona_overrides`` overlays single fields from ``config.toml
         [personas.<name>]`` on every persona read (model_preference,
@@ -1668,11 +1669,14 @@ class SqliteRepositories:
         else.
         """
         self.conn = conn
-        # A Path that doesn't exist makes ``list_active`` cheaply return [].
-        # Mostly used in persistence-only tests that don't touch personas.
-        _personas_dir = personas_dir or Path("/nonexistent/lyre-personas-unset")
+        # No personas_dir → allocate one. ``mkdtemp`` returns a writable
+        # path so ``upsert`` works; the dir is small and gets reaped with
+        # /tmp eventually. Production paths (main.py, onboard.py) always
+        # pass an explicit ``personas_dir``.
+        if personas_dir is None:
+            personas_dir = Path(tempfile.mkdtemp(prefix="lyre-personas-"))
         self.personas = FilesystemPersonaRepository(
-            _personas_dir, persona_overrides=persona_overrides,
+            personas_dir, persona_overrides=persona_overrides,
         )
         self.agents = SqliteAgentRepository(conn)
         self.tasks = SqliteTaskRepository(conn)
