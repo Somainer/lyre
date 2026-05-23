@@ -101,6 +101,123 @@ READ_MEMORY = Tool(
 )
 
 
+# Hard cap on the scratchpad size we'll accept on append/overwrite.
+# Larger than this and the model is hoarding instead of curating —
+# scratchpad is working memory, not lifetime archive. Long-term content
+# belongs in ``facts/agent-<id>-notes.md``.
+_SCRATCHPAD_MAX_BYTES = 32 * 1024
+
+
+async def _update_scratchpad(
+    ctx: ToolContext, args: dict[str, Any],
+) -> dict[str, Any]:
+    """Write to the calling agent's own scratchpad. Sandboxed to one
+    file: ``memory/scratchpad/<flat-self-id>.md``. Read via
+    ``read_memory(<that-path>)``.
+
+    Modes:
+      - ``append`` (default) — add content to the end. A trailing
+        newline is inserted between existing content and the new chunk
+        so concatenated calls don't smash together.
+      - ``overwrite`` — replace the entire file. The curation path:
+        you read, decide what stays, write back the pruned version.
+        Done items must be removed this way — otherwise they keep
+        coming back into context every wakeup.
+    """
+    content = args.get("content")
+    if not isinstance(content, str):
+        raise ToolError("content required (string)")
+    mode = args.get("mode", "append")
+    if mode not in ("append", "overwrite"):
+        raise ToolError("mode must be 'append' or 'overwrite'")
+
+    root_str = ctx.extras.get("memory_root")
+    if not root_str:
+        raise ToolError("memory_root not configured for this wakeup")
+    if not ctx.agent_id:
+        # ToolContext.agent_id is structurally optional but in any
+        # real wakeup the scheduler populates it. A None here implies
+        # an unwired test harness, not a runtime case.
+        raise ToolError("agent_id not configured for this wakeup")
+    root = Path(root_str)
+
+    from ...personas.seed import (
+        ensure_agent_scratchpad_file,
+        scratchpad_rel_path,
+    )
+
+    # Sandboxes by construction: path comes from helpers, never from
+    # caller. The scratchpad is per-agent — agents can't read or write
+    # each other's working memory.
+    path = ensure_agent_scratchpad_file(root, ctx.agent_id)
+    rel = scratchpad_rel_path(ctx.agent_id)
+
+    existing = path.read_text(encoding="utf-8") if path.exists() else ""
+    if mode == "append":
+        sep = "" if (not existing or existing.endswith("\n")) else "\n"
+        new_body = existing + sep + content
+    else:
+        new_body = content
+
+    if len(new_body.encode("utf-8")) > _SCRATCHPAD_MAX_BYTES:
+        raise ToolError(
+            f"scratchpad would exceed {_SCRATCHPAD_MAX_BYTES // 1024} "
+            f"KiB after this write. Scratchpad is working memory, not "
+            f"archive — call again with mode='overwrite' and a pruned "
+            f"version, or move long-term content to "
+            f"facts/agent-<id>-notes.md."
+        )
+
+    path.write_text(new_body, encoding="utf-8")
+    return {
+        "rel_path": rel,
+        "mode": mode,
+        "bytes": len(new_body.encode("utf-8")),
+    }
+
+
+UPDATE_SCRATCHPAD = Tool(
+    name="update_scratchpad",
+    description=(
+        "Write to your scratchpad — a private markdown file at "
+        "`memory/scratchpad/<your-flat-id>.md` that persists across "
+        "wakeups. This is your short-term / working memory: what "
+        "you're tracking right now, commitments you've made, the next "
+        "step you planned. Read it with `read_memory(<that-path>)` at "
+        "the start of every wakeup. "
+        "\n\n"
+        "mode='append' adds to the bottom (default — for new items). "
+        "mode='overwrite' replaces the whole file (for curation — when "
+        "done items pile up, read first, then write back only what's "
+        "still active). Done items MUST be removed via overwrite — "
+        "otherwise they pollute context every wakeup. "
+        "\n\n"
+        "Sandbox: each agent can only write its own scratchpad. The "
+        "rel_path is computed from your agent_id, not from arguments."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "content": {
+                "type": "string",
+                "description": "Markdown content to write or append.",
+            },
+            "mode": {
+                "type": "string",
+                "enum": ["append", "overwrite"],
+                "description": (
+                    "'append' (default) adds to file end. "
+                    "'overwrite' replaces file body — use this when "
+                    "curating / removing completed items."
+                ),
+            },
+        },
+        "required": ["content"],
+    },
+    handler=_update_scratchpad,
+)
+
+
 async def _list_personas(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
     """List PERSONAS — role definitions, not running instances.
 
@@ -335,13 +452,22 @@ async def _create_agent(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any
     # to discover the path. Mirrors what seed_default_agents does for
     # bootstrap agents; covers ad-hoc agents (workers etc.) spawned at runtime.
     notes_path: str | None = None
+    scratchpad_path: str | None = None
     root_str = ctx.extras.get("memory_root")
     if root_str:
-        from ...personas.seed import ensure_agent_notes_file
+        from ...personas.seed import (
+            ensure_agent_notes_file,
+            ensure_agent_scratchpad_file,
+        )
+        root = Path(root_str)
         try:
-            notes_path = str(ensure_agent_notes_file(Path(root_str), agent_id))
+            notes_path = str(ensure_agent_notes_file(root, agent_id))
         except OSError:
             notes_path = None  # non-fatal: agent will get the path from prompt
+        try:
+            scratchpad_path = str(ensure_agent_scratchpad_file(root, agent_id))
+        except OSError:
+            scratchpad_path = None
 
     return {
         "agent_id": agent_id,
@@ -350,6 +476,7 @@ async def _create_agent(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any
         "status": "idle",
         "metadata": metadata or {},
         "notes_file": notes_path,
+        "scratchpad_file": scratchpad_path,
     }
 
 

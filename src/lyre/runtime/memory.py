@@ -1,23 +1,48 @@
 """Filesystem-backed memory layer.
 
 Memory lives in `~/.lyre/memory/` (per Config.memory_path). Agent-write,
-user-read-by-convention. Today the canonical category is:
+user-read-by-convention. Three canonical buckets:
 
     memory/
-    └── facts/<topic>.md            ← agent-curated knowledge (kind, scope in frontmatter)
+    ├── facts/<topic>.md                ← agent-curated knowledge with
+    │                                     frontmatter (kind, scope).
+    │                                     Long-term, semi-global.
+    ├── facts/agent-<id>-notes.md       ← per-agent long-term notebook
+    │                                     (owner preferences, decisions,
+    │                                     gotchas). Runtime also appends
+    │                                     ## Auto-summary log entries at
+    │                                     each wakeup end.
+    └── scratchpad/<flat-agent-id>.md   ← per-agent SHORT-TERM working
+                                          memory. What's being tracked
+                                          right now, recent commitments,
+                                          next steps. Cycles as items
+                                          finish (overwrite mode on the
+                                          ``update_scratchpad`` tool).
+
+Three buckets, three durabilities:
+    facts/<topic>.md           — knowledge that outlives the agent
+    facts/agent-<id>-notes.md  — what one agent has learned over its life
+    scratchpad/<id>.md         — what one agent is doing this week
 
 Skills are tracked separately under `~/.lyre/skills/`. Owner identity &
 preferences (user-write, agent-read) live at `~/.lyre/user.md` and are
 injected into every system prompt by `context.assemble_system_prompt`;
 they never appear here.
 
-No new tools. Agents read via `shell_exec cat` / `read_memory`, write via
-`shell_exec` redirects / `python_exec`. At wakeup start, the scheduler scans
-this dir, reads JUST the frontmatters, and injects an index ("Available
-global memory") into the system prompt — so every agent sees what's
-available without searching.
+Read access: any path → `read_memory(rel_path)` (sandboxed).
+Write access:
+  - facts/ and notes: `shell_exec` / `python_exec` (so they require a
+    persona that has them — typically analyst/worker).
+  - scratchpad: dedicated `update_scratchpad(content, mode)` tool
+    available to every LLM persona, sandboxed to the agent's own file.
 
-Frontmatter expected fields (all optional):
+At wakeup start, the scheduler scans `facts/`, reads JUST the
+frontmatters, and injects an index ("Available global memory") into the
+system prompt. Scratchpad files are NOT indexed — they're agent-private,
+short-lived, and the model is reminded of its scratchpad path in the
+identity preamble.
+
+Frontmatter expected fields (all optional, facts/ only):
     description  : one-line summary used in the index
     scope        : free-form string ("lisa-lang", "global", ...)
     kind         : for facts, the fact category ("repo_info", "api_quirk", ...)
