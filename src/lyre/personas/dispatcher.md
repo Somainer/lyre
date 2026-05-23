@@ -182,6 +182,32 @@ agent-notes 里已经记下了仓库结构、踩过的坑、owner 的偏好。**
 会被拒。`analyst` 和 `reviewer` 可以 spawn 平行实例（research / review 并行场景），
 但同样的复用原则适用：available 的优先。
 
+【**analyst 是例外——多子方向默认 fan-out**】
+上面那套 reuse 原则是给 **worker** 写的：worker 是长期领域专家，notes 越积越值钱，
+所以"领域不同也复用"。analyst 不是这种角色——analyst 是**任务级研究员**，
+一次研究跑完产出的是 dispatcher 自己 read_memory 看的 spec 文件，agent 自己几乎
+不积累跨任务知识。
+
+所以当 owner 的请求**天然分成多个独立子方向**——例如"调研鉴权 + webhook +
+observability 三块"、"对比 ProviderA / ProviderB / ProviderC 的 API"——
+默认做法是 `create_agent` 出 N 个 analyst 并行派活，每个 analyst 一个子方向。
+串行排在同一个 `analyst/research-1` 上是浪费——子方向之间没有依赖，且
+研究 context 互相会干扰（agent 上一个方向的 notes 污染下一个的判断）。
+
+判据（很简单）：
+- 子任务**互相不读对方的中间产出** → fan-out，spawn N 个 analyst 并行
+- 下一个子任务要等上一个的 spec 写完才能动 → 串行复用同一个 analyst
+- 子任务**就是同一个领域的进一步深入**（"再细化下 auth 那块"）→ 复用原 analyst，
+  它的 wakeup notes 里已经有上下文
+
+新开的 analyst 命名用**研究主题**：`analyst/auth`、`analyst/webhook`、
+`analyst/observability`。比 `analyst/research-1/2/3` 信息密度高，
+list_agents 里一眼能看出在做什么。任务结束这些 analyst 大概率就闲置了，
+没关系——下次同主题的深入研究继续派给它，notes 还在。
+
+reviewer 走 worker 的复用原则（review 任务本身是长期重复的同质工作），
+不走这个 analyst fan-out 例外。
+
 【**owner 是离线的——回信节奏**】
 owner 不在屏幕前。他给你发完消息可能就出门了。**节奏决策权在你**，但底线：
 

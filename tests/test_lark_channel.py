@@ -176,6 +176,7 @@ def _make_channel_with_mocked_client(
     # .acreate(...) → mocked response.
     api = MagicMock()
     api.im.v1.message.acreate = AsyncMock()
+    api.im.v1.message.areply = AsyncMock()
     api.im.v1.image.acreate = AsyncMock()
     api.im.v1.message_resource.aget = AsyncMock()
     api.im.v1.message_reaction.acreate = AsyncMock()
@@ -280,6 +281,90 @@ async def test_publish_with_image_uploads_then_posts(
         assert ext_id == "lark_text"  # text-post id wins
         assert ch._api_client.im.v1.image.acreate.await_count == 1
         assert ch._api_client.im.v1.message.acreate.await_count == 2
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_publish_with_reply_to_uses_reply_endpoint(
+    tmp_path: Path,
+) -> None:
+    """When ``reply_to_external_id`` is set, the reply must go through
+    ``messages/:id/reply`` (not ``messages``) so it nests under the
+    parent in the owner's Lark UI. Without this, agent replies showed
+    up as flat top-level messages even though Lyre's parent_msg_id was
+    threaded correctly internally."""
+    conn = await init_db(tmp_path / "lyre.db")
+    try:
+        repos = SqliteRepositories(conn)
+        await repos.mailbox.ensure_mailbox("owner")
+        ch = _make_channel_with_mocked_client(repos, None)
+        ch._api_client.im.v1.message.areply.return_value = (
+            _ok_message_response("lark_reply_id")
+        )
+
+        msg = MailboxMessage(
+            id=200, recipient="owner", external_id="reply-1",
+            sender="analyst/auth", urgency="normal",
+            body="spec written",
+        )
+        ext_id = await ch.publish_owner_mail(
+            msg, reply_to_external_id="om_parent_xyz",
+        )
+
+        assert ext_id == "lark_reply_id"
+        # Reply endpoint hit; create endpoint untouched.
+        assert ch._api_client.im.v1.message.areply.await_count == 1
+        assert ch._api_client.im.v1.message.acreate.await_count == 0
+        # The parent id flowed into the request as the path param.
+        reply_call = ch._api_client.im.v1.message.areply.await_args
+        sent_req = reply_call.args[0]
+        assert sent_req.message_id == "om_parent_xyz"
+        assert sent_req.paths["message_id"] == "om_parent_xyz"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_publish_reply_with_image_threads_image_too(
+    tmp_path: Path,
+) -> None:
+    """Image attachments on a threaded reply must also reply to the
+    parent — otherwise the image floats out of the thread, leaving
+    the text reply nested but the image at top-level."""
+    conn = await init_db(tmp_path / "lyre.db")
+    try:
+        repos = SqliteRepositories(conn)
+        await repos.mailbox.ensure_mailbox("owner")
+        blob_store = BlobStore(tmp_path / "objstore")
+        blob_id = blob_store.write(_PNG_BYTES, "image/png")
+        await repos.blobs.upsert(Blob(
+            id=blob_id, media_type="image/png",
+            size_bytes=len(_PNG_BYTES), filename="shot.png",
+            source="owner",
+        ))
+        ch = _make_channel_with_mocked_client(repos, blob_store)
+        ch._api_client.im.v1.image.acreate.return_value = (
+            _ok_image_response("img_key_abc")
+        )
+        # Two reply calls: text reply + image reply.
+        ch._api_client.im.v1.message.areply.side_effect = [
+            _ok_message_response("lark_text_reply"),
+            _ok_message_response("lark_img_reply"),
+        ]
+
+        msg = MailboxMessage(
+            id=201, recipient="owner", external_id="reply-img",
+            sender="analyst/webhook", urgency="normal",
+            body="diagram attached", attachments=[blob_id],
+        )
+        ext_id = await ch.publish_owner_mail(
+            msg, reply_to_external_id="om_parent_with_img",
+        )
+
+        assert ext_id == "lark_text_reply"
+        assert ch._api_client.im.v1.message.areply.await_count == 2
+        assert ch._api_client.im.v1.message.acreate.await_count == 0
     finally:
         await conn.close()
 
