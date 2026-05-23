@@ -20,6 +20,7 @@ from .models import (
     Agent,
     Artifact,
     Blob,
+    GitContext,
     MailboxMessage,
     MailReaction,
     OutboxRow,
@@ -148,8 +149,8 @@ class SqlitePersonaRepository:
             INSERT INTO personas (
               name, display_name, kind,
               role_description, system_prompt, allowed_lyre_tools,
-              model_preference, needs_worktree, status, metadata
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              model_preference, status, metadata
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(name) DO UPDATE SET
               display_name     = excluded.display_name,
               kind             = excluded.kind,
@@ -157,7 +158,6 @@ class SqlitePersonaRepository:
               system_prompt    = excluded.system_prompt,
               allowed_lyre_tools = excluded.allowed_lyre_tools,
               model_preference = excluded.model_preference,
-              needs_worktree   = excluded.needs_worktree,
               status           = excluded.status,
               metadata         = excluded.metadata,
               updated_at       = strftime('%Y-%m-%dT%H:%M:%fZ','now')
@@ -170,7 +170,6 @@ class SqlitePersonaRepository:
                 persona.system_prompt,
                 json.dumps(persona.allowed_lyre_tools),
                 _json(persona.model_preference),
-                1 if persona.needs_worktree else 0,
                 persona.status,
                 _json(persona.metadata),
             ),
@@ -190,8 +189,8 @@ class SqlitePersonaRepository:
             """
             INSERT INTO personas (
               name, role_description, system_prompt, allowed_lyre_tools,
-              model_preference, needs_worktree, status, proposed_by_task_id, metadata
-            ) VALUES (?, ?, ?, ?, ?, ?, 'proposed', ?, ?)
+              model_preference, status, proposed_by_task_id, metadata
+            ) VALUES (?, ?, ?, ?, ?, 'proposed', ?, ?)
             """,
             (
                 name,
@@ -199,7 +198,6 @@ class SqlitePersonaRepository:
                 system_prompt,
                 json.dumps(allowed_lyre_tools),
                 _json(kwargs.get("model_preference")),
-                1 if kwargs.get("needs_worktree", True) else 0,
                 source_task_id,
                 _json(kwargs.get("metadata")),
             ),
@@ -242,7 +240,6 @@ class SqlitePersonaRepository:
             system_prompt=row["system_prompt"],
             allowed_lyre_tools=_parse_json(row["allowed_lyre_tools"]) or [],
             model_preference=_parse_json(row["model_preference"]),
-            needs_worktree=bool(row["needs_worktree"]),
             status=row["status"],
             proposed_by_task_id=row["proposed_by_task_id"],
             reviewer=row["reviewer"],
@@ -397,12 +394,16 @@ class SqliteTaskRepository:
         # for callers that haven't migrated. dispatch_task and Phase 0 will
         # populate agent_id once their plumbing is updated.
 
+        git_ctx_json = (
+            spec.git_context.model_dump_json() if spec.git_context else None
+        )
         await self.conn.execute(
             """
             INSERT INTO tasks (
               id, parent_task_id, agent_id, persona_name, goal, acceptance,
-              status, lease_duration_s, tier_overrides, deadline, metadata
-            ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)
+              status, lease_duration_s, tier_overrides, deadline, metadata,
+              git_context
+            ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -415,6 +416,7 @@ class SqliteTaskRepository:
                 _json(spec.tier_overrides),
                 spec.deadline.isoformat() if spec.deadline else None,
                 _json(spec.metadata),
+                git_ctx_json,
             ),
         )
         await self.conn.commit()
@@ -620,6 +622,7 @@ class SqliteTaskRepository:
     @staticmethod
     def _row_to_task(row: aiosqlite.Row) -> Task:
         # agent_id is a new (nullable) column from migration 0003.
+        # git_context is a new (nullable) column from migration 0008.
         # SQLite's Row.keys() doesn't expose missing columns; trying to read
         # them raises IndexError. Guard so callers on a pre-0003 schema
         # (notably test fixtures that mocked rows) don't crash.
@@ -627,6 +630,15 @@ class SqliteTaskRepository:
             agent_id = row["agent_id"]
         except (KeyError, IndexError):
             agent_id = None
+        git_ctx_raw: str | None
+        try:
+            git_ctx_raw = row["git_context"]
+        except (KeyError, IndexError):
+            git_ctx_raw = None
+        git_ctx = (
+            GitContext.model_validate_json(git_ctx_raw)
+            if git_ctx_raw else None
+        )
         return Task(
             id=row["id"],
             parent_task_id=row["parent_task_id"],
@@ -640,6 +652,7 @@ class SqliteTaskRepository:
             checkpoint=_parse_json(row["checkpoint"]),
             tier_overrides=_parse_json(row["tier_overrides"]),
             metadata=_parse_json(row["metadata"]),
+            git_context=git_ctx,
         )
 
 

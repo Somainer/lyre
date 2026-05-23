@@ -64,7 +64,10 @@ def load_persona_from_file(path: Path) -> Persona:
         system_prompt=body,
         allowed_lyre_tools=front.get("allowed_lyre_tools", []) or [],
         model_preference=front.get("model_preference"),
-        needs_worktree=bool(front.get("needs_worktree", True)),
+        # ``needs_worktree`` in frontmatter is silently ignored (kept for
+        # back-compat with user-edited identity.md files); every LLM
+        # persona unconditionally gets an empty-tmpdir worktree now,
+        # and git provisioning is per-task (TaskSpec.git_context).
         status=front.get("status", "approved"),
         metadata=front.get("metadata"),
     )

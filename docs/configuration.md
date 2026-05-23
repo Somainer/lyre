@@ -132,7 +132,6 @@ allowed_lyre_tools:
   - query_task_status
   - read_memory
   - list_agents
-needs_worktree: true
 model_preference:
   tier: workhorse
   requires: [tool_use, streaming]
@@ -148,7 +147,7 @@ Field details:
 | `name` | Persona name. Must match filename stem. |
 | `role_description` | One-line summary; shown to other agents in `list_personas()`. |
 | `allowed_lyre_tools` | Subset of the runtime's tools this persona can call. Enforced at dispatch time — calling a non-allowlisted tool returns an error to the model. |
-| `needs_worktree` | If true, each task gets its own tmpdir + ephemeral SSH key (for working in isolation on code). |
+| `kind` | One of `singleton` / `seeded` / `spawn_only` — see [docs/design/PERSONAS.md](./design/PERSONAS.md). Controls bootstrap-agent seeding behaviour. |
 | `model_preference.tier` | `flagship` / `workhorse` / `cheap`. Router picks among entries with this tier. |
 | `model_preference.requires` | List of capability tags the chosen model must have. |
 | `model_preference.prefer` | Explicit `model_id`s to try first within the matching tier. |

@@ -232,7 +232,6 @@ async def _list_personas(ctx: ToolContext, args: dict[str, Any]) -> dict[str, An
             {
                 "name": p.name,
                 "role_description": p.role_description or "",
-                "needs_worktree": bool(p.needs_worktree),
             }
             for p in personas
         ],

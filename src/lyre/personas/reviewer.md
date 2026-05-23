@@ -20,7 +20,6 @@ allowed_lyre_tools:
   - query_task_status
   - dispatch_task
   - create_agent
-needs_worktree: true
 model_preference:
   tier: workhorse
   requires: [tool_use, streaming]

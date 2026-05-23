@@ -73,7 +73,6 @@ async def _seed_personas(repos: SqliteRepositories) -> None:
             model_preference={
                 "tier": "workhorse", "requires": ["tool_use"], "prefer": [],
             },
-            needs_worktree=True,
         )
     )
     await repos.personas.upsert(
@@ -85,7 +84,6 @@ async def _seed_personas(repos: SqliteRepositories) -> None:
             model_preference={
                 "tier": "workhorse", "requires": ["tool_use"], "prefer": [],
             },
-            needs_worktree=False,
         )
     )
     await repos.personas.upsert(
@@ -95,7 +93,6 @@ async def _seed_personas(repos: SqliteRepositories) -> None:
             model_preference={
                 "tier": "flagship", "requires": ["tool_use"], "prefer": [],
             },
-            needs_worktree=False,
         )
     )
     # Post-A3: scheduler/router/Phase 0 all key off agents.

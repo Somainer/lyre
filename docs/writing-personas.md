@@ -33,7 +33,6 @@ allowed_lyre_tools:
   - report_side_effect
   - read_memory
   - list_agents
-needs_worktree: true
 model_preference:
   tier: workhorse
   requires: [tool_use, streaming]
@@ -277,7 +276,6 @@ notes:
      - read_memory
      - list_agents
      - report_progress
-   needs_worktree: false
    model_preference:
      tier: workhorse
      requires: [tool_use, streaming]

@@ -37,6 +37,7 @@ from ..persistence.repositories import Repositories
 from ..runtime.adapter_factory import AdapterFactory, model_name_for_provider
 from ..runtime.agent_loop import AgentLoop
 from ..runtime.context import assemble_initial_user_message, assemble_system_prompt
+from ..runtime.git_context import GitContextHandle, GitContextProvisioner
 from ..runtime.health_tracker import HealthTracker
 from ..runtime.kill_switch import KillSwitch, is_simulated_kill_in_flight
 from ..runtime.mail_watcher import MailWatcher
@@ -98,6 +99,7 @@ class Scheduler:
         health: HealthTracker | None = None,
         adapter_factory: AdapterFactory | None = None,
         worktree_manager: WorktreeManager | None = None,
+        git_context_provisioner: GitContextProvisioner | None = None,
         kill_switch: KillSwitch | None = None,
         spawn_subprocess: bool = False,
         subprocess_argv: list[str] | None = None,
@@ -130,6 +132,9 @@ class Scheduler:
         )
         self.worktree_manager = worktree_manager or WorktreeManager(
             root=self.config.object_store_path / "worktrees"
+        )
+        self.git_context_provisioner = (
+            git_context_provisioner or GitContextProvisioner()
         )
         self.kill_switch = kill_switch or KillSwitch()
         self.spawn_subprocess = spawn_subprocess
@@ -695,9 +700,45 @@ class Scheduler:
             return
 
         transcript = TranscriptWriter(self.config.object_store_path, wakeup_id)
-        worktree_handle: WorktreeHandle | None = None
-        if persona.needs_worktree:
-            worktree_handle = await self.worktree_manager.prepare(task_id)
+        # Every wakeup gets a worktree (empty tmpdir). Whether it's
+        # a git working copy depends on TaskSpec.git_context — see
+        # the git_context provisioning below. The worktree itself is
+        # cheap (one mkdir) and uniformly available simplifies
+        # downstream tool / prompt logic (no "do I have a sandbox"
+        # branching anywhere).
+        worktree_handle: WorktreeHandle = (
+            await self.worktree_manager.prepare(task_id)
+        )
+
+        # Optional git_context overlay: if the task was dispatched
+        # with a repo + branch spec, provision an ephemeral SSH key
+        # + ssh-agent and clone+checkout into the worktree before
+        # the worker arrives. Non-git tasks (skill migration,
+        # research, data shaping) skip this entirely.
+        git_handle: GitContextHandle | None = None
+        if task_for_setup := await self.repos.tasks.get(task_id):
+            if task_for_setup.git_context is not None:
+                try:
+                    git_handle = await self.git_context_provisioner.prepare(
+                        task_id=task_id,
+                        worktree_dir=worktree_handle.dir,
+                        git_context=task_for_setup.git_context,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    # Provisioning failed (bad repo URL, network, etc.).
+                    # Release lease, mark task failed, surface error.
+                    log.warning(
+                        "git_context_provision_failed",
+                        task_id=task_id,
+                        error=str(exc),
+                    )
+                    await self.repos.tasks.release_lease(task_id, wakeup_id)
+                    await self.repos.tasks.update_status(task_id, "failed")
+                    transcript.close()
+                    await self.worktree_manager.cleanup(
+                        worktree_handle, remove_dir=False,
+                    )
+                    return
 
         # Start blocker watcher. Baseline = whatever's already been processed
         # by this persona at wakeup-start time, so the agent sees ALL blockers
@@ -735,7 +776,10 @@ class Scheduler:
                 wakeup_id=wakeup_id,
                 tools=persona.allowed_lyre_tools,
                 candidates=[c.id for c in candidates],
-                worktree=str(worktree_handle.dir) if worktree_handle else None,
+                worktree=str(worktree_handle.dir),
+                git_context_repo=(
+                    git_handle.repo_url if git_handle else None
+                ),
             )
 
             other_agents = await self.repos.agents.list_all()
@@ -743,9 +787,7 @@ class Scheduler:
                 persona,
                 agent_id=agent_id,
                 memory_root=self.config.memory_path,
-                worktree_cwd=(
-                    worktree_handle.dir if worktree_handle else None
-                ),
+                worktree_cwd=worktree_handle.dir,
                 other_agents=other_agents,
             )
             initial_user_msg = await assemble_initial_user_message(
@@ -753,10 +795,22 @@ class Scheduler:
                 tasks_repo=self.repos.tasks,
             )
 
-            extras: dict[str, Any] = {}
-            if worktree_handle:
-                extras["worktree"] = str(worktree_handle.dir)
-                extras["env_overlay"] = worktree_handle.env_overlay()
+            extras: dict[str, Any] = {
+                "worktree": str(worktree_handle.dir),
+                # env_overlay carries SSH_AUTH_SOCK / SSH_AGENT_PID
+                # only when a git_context overlay was provisioned.
+                # Non-git tasks see no SSH env — no leaking of git
+                # credentials into research / skill-migration tasks.
+                "env_overlay": (
+                    git_handle.env_overlay() if git_handle else {}
+                ),
+            }
+            if git_handle is not None:
+                extras["git_context"] = {
+                    "repo_url": git_handle.repo_url,
+                    "base_branch": git_handle.base_branch,
+                    "target_branch": git_handle.target_branch,
+                }
             if self.config.memory_path is not None:
                 extras["memory_root"] = str(self.config.memory_path)
             # list_models / future router-aware tools read these.
@@ -877,12 +931,17 @@ class Scheduler:
                 await blocker_watcher.stop()
                 transcript.close()
                 await self.repos.tasks.release_lease(task_id, wakeup_id)
-                if worktree_handle is not None:
-                    # On success: wipe local state, remote-side git/PR is the truth.
-                    # On failure: keep dir for postmortem; agent gets killed either way.
-                    await self.worktree_manager.cleanup(
-                        worktree_handle, remove_dir=succeeded
-                    )
+                # git_context teardown first (kill ssh-agent), then
+                # worktree teardown (rm -rf the dir). The order
+                # matters when ``remove_dir=True``: ssh-agent has to
+                # release the key file before we wipe the dir.
+                if git_handle is not None:
+                    await self.git_context_provisioner.cleanup(git_handle)
+                # On success: wipe local state, remote-side git / PR
+                # is the truth. On failure: keep dir for postmortem.
+                await self.worktree_manager.cleanup(
+                    worktree_handle, remove_dir=succeeded
+                )
 
     def _preference_for(self, persona: Persona) -> ModelPreference:
         pref = ModelPreference.from_dict(persona.model_preference)

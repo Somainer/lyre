@@ -80,7 +80,7 @@ These are **settled**. PRs that violate them won't land.
 ## Architecture: the agent/persona/wakeup/task model
 
 - **Persona** (`src/lyre/personas/<name>.md`) = static role definition with
-  YAML frontmatter (`allowed_lyre_tools`, `model_preference`, `needs_worktree`)
+  YAML frontmatter (`allowed_lyre_tools`, `model_preference`, `kind`)
   and a markdown system-prompt body. After onboarding it lives at
   `~/.lyre/personas/<name>/identity.md` (the SSOT).
 - **Agent** = a running *instance* of a persona. One persona can have many

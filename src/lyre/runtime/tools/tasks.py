@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ...persistence.models import TaskSpec
+from ...persistence.models import GitContext, TaskSpec
 from . import Tool, ToolContext, ToolError
 
 
@@ -70,6 +70,29 @@ async def _dispatch_task(ctx: ToolContext, args: dict[str, Any]) -> dict[str, An
     if metadata is not None and not isinstance(metadata, dict):
         raise ToolError("metadata must be an object")
 
+    git_ctx_arg = args.get("git_context")
+    git_ctx: GitContext | None = None
+    if git_ctx_arg is not None:
+        if not isinstance(git_ctx_arg, dict):
+            raise ToolError(
+                "git_context must be an object "
+                "{repo_url, target_branch, base_branch?}"
+            )
+        repo_url = git_ctx_arg.get("repo_url")
+        target_branch = git_ctx_arg.get("target_branch")
+        if not isinstance(repo_url, str) or not repo_url:
+            raise ToolError("git_context.repo_url required (string)")
+        if not isinstance(target_branch, str) or not target_branch:
+            raise ToolError("git_context.target_branch required (string)")
+        base_branch = git_ctx_arg.get("base_branch", "main")
+        if not isinstance(base_branch, str):
+            raise ToolError("git_context.base_branch must be a string")
+        git_ctx = GitContext(
+            repo_url=repo_url,
+            target_branch=target_branch,
+            base_branch=base_branch,
+        )
+
     spec = TaskSpec(
         agent_id=resolved_agent_id,
         persona_name=resolved_persona,
@@ -79,6 +102,7 @@ async def _dispatch_task(ctx: ToolContext, args: dict[str, Any]) -> dict[str, An
         lease_duration_s=int(args.get("lease_duration_s", 1800)),
         deadline=None,
         metadata=metadata,
+        git_context=git_ctx,
     )
     new_task_id = await ctx.repos.tasks.create(spec)
     return {
@@ -111,7 +135,16 @@ DISPATCH_TASK = Tool(
         "Create a child task for an existing agent. Returns the new task_id; "
         "the scheduler will pick it up. Use query_task_status() to poll. "
         "If no suitable agent exists yet, call create_agent() first, then "
-        "pass its id as `agent`."
+        "pass its id as `agent`. "
+        "\n\n"
+        "**git_context** (optional): if this task needs the worker to "
+        "operate on a git working copy (code change → push → PR), pass "
+        "``git_context={'repo_url': ..., 'target_branch': ..., "
+        "'base_branch': 'main'}``. The runtime provisions an SSH key + "
+        "agent and clones the repo onto the worker's worktree before "
+        "the worker wakes up. **Omit git_context** for non-code tasks "
+        "(research, skill migration, data shaping, log parsing) — the "
+        "worker gets a clean tmpdir sandbox with no git binding."
     ),
     input_schema={
         "type": "object",
@@ -138,6 +171,37 @@ DISPATCH_TASK = Tool(
             },
             "lease_duration_s": {"type": "integer", "default": 1800},
             "metadata": {"type": "object"},
+            "git_context": {
+                "type": "object",
+                "description": (
+                    "Optional. Provision a git working copy on the "
+                    "worker's worktree before it wakes up. Required "
+                    "for code-edit tasks; omit for non-git work."
+                ),
+                "properties": {
+                    "repo_url": {
+                        "type": "string",
+                        "description": (
+                            "ssh:// or https:// URL of the repo. "
+                            "SSH preferred; runtime generates the key."
+                        ),
+                    },
+                    "target_branch": {
+                        "type": "string",
+                        "description": (
+                            "Branch to check out (will be created from "
+                            "base_branch). Conventionally semantic, "
+                            "e.g. 'claude/<feature>'."
+                        ),
+                    },
+                    "base_branch": {
+                        "type": "string",
+                        "default": "main",
+                        "description": "Branch to clone from. Defaults to 'main'.",
+                    },
+                },
+                "required": ["repo_url", "target_branch"],
+            },
         },
         "required": ["goal", "acceptance"],
     },

@@ -180,15 +180,8 @@ async def test_subprocess_sigkill_mid_task_recovers_via_expired_lease(
     try:
         repos = SqliteRepositories(conn)
         await _seed(repos)
-
-        # Worker-maintainer normally needs a worktree (ssh-keygen +
-        # ssh-agent). Override that for this isolation test — we're
-        # testing subprocess lifecycle, not worktree.
         worker = await repos.personas.get("worker-maintainer")
         assert worker is not None
-        await repos.personas.upsert(
-            worker.model_copy(update={"needs_worktree": False})
-        )
 
         task_id = await repos.tasks.create(
             TaskSpec(

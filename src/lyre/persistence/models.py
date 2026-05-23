@@ -94,7 +94,6 @@ class Persona(BaseModel):
     # not a specific model identity. The router resolves against
     # model_registry.yaml at wakeup time.
     model_preference: dict[str, Any] | None = None
-    needs_worktree: bool = True
     status: PersonaStatus = "approved"
     proposed_by_task_id: str | None = None
     reviewer: str | None = None
@@ -109,6 +108,25 @@ class Persona(BaseModel):
         this anywhere the prompt / template needs to render the persona
         for the owner to read; reserve ``name`` for system addressing."""
         return self.display_name or self.name
+
+
+class GitContext(BaseModel):
+    """Optional per-task git working-copy provisioning.
+
+    When a task's ``git_context`` is set, the runtime prepares an
+    ephemeral SSH keypair + agent for it, clones ``repo_url`` into
+    the task's worktree, and checks out ``target_branch`` (created
+    from ``base_branch``). When unset, the worktree stays an empty
+    tmpdir — workers doing non-git work (skill migration, research,
+    data shaping) don't get an SSH key they'll never use.
+
+    Branches are dispatcher-decided, not worker-decided: the
+    dispatcher knows the task's semantic name and the conventions.
+    """
+
+    repo_url: str
+    target_branch: str
+    base_branch: str = "main"
 
 
 class Task(BaseModel):
@@ -130,6 +148,8 @@ class Task(BaseModel):
     tier_overrides: dict[str, Any] | None = None
     deadline: datetime | None = None
     metadata: dict[str, Any] | None = None
+    # Optional git working-copy provisioning. See ``GitContext``.
+    git_context: GitContext | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
     completed_at: datetime | None = None
@@ -154,6 +174,10 @@ class TaskSpec(BaseModel):
     tier_overrides: dict[str, Any] | None = None
     deadline: datetime | None = None
     metadata: dict[str, Any] | None = None
+    # See Task.git_context — set when the worker needs a checked-out
+    # working copy; omit when the task is non-git (research, skill
+    # migration, data shaping).
+    git_context: GitContext | None = None
 
 
 class Wakeup(BaseModel):

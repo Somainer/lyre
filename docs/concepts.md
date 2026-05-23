@@ -51,7 +51,7 @@ keeps them apart.
 
 - **Persona** = the role definition. A markdown file at
   `src/lyre/personas/<name>.md` with frontmatter (allowed tools, model
-  preference, needs_worktree) and a system-prompt body. Static.
+  preference, kind) and a system-prompt body. Static.
 - **Agent** = a running instance of a persona. Has an ID, a mailbox, a
   notes file, a task queue, transcripts. Dynamic. **One persona can have
   many agent instances** running in parallel.
