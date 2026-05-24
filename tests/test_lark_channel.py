@@ -20,6 +20,7 @@ from lyre.integrations.lark.channel import (
     LarkChannel,
     _build_owner_mail_card,
     _extract_body_and_images,
+    _parse_urgency_prefix,
     _sniff_image_mime,
 )
 from lyre.persistence.db import init_db
@@ -154,6 +155,78 @@ async def test_channel_refuses_without_authorized_user_id(
             LarkChannel(cfg, repos, None, dispatcher_id="dispatcher")
     finally:
         await conn.close()
+
+
+# ---------------------------------------------------------------------------
+# _parse_urgency_prefix — owner-typed `!blocker` / `!urgent` / `!high` / `!low`
+# ---------------------------------------------------------------------------
+
+
+def test_urgency_prefix_each_token_strips_and_maps() -> None:
+    """Each recognized token at the very start maps to the right
+    mailbox urgency and is stripped (along with the following space)
+    from the body so agents don't see the meta-marker."""
+    assert _parse_urgency_prefix("!blocker drop everything now") == (
+        "blocker", "drop everything now",
+    )
+    # !urgent aliases to high (matches how people actually type).
+    assert _parse_urgency_prefix("!urgent fix this") == ("high", "fix this")
+    assert _parse_urgency_prefix("!high heads up") == ("high", "heads up")
+    assert _parse_urgency_prefix("!low FYI when you can") == (
+        "low", "FYI when you can",
+    )
+
+
+def test_urgency_prefix_case_insensitive() -> None:
+    assert _parse_urgency_prefix("!BLOCKER stop")[0] == "blocker"
+    assert _parse_urgency_prefix("!Urgent x")[0] == "high"
+    assert _parse_urgency_prefix("!High y")[0] == "high"
+
+
+def test_urgency_prefix_default_normal_when_absent() -> None:
+    """No recognized prefix → urgency stays normal, body unchanged."""
+    assert _parse_urgency_prefix("just a regular message") == (
+        "normal", "just a regular message",
+    )
+    assert _parse_urgency_prefix("") == ("normal", "")
+
+
+def test_urgency_prefix_unknown_token_passes_through() -> None:
+    """`!important` looks like a urgency token but isn't recognized —
+    the channel shouldn't silently strip it (leaves owner's text
+    intact, urgency falls back to normal)."""
+    assert _parse_urgency_prefix("!important note") == (
+        "normal", "!important note",
+    )
+    assert _parse_urgency_prefix("!nope") == ("normal", "!nope")
+
+
+def test_urgency_prefix_word_boundary_prevents_partial_match() -> None:
+    """`!blockerfoo` must NOT match `!blocker` — without the word
+    boundary check the parser would eat the prefix and mangle the
+    body to "foo"."""
+    assert _parse_urgency_prefix("!blockerfoo bar") == (
+        "normal", "!blockerfoo bar",
+    )
+    assert _parse_urgency_prefix("!lowness check") == (
+        "normal", "!lowness check",
+    )
+
+
+def test_urgency_prefix_only_at_start() -> None:
+    """A prefix that appears mid-body is not honoured (otherwise any
+    mention of `!blocker` would change urgency, which is surprising)."""
+    assert _parse_urgency_prefix("see also !blocker note") == (
+        "normal", "see also !blocker note",
+    )
+
+
+def test_urgency_prefix_alone_yields_empty_body() -> None:
+    """`!blocker` with nothing after still parses — empty body, but
+    the urgency is set. (Whether the rest of the pipeline accepts an
+    empty body is a separate concern.)"""
+    assert _parse_urgency_prefix("!blocker") == ("blocker", "")
+    assert _parse_urgency_prefix("!blocker   ") == ("blocker", "")
 
 
 # ---------------------------------------------------------------------------

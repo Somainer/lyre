@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json as _json
+import re
 import threading
 import uuid
 from typing import TYPE_CHECKING, Any, ClassVar
@@ -329,6 +330,12 @@ class LarkChannel:
                 msg_id, image_keys,
             )
 
+            # Owner can override urgency with a leading token
+            # (!blocker / !urgent / !high / !low). Token is stripped
+            # from the stored body so agents don't see the meta-marker
+            # in the message they read.
+            urgency, stored_body = _parse_urgency_prefix(addr.body)
+
             await self.repos.mailbox.ensure_mailbox(addr.recipient)
             from ...persistence.models import MailboxMessage
             inserted_id = await self.repos.mailbox.insert_message(
@@ -336,8 +343,8 @@ class LarkChannel:
                     recipient=addr.recipient,
                     external_id=f"lark:{msg_id}",
                     sender="owner",
-                    urgency="normal",
-                    body=addr.body,
+                    urgency=urgency,  # type: ignore[arg-type]
+                    body=stored_body,
                     parent_msg_id=parent_mail_id,
                     attachments=attachments or None,
                     metadata={
@@ -659,6 +666,47 @@ _REACTION_TO_LARK_EMOJI: dict[str, str] = {
 # Helpers — kept module-level so they're easy to test without spinning up
 # a full LarkChannel.
 # ---------------------------------------------------------------------------
+
+
+# Inbound urgency-prefix parsing for owner messages from Lark.
+# Owner can lead a chat message with `!blocker` / `!urgent` / `!high` /
+# `!low` to override the default normal. `!urgent` aliases to `high`
+# (matches how people naturally type "urgent" instead of "high"). The
+# token must be at the very start and bounded by whitespace or end of
+# string (so `!blockerfoo` doesn't match `!blocker`). Case-insensitive.
+# If no recognized token, urgency stays normal and body passes through
+# unchanged.
+_URGENCY_TOKEN_TO_VALUE: dict[str, str] = {
+    "blocker": "blocker",
+    "urgent":  "high",
+    "high":    "high",
+    "low":     "low",
+}
+_URGENCY_PREFIX_RE = re.compile(
+    r"^!(?P<token>blocker|urgent|high|low)\b\s*",
+    re.IGNORECASE,
+)
+
+
+def _parse_urgency_prefix(body: str) -> tuple[str, str]:
+    """Strip a leading ``!blocker`` / ``!urgent`` / ``!high`` / ``!low``
+    prefix from ``body`` and map it to a mailbox urgency level.
+
+    Returns ``(urgency, stripped_body)``. If no recognized prefix is
+    present, returns ``("normal", body)`` — the channel's default.
+
+    The prefix is only honoured at the very start of the message, and
+    must be followed by whitespace or end-of-string (the ``\\b`` in
+    the regex). That keeps phrases like ``!important`` or ``!low-key``
+    or ``!blockedness`` from getting mis-parsed.
+    """
+    if not body:
+        return "normal", body
+    m = _URGENCY_PREFIX_RE.match(body)
+    if m is None:
+        return "normal", body
+    urgency = _URGENCY_TOKEN_TO_VALUE[m.group("token").lower()]
+    return urgency, body[m.end():]
 
 
 # Urgency → Lark card header color template. Lark's built-in palette
