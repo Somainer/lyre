@@ -15,7 +15,12 @@ TaskStatus = Literal[
 ]
 PersonaStatus = Literal["proposed", "approved", "deprecated"]
 SkillStatus = Literal["proposed", "approved", "deprecated"]
-AgentStatus = Literal["idle", "busy", "archived"]
+# "busy" used to be a third value here but nothing in the runtime ever
+# wrote it back — true running-vs-not-running state lives in the
+# wakeups table (``ended_at IS NULL`` = running). Both ``list_agents``
+# and the dashboard derive ``busy`` from active wakeups; the agent
+# record only carries the lifecycle distinction.
+AgentStatus = Literal["idle", "archived"]
 Urgency = Literal["blocker", "high", "normal", "low"]
 OutboxKind = Literal[
     "mailbox_send",

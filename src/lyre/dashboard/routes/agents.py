@@ -69,9 +69,9 @@ def _derive_occupancy_status(
     busy_legacy_personas: set[str],
 ) -> str:
     """Reflect "running a wakeup right now" back into the Agent record.
-    Without this, agent.status (which only flips on idle/busy/archived
-    transitions written by the runtime) lags the reality the dashboard
-    sees via list_active_wakeups. occupancy_pill() reads .status.
+    Without this, agent.status (which is lifecycle-only — idle vs
+    archived) lags the reality the dashboard sees via
+    list_active_wakeups. occupancy_pill() reads .status.
 
     Two match passes:
       * ``busy_agent_ids`` — exact `<persona>/<name>` match for wakeups
