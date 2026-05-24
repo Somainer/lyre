@@ -42,10 +42,17 @@ async def _mailbox_send(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any
     if not recipients:
         raise ToolError("'to' is empty")
     self_mailbox = ctx.self_mailbox
-    if self_mailbox in recipients:
+    # Self-send is blocked for IMMEDIATE delivery — auto-wake-on-mail
+    # would fire instantly and any "kick myself awake" loop becomes a
+    # runaway. Scheduled / future self-send IS allowed (deliver_at /
+    # deliver_in / recur_*), because the delivery delay breaks the
+    # instant-loop class of bugs and "remind future-me about X" is a
+    # legit pattern for long-running agents tracking their own work.
+    if self_mailbox in recipients and not _has_scheduling_args(args):
         raise ToolError(
-            f"refusing to send to self ({self_mailbox}); drop yourself "
-            f"from the recipient list"
+            f"refusing to send immediate mail to self ({self_mailbox}); "
+            f"drop yourself from the recipient list, or pass "
+            f"deliver_in / deliver_at if you want a future self-reminder"
         )
 
     # Recipients are AGENT IDs (post-A3). Validate every one against the
@@ -658,11 +665,12 @@ MAILBOX_SEND = Tool(
         "Email another agent (or several) via the persistent mailbox.\n"
         "Modes:\n"
         "  immediate — default. Delivered as soon as the outbox dispatcher "
-        "picks it up (sub-second typical).\n"
+        "picks it up (sub-second typical). Cannot target yourself.\n"
         "  scheduled — pass any of deliver_at / deliver_in / recur_every / "
         "recur_cron. The mail goes to scheduled_mail and the scheduler "
         "delivers it when due. Powers reminders, supervision, timeouts, "
-        "and recurring jobs (cron-like).\n"
+        "and recurring jobs (cron-like). CAN target yourself (set a "
+        "future self-reminder, e.g. 'check PR #142 in 4h').\n"
         "Supports broadcast (`to` as a list), reply (`reply_to`), and "
         "forward (`forward_msg_id`)."
     ),

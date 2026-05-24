@@ -107,6 +107,93 @@ async def test_mailbox_send_rejects_unknown_recipient(ctx: ToolContext) -> None:
 
 
 @pytest.mark.asyncio
+async def test_mailbox_send_to_self_immediate_rejected(
+    ctx: ToolContext,
+) -> None:
+    """Immediate self-send is still blocked — auto-wake-on-mail would
+    fire instantly and "kick myself awake" is a trivial loop. Error
+    message points at the scheduled-mail workaround."""
+    with pytest.raises(ToolError, match="immediate mail to self"):
+        await MAILBOX_SEND.handler(
+            ctx,
+            {
+                "to": ctx.self_mailbox,
+                "body": "check on X",
+                "_tool_use_id": "tu_self_now",
+            },
+        )
+
+
+@pytest.mark.asyncio
+async def test_mailbox_send_to_self_scheduled_allowed(
+    ctx: ToolContext,
+) -> None:
+    """Scheduled self-send IS allowed — the delivery delay breaks the
+    instant-loop class of bugs, and "remind future-me about X" is a
+    legit long-running-agent pattern that the identity preamble
+    already documents."""
+    out = await MAILBOX_SEND.handler(
+        ctx,
+        {
+            "to": ctx.self_mailbox,
+            "body": "remind me to check PR #142",
+            "title": "self-reminder: PR #142",
+            "deliver_in": "1h",
+            "_tool_use_id": "tu_self_later",
+        },
+    )
+    assert out["status"] == "scheduled"
+    assert out["recipients"] == [ctx.self_mailbox]
+    assert len(out["scheduled_ids"]) == 1
+    # Row landed in scheduled_mail with the agent as both sender and
+    # recipient. The scheduler's Phase -1 will deliver when due.
+    sid = out["scheduled_ids"][0]
+    spec = await ctx.repos.scheduled_mail.get(sid)
+    assert spec is not None
+    assert spec.recipient == ctx.self_mailbox
+    assert spec.sender == ctx.self_mailbox
+
+
+@pytest.mark.asyncio
+async def test_mailbox_send_to_self_recurring_allowed(
+    ctx: ToolContext,
+) -> None:
+    """Recurring self-send (the standing-commission pattern: 'every
+    weekday morning, scan the queue and remind me') is also allowed."""
+    out = await MAILBOX_SEND.handler(
+        ctx,
+        {
+            "to": ctx.self_mailbox,
+            "body": "weekday morning scan",
+            "title": "standing: morning scan",
+            "recur_cron": "0 9 * * 1-5",
+            "_tool_use_id": "tu_self_recur",
+        },
+    )
+    assert out["status"] == "scheduled"
+    assert out["recur_kind"] == "cron"
+    assert out["recur_value"] == "0 9 * * 1-5"
+
+
+@pytest.mark.asyncio
+async def test_mailbox_send_mixed_self_and_other_immediate_rejected(
+    ctx: ToolContext,
+) -> None:
+    """A broadcast that includes self alongside others is still rejected
+    when immediate — preserve the "no immediate self-touch" invariant
+    even if the model thinks it can sneak self in via a list."""
+    with pytest.raises(ToolError, match="immediate mail to self"):
+        await MAILBOX_SEND.handler(
+            ctx,
+            {
+                "to": [ctx.self_mailbox, "owner"],
+                "body": "status",
+                "_tool_use_id": "tu_mixed_self",
+            },
+        )
+
+
+@pytest.mark.asyncio
 async def test_mailbox_send_validates_args(ctx: ToolContext) -> None:
     with pytest.raises(ToolError):
         await MAILBOX_SEND.handler(ctx, {"body": "x", "_tool_use_id": "t1"})
