@@ -28,11 +28,17 @@ from __future__ import annotations
 import asyncio
 import io
 import json as _json
+import re
 import threading
 import uuid
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import structlog
+
+# Recomputing the same auto-derive used at insert time lets us tell
+# "owner specified a real subject" apart from "title fell back to the
+# body's first line" when rendering Lark cards — keep them in sync.
+from ...persistence.sqlite_impl import _derive_title_from_body
 
 if TYPE_CHECKING:
     from ...config import LarkConfig
@@ -329,6 +335,12 @@ class LarkChannel:
                 msg_id, image_keys,
             )
 
+            # Owner can override urgency with a leading token
+            # (!blocker / !urgent / !high / !low). Token is stripped
+            # from the stored body so agents don't see the meta-marker
+            # in the message they read.
+            urgency, stored_body = _parse_urgency_prefix(addr.body)
+
             await self.repos.mailbox.ensure_mailbox(addr.recipient)
             from ...persistence.models import MailboxMessage
             inserted_id = await self.repos.mailbox.insert_message(
@@ -336,8 +348,8 @@ class LarkChannel:
                     recipient=addr.recipient,
                     external_id=f"lark:{msg_id}",
                     sender="owner",
-                    urgency="normal",
-                    body=addr.body,
+                    urgency=urgency,  # type: ignore[arg-type]
+                    body=stored_body,
                     parent_msg_id=parent_mail_id,
                     attachments=attachments or None,
                     metadata={
@@ -464,12 +476,16 @@ class LarkChannel:
             ReplyMessageRequestBody,
         )
 
-        # Compose the text body — prefix with the sender so owner
-        # knows which agent is talking. Markdown survives in Lark
-        # as plaintext (the bot account doesn't render rich cards
-        # in MVP; that's a follow-up).
-        text_body = f"[{msg.sender}] {msg.body or ''}"
-        text_content = _json.dumps({"text": text_body})
+        # Build an interactive card so Lark renders the body's
+        # markdown (lists, code blocks, links, bold). Plain text posts
+        # showed everything as raw asterisks and backticks. Header
+        # carries the sender id + urgency-based colour.
+        card_content = _json.dumps(_build_owner_mail_card(
+            sender=msg.sender,
+            body=msg.body or "",
+            urgency=msg.urgency,
+            title=msg.title,
+        ))
         text_uuid = f"lyre-mail-{msg.id}"  # SDK-side dedup token
 
         if reply_to_external_id is not None:
@@ -478,8 +494,8 @@ class LarkChannel:
                 .message_id(reply_to_external_id)
                 .request_body(
                     ReplyMessageRequestBody.builder()
-                    .msg_type("text")
-                    .content(text_content)
+                    .msg_type("interactive")
+                    .content(card_content)
                     .uuid(text_uuid)
                     .build()
                 )
@@ -493,8 +509,8 @@ class LarkChannel:
                 .request_body(
                     CreateMessageRequestBody.builder()
                     .receive_id(self.cfg.authorized_user_id)
-                    .msg_type("text")
-                    .content(text_content)
+                    .msg_type("interactive")
+                    .content(card_content)
                     .uuid(text_uuid)
                     .build()
                 )
@@ -503,7 +519,7 @@ class LarkChannel:
             text_resp = await self._api_client.im.v1.message.acreate(text_req)
         if not text_resp.success():
             raise RuntimeError(
-                f"Lark text post failed: code={text_resp.code} "
+                f"Lark card post failed: code={text_resp.code} "
                 f"msg={text_resp.msg}"
             )
         lark_msg_id = (
@@ -656,6 +672,133 @@ _REACTION_TO_LARK_EMOJI: dict[str, str] = {
 # Helpers — kept module-level so they're easy to test without spinning up
 # a full LarkChannel.
 # ---------------------------------------------------------------------------
+
+
+# Inbound urgency-prefix parsing for owner messages from Lark.
+# Owner can lead a chat message with `!blocker` / `!urgent` / `!high` /
+# `!low` to override the default normal. `!urgent` aliases to `high`
+# (matches how people naturally type "urgent" instead of "high"). The
+# token must be at the very start and bounded by whitespace or end of
+# string (so `!blockerfoo` doesn't match `!blocker`). Case-insensitive.
+# If no recognized token, urgency stays normal and body passes through
+# unchanged.
+_URGENCY_TOKEN_TO_VALUE: dict[str, str] = {
+    "blocker": "blocker",
+    "urgent":  "high",
+    "high":    "high",
+    "low":     "low",
+}
+_URGENCY_PREFIX_RE = re.compile(
+    r"^!(?P<token>blocker|urgent|high|low)\b\s*",
+    re.IGNORECASE,
+)
+
+
+def _parse_urgency_prefix(body: str) -> tuple[str, str]:
+    """Strip a leading ``!blocker`` / ``!urgent`` / ``!high`` / ``!low``
+    prefix from ``body`` and map it to a mailbox urgency level.
+
+    Returns ``(urgency, stripped_body)``. If no recognized prefix is
+    present, returns ``("normal", body)`` — the channel's default.
+
+    The prefix is only honoured at the very start of the message, and
+    must be followed by whitespace or end-of-string (the ``\\b`` in
+    the regex). That keeps phrases like ``!important`` or ``!low-key``
+    or ``!blockedness`` from getting mis-parsed.
+    """
+    if not body:
+        return "normal", body
+    m = _URGENCY_PREFIX_RE.match(body)
+    if m is None:
+        return "normal", body
+    urgency = _URGENCY_TOKEN_TO_VALUE[m.group("token").lower()]
+    return urgency, body[m.end():]
+
+
+# Urgency → Lark card header color template. Lark's built-in palette
+# (see open.feishu.cn card docs) — these are the values that
+# actually render colored bars in the owner's Lark client.
+_URGENCY_TEMPLATE: dict[str, str] = {
+    "blocker": "red",
+    "high":    "orange",
+    "normal":  "blue",
+    "low":     "grey",
+}
+
+# Traffic-light marker prepended to the body's ``**from <sender>**``
+# attribution line. Only the elevated urgencies get a marker — flagging
+# every normal mail with a coloured dot would be visual noise. blocker
+# / high mail tends to be terse, often arrives without a meaningful
+# title (so no coloured header bar), and the body-level dot is the
+# only urgency signal owner sees in those cases.
+_URGENCY_BODY_MARKER: dict[str, str] = {
+    "blocker": "🔴",
+    "high":    "🟠",
+}
+
+
+def _build_owner_mail_card(
+    sender: str, body: str, urgency: str, title: str | None = None,
+) -> dict[str, Any]:
+    """Lark interactive card with markdown body.
+
+    Plain ``msg_type=text`` posts don't render markdown — the owner saw
+    everything (lists, code blocks, links) as raw asterisks and
+    backticks. Cards via ``lark_md`` text components render properly
+    and let us colour-code by urgency too.
+
+    Layout: an attribution line — ``[<dot>] **from <sender>**`` where
+    the dot is 🔴/🟠 for blocker/high urgency and omitted otherwise —
+    is always the first line of the body, then a blank line, then the
+    message body verbatim. Uniform sender attribution, owner doesn't
+    have to scan two places to know who's talking.
+
+    The ``header`` block is only attached when the sender supplied a
+    *meaningful* title — i.e. one distinct from what we'd auto-derive
+    from the body's first line. An auto-derived title would just
+    duplicate body[0] in the header, so we drop the header entirely
+    for those — cleaner than the previous ``[<sender>]`` placeholder.
+    When the header is present, ``template`` colours it by urgency
+    (blocker→red etc); when absent, the body-level dot is the only
+    urgency signal the owner gets.
+
+    Image attachments still ride as separate ``msg_type=image`` posts
+    threaded to the same reply parent — embedding them inside the card
+    would require extra ``img_key`` round-trips for no UX gain over the
+    existing thread layout.
+    """
+    template = _URGENCY_TEMPLATE.get(urgency, "blue")
+    marker = _URGENCY_BODY_MARKER.get(urgency, "")
+
+    # Auto-derive check: the persistence layer fills missing titles with
+    # the body's first non-empty line (sqlite_impl._derive_title_from_body).
+    # Recomputing here lets the card tell "owner cares about this subject"
+    # apart from "no subject given" without threading an extra flag through.
+    has_meaningful_title = (
+        title is not None and title != _derive_title_from_body(body)
+    )
+
+    attribution = f"{marker} **from {sender}**" if marker else f"**from {sender}**"
+    body_content = f"{attribution}\n\n{body}" if body else attribution
+
+    card: dict[str, Any] = {
+        "config": {"wide_screen_mode": True, "update_multi": False},
+        "elements": [
+            {
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": body_content,
+                },
+            },
+        ],
+    }
+    if has_meaningful_title:
+        card["header"] = {
+            "title": {"tag": "plain_text", "content": title},
+            "template": template,
+        }
+    return card
 
 
 def _extract_body_and_images(
