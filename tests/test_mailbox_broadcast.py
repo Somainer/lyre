@@ -456,7 +456,7 @@ def test_identity_preamble_teaches_stateless_wakeups() -> None:
     is rooted in the model not knowing wakeups are stateless. The
     preamble must explicitly call out statelessness AND list the
     canonical persistence channels: sent-box recall, future mail to
-    self, the notes file, and report_progress (crash-recovery only)."""
+    self, and the notes file."""
     me = Persona(name="dispatcher", role_description="lead", system_prompt="b")
     prompt = assemble_system_prompt(me, agent_id="dispatcher")
     assert "STATELESS WAKEUPS" in prompt
@@ -465,8 +465,6 @@ def test_identity_preamble_teaches_stateless_wakeups() -> None:
     assert "deliver_in" in prompt and 'to="dispatcher"' in prompt
     # Notes file path must be in the preamble, plugged with agent id
     assert "facts/agent-dispatcher-notes.md" in prompt
-    # report_progress repositioned as crash-recovery only
-    assert "crash" in prompt.lower()
 
 
 def test_identity_preamble_teaches_ack_and_stop_anti_pattern() -> None:

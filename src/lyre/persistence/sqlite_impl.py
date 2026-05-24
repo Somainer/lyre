@@ -366,19 +366,6 @@ class SqliteTaskRepository:
         )
         await self.conn.commit()
 
-    async def update_checkpoint(
-        self, task_id: str, checkpoint: dict[str, Any], holder_wakeup_id: str
-    ) -> None:
-        await self.conn.execute(
-            """
-            UPDATE tasks SET checkpoint = ?,
-                             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-            WHERE id = ? AND lease_holder = ?
-            """,
-            (json.dumps(checkpoint), task_id, holder_wakeup_id),
-        )
-        await self.conn.commit()
-
     async def update_status(self, task_id: str, status: str) -> None:
         sql = """
             UPDATE tasks SET status = ?,
@@ -535,7 +522,6 @@ class SqliteTaskRepository:
             status=row["status"],
             lease_duration_s=row["lease_duration_s"],
             lease_holder=row["lease_holder"],
-            checkpoint=_parse_json(row["checkpoint"]),
             tier_overrides=_parse_json(row["tier_overrides"]),
             metadata=_parse_json(row["metadata"]),
             git_context=git_ctx,
@@ -576,6 +562,11 @@ class SqliteWakeupRepository:
         end_status: str,
         metering: dict[str, Any] | None = None,
         failure_report: dict[str, Any] | None = None,
+        *,
+        awaiting_on: str | None = None,
+        awaiting_ref: str | None = None,
+        failure_reason: str | None = None,
+        recoverable: bool | None = None,
     ) -> None:
         m = metering or {}
         await self.conn.execute(
@@ -590,6 +581,10 @@ class SqliteWakeupRepository:
                 provider = ?,
                 model = ?,
                 failure_report = ?,
+                awaiting_on = ?,
+                awaiting_ref = ?,
+                failure_reason = ?,
+                recoverable = ?,
                 context_peak_tokens = ?,
                 compaction_count = COALESCE(?, 0)
             WHERE id = ?
@@ -603,6 +598,10 @@ class SqliteWakeupRepository:
                 m.get("provider"),
                 m.get("model"),
                 _json(failure_report),
+                awaiting_on,
+                awaiting_ref,
+                failure_reason,
+                int(recoverable) if recoverable is not None else None,
                 m.get("context_peak_tokens"),
                 m.get("compaction_count"),
                 wakeup_id,
@@ -771,6 +770,27 @@ class SqliteWakeupRepository:
             compaction_count = r["compaction_count"] or 0
         except (KeyError, IndexError):
             compaction_count = 0
+        # End-of-wakeup declaration metadata (see WAKEUP_END_CONTRACT.md).
+        # Defensive .get-style access matches the context_peak pattern
+        # above — older test DBs / fixtures built before this migration
+        # may not carry the columns.
+        try:
+            awaiting_on = r["awaiting_on"]
+        except (KeyError, IndexError):
+            awaiting_on = None
+        try:
+            awaiting_ref = r["awaiting_ref"]
+        except (KeyError, IndexError):
+            awaiting_ref = None
+        try:
+            failure_reason = r["failure_reason"]
+        except (KeyError, IndexError):
+            failure_reason = None
+        try:
+            rec_raw = r["recoverable"]
+            recoverable: bool | None = bool(rec_raw) if rec_raw is not None else None
+        except (KeyError, IndexError):
+            recoverable = None
         return Wakeup(
             id=r["id"],
             task_id=r["task_id"],
@@ -786,6 +806,10 @@ class SqliteWakeupRepository:
             provider=r["provider"],
             model=r["model"],
             transcript_uri=r["transcript_uri"],
+            awaiting_on=awaiting_on,
+            awaiting_ref=awaiting_ref,
+            failure_reason=failure_reason,
+            recoverable=recoverable,
             context_peak_tokens=context_peak,
             compaction_count=compaction_count,
         )

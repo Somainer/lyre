@@ -68,7 +68,7 @@ async def _seed_personas(repos: SqliteRepositories) -> None:
             role_description="worker",
             system_prompt="you write code",
             allowed_lyre_tools=[
-                "python_exec", "shell_exec", "mailbox_send", "report_progress",
+                "python_exec", "shell_exec", "mailbox_send",
             ],
             model_preference={
                 "tier": "workhorse", "requires": ["tool_use"], "prefer": [],

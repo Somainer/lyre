@@ -67,11 +67,6 @@ async def test_task_lifecycle_with_lease(repos: SqliteRepositories) -> None:
     assert await repos.tasks.renew_lease(task_id, wakeup_a, duration_sec=60)
     assert not await repos.tasks.renew_lease(task_id, wakeup_b, duration_sec=60)
 
-    # Updating checkpoint as holder works; as non-holder is a no-op.
-    await repos.tasks.update_checkpoint(task_id, {"phase": "edit"}, wakeup_a)
-    after = await repos.tasks.get(task_id)
-    assert after is not None and after.checkpoint == {"phase": "edit"}
-
     await repos.tasks.release_lease(task_id, wakeup_a)
     released = await repos.tasks.get(task_id)
     assert released is not None

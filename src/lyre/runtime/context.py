@@ -316,9 +316,6 @@ def _build_identity_preamble(
         f"auto-wake-on-mail will start a fresh wakeup for you to read "
         f"their result. There is NO blocking 'wait for children' primitive; "
         f"events are the only synchronisation.\n"
-        f"  • Status without a recipient → `report_progress(...)` "
-        f"(crash-recovery state only — NOT visible to owner or other "
-        f"agents; for visibility use `mailbox_send`)\n"
         f"Every owner / user-visible response must go through "
         f"`mailbox_send`. Plain text alone reaches no one.\n"
         f"\n"
@@ -413,7 +410,6 @@ def _build_identity_preamble(
         f"  • The filesystem under `~/.lyre/memory/` — your notes, "
         f"persona profiles, facts. Read via `read_memory(...)` or "
         f"`shell_exec cat ...`.\n"
-        f"  • Task checkpoint (via report_progress / query_task_status).\n"
         f"  • Persisted facts about agents (list_agents shows everyone).\n"
         f"\n"
         f"So the *correct* reaction when an asker references prior "
@@ -460,11 +456,7 @@ def _build_identity_preamble(
         f"shows what you said. Treat this as a FALLBACK audit trail, "
         f"not as primary memory — scratchpad is what you should "
         f"actually rely on for \"did I follow through\".\n"
-        f"  5. **report_progress checkpoint** — for crash recovery "
-        f"only. Used by the scheduler to re-seed the next wakeup of "
-        f"the SAME task if a wakeup crashes mid-flight. Not for "
-        f"general note-keeping; not visible to anyone else.\n"
-        f"You don't need to use all five every wakeup — but the "
+        f"You don't need to use all four every wakeup — but the "
         f"scratchpad pair (read at start, update on commit/done) is "
         f"required if you make ANY commitment that outlives this wakeup.\n"
         f"\n"
@@ -502,8 +494,7 @@ def _build_identity_preamble(
         f"**PROGRESS VIA MAIL.** Mail is the universal channel for "
         f"long-running work. If a task takes multiple wakeups or hours, "
         f"emit periodic progress mail to whoever's waiting (often the "
-        f"owner). Don't reach for a \"report_progress for visibility\" "
-        f"shortcut — there isn't one. The pattern is:\n"
+        f"owner). The pattern is:\n"
         f"  • Schedule a recurring self-ping: "
         f"`mailbox_send(to=\"{agent_id}\", title=\"check in on …\", "
         f"body=\"...\", recur_every=\"30m\")` — on each wake decide "
@@ -525,14 +516,13 @@ async def assemble_initial_user_message(
     """Build the initial user-role message for a wakeup.
 
     Composition:
-      - task.goal + acceptance + checkpoint (always)
+      - task.goal + acceptance (always)
       - subagent children with status (if `tasks_repo` given and any)
 
     Cross-wakeup recall is NOT inlined here. Agents are stateless across
     wakeups but have explicit channels for self-recall:
       - `mailbox_read(box="sent")` to see what they sent / promised
       - `read_memory` / `shell_exec cat ~/.lyre/memory/...` for notes
-      - report_progress checkpoint (for crash recovery, not visibility)
     The identity preamble teaches them this. Auto-injecting recent sends
     is fighting the model's agency.
     """
@@ -544,8 +534,6 @@ async def assemble_initial_user_message(
 【验收标准】
 {task.acceptance}
 """
-    if task.checkpoint:
-        body += f"\n\n【续做 checkpoint】\n{task.checkpoint}\n"
 
     if tasks_repo is not None:
         children = await tasks_repo.find_children(task.id)

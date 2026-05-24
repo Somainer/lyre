@@ -1,11 +1,17 @@
-"""Progress tools: report_progress, report_side_effect.
+"""Wakeup-lifecycle and side-effect tools.
 
-report_progress     — agent self-checkpoint: persists task.checkpoint so a kill+
-                      restart can resume.
-report_side_effect — agent declares an externally visible side effect
-                      (e.g., 'opened PR'). Goes through outbox as a tier1
-                      notification; the dispatcher fans it out to subscribers
-                      (e.g., owner mailbox).
+  * ``report_side_effect`` — agent declares an externally visible side
+    effect (e.g., 'opened PR'). Goes through outbox as a tier1
+    notification; the dispatcher fans it out to subscribers (e.g.,
+    owner mailbox).
+
+A previous ``report_progress`` tool lived here too — it persisted a
+free-form JSON blob into ``tasks.checkpoint``. The audit in
+``docs/design/WAKEUP_END_CONTRACT.md`` §3a found it vestigial
+(``update_scratchpad`` covers the same continuity story with better
+scope and curation), so it has been removed along with the column.
+The terminal-declaration tool ``end_wakeup`` replaces it as the
+canonical wakeup-end signal.
 """
 
 from __future__ import annotations
@@ -14,20 +20,6 @@ from typing import Any
 
 from ...persistence.models import OutboxRow
 from . import Tool, ToolContext, ToolError
-
-
-async def _report_progress(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
-    note = args.get("note")
-    checkpoint = args.get("checkpoint")
-    if not isinstance(checkpoint, dict):
-        raise ToolError("checkpoint must be an object (key/value map)")
-    if note and not isinstance(note, str):
-        raise ToolError("note must be a string")
-
-    # The agent holds the lease for the duration of its wakeup, so it is the
-    # legitimate holder for the checkpoint update.
-    await ctx.repos.tasks.update_checkpoint(ctx.task_id, checkpoint, ctx.wakeup_id)
-    return {"status": "ok", "task_id": ctx.task_id}
 
 
 async def _report_side_effect(
@@ -64,36 +56,6 @@ async def _report_side_effect(
     )
     return {"status": "queued", "external_id": external_id, "kind": kind}
 
-
-REPORT_PROGRESS = Tool(
-    name="report_progress",
-    description=(
-        "CRASH-RECOVERY ONLY. Persist your current progress as a task "
-        "checkpoint — the scheduler uses this to re-seed the NEXT wakeup "
-        "of THE SAME task if this wakeup crashes mid-flight.\n\n"
-        "NOT VISIBLE to owner or other agents. NOT a status update channel. "
-        "For visibility / progress reports, use `mailbox_send` to the "
-        "asker (owner / parent agent / etc.).\n\n"
-        "Typical call: at meaningful boundaries (file edited, decision "
-        "made, subtask done) so a crash doesn't lose state. Free-form "
-        "key/value map."
-    ),
-    input_schema={
-        "type": "object",
-        "properties": {
-            "checkpoint": {
-                "type": "object",
-                "description": "Free-form key/value map. Examples: {'phase':'edit','files_changed':['README.md']}.",
-            },
-            "note": {
-                "type": "string",
-                "description": "Optional one-line note for the transcript.",
-            },
-        },
-        "required": ["checkpoint"],
-    },
-    handler=_report_progress,
-)
 
 REPORT_SIDE_EFFECT = Tool(
     name="report_side_effect",

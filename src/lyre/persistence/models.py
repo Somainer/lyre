@@ -149,7 +149,6 @@ class Task(BaseModel):
     lease_duration_s: int = 1800
     lease_holder: str | None = None
     lease_until: datetime | None = None
-    checkpoint: dict[str, Any] | None = None
     tier_overrides: dict[str, Any] | None = None
     deadline: datetime | None = None
     metadata: dict[str, Any] | None = None
@@ -201,10 +200,18 @@ class Wakeup(BaseModel):
     model: str | None = None
     failure_report: dict[str, Any] | None = None
     transcript_uri: str | None = None
-    # Per-wakeup context metrics (migration 0006). `context_peak_tokens`
-    # is the max input_tokens any single turn reported — proxy for
-    # "how close to the model's context window did we get". `compaction_
-    # count` is how many times the wakeup auto-compacted mid-flight.
+    # End-of-wakeup declaration metadata. See WAKEUP_END_CONTRACT.md
+    # §3b. Populated by the scheduler from the agent's terminal
+    # end_wakeup(...) call. NULL when end_status doesn't carry an
+    # awaiting/failure semantics (e.g. completed, yielded).
+    awaiting_on: str | None = None
+    awaiting_ref: str | None = None
+    failure_reason: str | None = None
+    recoverable: bool | None = None
+    # Per-wakeup context metrics. `context_peak_tokens` is the max
+    # input_tokens any single turn reported — proxy for "how close
+    # to the model's context window did we get". `compaction_count`
+    # is how many times the wakeup auto-compacted mid-flight.
     context_peak_tokens: int | None = None
     compaction_count: int = 0
 

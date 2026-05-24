@@ -77,7 +77,6 @@ _USER_FACING_TOOLS: frozenset[str] = frozenset(
         "mailbox_send",       # reply / inform sender
         "mailbox_react",      # silent ack — closes a thread without push
         "dispatch_task",      # spawn worker
-        "report_progress",    # publish status
         "report_side_effect", # publish Tier-1 notification
         "cancel_scheduled_mail",
         "archive_agent",

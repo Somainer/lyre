@@ -9,7 +9,7 @@ from lyre.persistence.sqlite_impl import SqliteRepositories
 from lyre.runtime.tools import ToolContext, ToolError
 from lyre.runtime.tools.builtin import build_default_registry
 from lyre.runtime.tools.mailbox import MAILBOX_READ, MAILBOX_SEND, MARK_READ
-from lyre.runtime.tools.progress import REPORT_PROGRESS, REPORT_SIDE_EFFECT
+from lyre.runtime.tools.progress import REPORT_SIDE_EFFECT
 from lyre.runtime.tools.tasks import DISPATCH_TASK, QUERY_TASK_STATUS
 
 
@@ -487,17 +487,6 @@ async def test_mark_read_handler(ctx: ToolContext) -> None:
 
 
 @pytest.mark.asyncio
-async def test_report_progress_updates_checkpoint(ctx: ToolContext) -> None:
-    await REPORT_PROGRESS.handler(
-        ctx,
-        {"checkpoint": {"phase": "edit", "files": ["README.md"]}},
-    )
-    t = await ctx.repos.tasks.get(ctx.task_id)
-    assert t is not None
-    assert t.checkpoint == {"phase": "edit", "files": ["README.md"]}
-
-
-@pytest.mark.asyncio
 async def test_report_side_effect_writes_outbox(ctx: ToolContext) -> None:
     result = await REPORT_SIDE_EFFECT.handler(
         ctx,
@@ -554,7 +543,6 @@ def test_builtin_registry_contains_expected_tools() -> None:
         "mailbox_send",
         "mailbox_read",
         "mark_read",
-        "report_progress",
         "report_side_effect",
         "dispatch_task",
         "query_task_status",
@@ -570,9 +558,9 @@ def test_builtin_registry_contains_expected_tools() -> None:
 
 def test_registry_specs_for_filters_by_allowlist() -> None:
     reg = build_default_registry()
-    specs = reg.specs_for(["mailbox_send", "ghost", "report_progress"])
+    specs = reg.specs_for(["mailbox_send", "ghost", "report_side_effect"])
     names = {s.name for s in specs}
-    assert names == {"mailbox_send", "report_progress"}
+    assert names == {"mailbox_send", "report_side_effect"}
 
 
 # ---------------------------------------------------------------------------

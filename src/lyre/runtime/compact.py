@@ -26,7 +26,7 @@ Tools that are dropped from elided range entirely (idempotent /
 re-fetchable / pure side-effect ack):
   - mailbox_read (listings — bodies are preserved via mailbox_get_message)
   - list_agents / list_personas / list_models / list_tasks / query_task_status
-  - report_progress / report_side_effect / mark_read
+  - report_side_effect / mark_read
   - create_agent / archive_agent (one-liner in work summary if any)
 """
 
@@ -60,7 +60,6 @@ _TOOL_POLICY: dict[str, str] = {
     "list_tasks": "drop",
     "list_scheduled_mail": "drop",
     "query_task_status": "drop",
-    "report_progress": "drop",
     "report_side_effect": "trace",   # operator may care about effects
     "create_agent": "trace",
     "archive_agent": "trace",
