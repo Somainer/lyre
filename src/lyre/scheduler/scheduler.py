@@ -32,7 +32,7 @@ import structlog
 
 from ..adapter.llm_adapter import LLMAdapter
 from ..config import Config
-from ..persistence.models import Persona, ScheduledMail, TaskSpec
+from ..persistence.models import OutboxRow, Persona, ScheduledMail, Task, TaskSpec
 from ..persistence.repositories import Repositories
 from ..runtime.adapter_factory import AdapterFactory, model_name_for_provider
 from ..runtime.agent_loop import AgentLoop, AgentLoopResult
@@ -89,6 +89,26 @@ def _resolve_end_statuses(result: AgentLoopResult) -> tuple[str, str]:
     # populated (synthesised by the runtime when the agent didn't
     # declare). Treat as failed to keep the system honest.
     return "failed_unknown", "failed"
+
+
+# Tasks reach a terminal state in one of these three values; anything
+# else (pending / in_progress / needs_input) is still in-flight and
+# does NOT warrant a task_terminated mail.
+_TERMINAL_TASK_STATUSES: frozenset[str] = frozenset(
+    {"completed", "failed", "cancelled"}
+)
+
+
+# Urgency the supervisor sees the task_terminated mail with. blocker /
+# urgency=high means MailWatcher fires the mid-wakeup interrupt path,
+# so a busy supervisor sees a child failure immediately instead of on
+# its next idle wakeup. Successful completion is normal; cancellation
+# rides along at normal too — the supervisor decided it.
+_TASK_OUTCOME_URGENCY: dict[str, str] = {
+    "completed": "normal",
+    "failed":    "high",
+    "cancelled": "normal",
+}
 
 
 class Scheduler:
@@ -691,6 +711,159 @@ class Scheduler:
         # task still in `_active_subprocesses` won't double-spawn.
         self._active_subprocesses.pop(task_id, None)
 
+    async def _resolve_terminated_task_supervisor(
+        self, task: Task,
+    ) -> str | None:
+        """Find the agent that should receive a ``task_terminated`` mail
+        for ``task``. Returns the recipient ``agent_id`` or None when
+        even the owner fallback is unavailable.
+
+        Order of resolution (OTP `monitor` analogue):
+          1. ``parent_task_id`` is set → the parent task's executing
+             agent IS the supervisor. This is the structural link
+             produced by ``dispatch_task`` — the dispatcher implicitly
+             monitors anything it spawned.
+          2. Fallback to ``owner``. Top-level tasks (no parent) have
+             no in-system supervisor; the human owner is the
+             root-of-the-supervision-tree by default.
+
+        Archived parent agents fall through to the owner fallback so
+        a dead supervisor doesn't swallow failure signals.
+        """
+        if task.parent_task_id:
+            parent = await self.repos.tasks.get(task.parent_task_id)
+            if parent is not None and parent.agent_id:
+                parent_agent = await self.repos.agents.get(parent.agent_id)
+                if parent_agent is not None and parent_agent.status != "archived":
+                    return parent.agent_id
+        # Owner fallback. Verify the agent record exists — in a fresh
+        # test DB it might not, in which case we return None and the
+        # outbox enqueue is skipped (no recipient to deliver to).
+        owner = await self.repos.agents.get("owner")
+        if owner is not None and owner.status != "archived":
+            return "owner"
+        return None
+
+    async def _emit_task_terminated_mail(
+        self,
+        task: Task | None,
+        wakeup_id: str,
+        task_status: str,
+        *,
+        declared_summary: str | None,
+        declared_failure_reason: str | None,
+        declared_recoverable: bool | None,
+        transcript_uri: str | None,
+    ) -> None:
+        """Deliver a ``task_terminated`` mail to the supervising agent.
+
+        Lyre's OTP-monitor analogue (see brainstorm + WAKEUP_END_CONTRACT
+        §11 follow-ups). At end-of-wakeup, when the task reaches a
+        terminal state, the scheduler synthesises a mail and enqueues
+        it via the standard outbox path — same delivery mechanism as
+        any agent-to-agent send, so durability + idempotency + Phase-0
+        auto-wake all work uniformly.
+
+        Idempotency: external_id is ``task_terminated:<task_id>``. If
+        the task somehow terminates twice (shouldn't happen, but
+        belt-and-suspenders for retries), the outbox dispatcher's
+        UNIQUE-on-external_id constraint at the mailbox layer drops
+        the duplicate silently.
+        """
+        if task is None:
+            # Exception path may catch before the task re-fetch lands.
+            # Without a task row we can't resolve recipient or build a
+            # meaningful body, so silently skip — the wakeup row + DB
+            # transition still happened, dashboard will surface it.
+            return
+        if task_status not in _TERMINAL_TASK_STATUSES:
+            return  # awaiting / in_progress / pending — still in-flight
+
+        recipient = await self._resolve_terminated_task_supervisor(task)
+        if recipient is None:
+            log.warning(
+                "task_terminated_mail_no_recipient",
+                task_id=task.id,
+                outcome=task_status,
+            )
+            return
+
+        # The agent that ran the task is the conceptual sender — from
+        # the supervisor's perspective, "mail from worker-1 saying I
+        # died" reads naturally. Falls back to persona_name for
+        # pre-A3 tasks that never had an agent_id.
+        sender = task.agent_id or task.persona_name
+
+        urgency = _TASK_OUTCOME_URGENCY.get(task_status, "normal")
+        goal_preview = (task.goal or "").replace("\n", " ").strip()[:60]
+        title = f"[task-terminated:{task_status}] {goal_preview}"
+
+        body_lines: list[str] = [
+            f"task_id: {task.id}",
+            f"outcome: {task_status}",
+        ]
+        if declared_failure_reason:
+            body_lines.append(f"failure_reason: {declared_failure_reason}")
+        if declared_recoverable is not None:
+            body_lines.append(f"recoverable: {declared_recoverable}")
+        body_lines.append("")
+        body_lines.append(
+            f"summary: {declared_summary or '(no summary)'}"
+        )
+        if transcript_uri:
+            body_lines.append(f"transcript: {transcript_uri}")
+        body = "\n".join(body_lines)
+
+        # Structured payload — supervisor personas pattern-match on
+        # metadata.kind / metadata.failure_reason without parsing the
+        # body. Body is the human-readable fallback for inbox listings.
+        metadata: dict[str, Any] = {
+            "kind": "task_terminated",
+            "task_id": task.id,
+            "outcome": task_status,
+            "failure_reason": declared_failure_reason,
+            "recoverable": declared_recoverable,
+            "summary": declared_summary,
+            "transcript_uri": transcript_uri,
+            "parent_task_id": task.parent_task_id,
+        }
+
+        external_id = f"task_terminated:{task.id}"
+        payload = {
+            "recipient": recipient,
+            "sender": sender,
+            "urgency": urgency,
+            "title": title,
+            "body": body,
+            "task_id": task.id,
+            "external_id": external_id,
+            "parent_msg_id": None,
+            "broadcast_id": None,
+            "recipients_all": [recipient],
+            "metadata": metadata,
+            "attachments": None,
+        }
+        await self.repos.outbox.enqueue(
+            [
+                OutboxRow(
+                    task_id=task.id,
+                    wakeup_id=wakeup_id,
+                    kind="mailbox_send",
+                    payload=payload,
+                    external_id=external_id,
+                )
+            ]
+        )
+        log.info(
+            "task_terminated_mail_enqueued",
+            task_id=task.id,
+            outcome=task_status,
+            recipient=recipient,
+            sender=sender,
+            failure_reason=declared_failure_reason,
+            urgency=urgency,
+        )
+
     async def _run_task_inline(self, task_id: str) -> None:
         task = await self.repos.tasks.get(task_id)
         if task is None:
@@ -935,6 +1108,18 @@ class Scheduler:
                 recoverable=result.declared_recoverable,
             )
             await self.repos.tasks.update_status(task_id, task_status)
+            # task_terminated mail: OTP-monitor analogue, delivered to
+            # the parent task's agent (or owner fallback). Fires only
+            # on terminal transitions — awaiting/yielded don't qualify.
+            await self._emit_task_terminated_mail(
+                task=task,
+                wakeup_id=wakeup_id,
+                task_status=task_status,
+                declared_summary=result.declared_summary,
+                declared_failure_reason=result.declared_failure_reason,
+                declared_recoverable=result.declared_recoverable,
+                transcript_uri=transcript.uri,
+            )
             succeeded = task_status == "completed"
             log.info(
                 "task_done",
@@ -975,6 +1160,21 @@ class Scheduler:
                 recoverable=False,
             )
             await self.repos.tasks.update_status(task_id, "failed")
+            # task_terminated notification still fires — the exception
+            # is exactly the kind of "sudden failed 没人知道" event we
+            # want the supervisor (or owner) to see immediately.
+            await self._emit_task_terminated_mail(
+                task=task,
+                wakeup_id=wakeup_id,
+                task_status="failed",
+                declared_summary=(
+                    f"runtime exception in agent loop: "
+                    f"{type(e).__name__}: {e}"
+                ),
+                declared_failure_reason="tool_error",
+                declared_recoverable=False,
+                transcript_uri=None,
+            )
         finally:
             # Simulated process death (Q5 chaos test): if a SimulatedKill is
             # propagating, real process would already be dead and no `finally`
