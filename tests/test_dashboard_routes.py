@@ -20,7 +20,7 @@ from lyre.dashboard import MailboxBroadcaster, create_app
 from lyre.persistence.db import init_db
 from lyre.persistence.models import MailboxMessage, TaskSpec
 from lyre.persistence.sqlite_impl import SqliteRepositories
-from lyre.personas.seed import seed_personas
+from lyre.personas.seed import ensure_user_personas
 
 
 @pytest_asyncio.fixture
@@ -32,9 +32,10 @@ async def seeded_dashboard(
     db = tmp_path / "lyre.db"
     obj = tmp_path / "objstore"
     obj.mkdir(parents=True)
+    personas_dir = tmp_path / "personas"
+    ensure_user_personas(personas_dir)
     conn = await init_db(db)
-    repos = SqliteRepositories(conn)
-    await seed_personas(repos.personas)
+    repos = SqliteRepositories(conn, personas_dir=personas_dir)
     # Post-A3: dashboard send-form validates recipient against agents.
     # Seed an agent for each persona (id == persona name) so existing
     # CLI/dashboard usage like `send dispatcher "..."` keeps working.
@@ -319,15 +320,16 @@ def test_agent_detail_surfaces_assistant_text_from_completed_wakeup(
     from lyre.persistence.db import init_db
     from lyre.persistence.models import TaskSpec
     from lyre.persistence.sqlite_impl import SqliteRepositories
-    from lyre.personas.seed import seed_personas
+    from lyre.personas.seed import ensure_user_personas
 
     async def _setup():
         db = tmp_path / "lyre.db"
         obj = tmp_path / "objstore"
         obj.mkdir(parents=True)
+        personas_dir = tmp_path / "personas"
+        ensure_user_personas(personas_dir)
         conn = await init_db(db)
-        repos = SqliteRepositories(conn)
-        await seed_personas(repos.personas)
+        repos = SqliteRepositories(conn, personas_dir=personas_dir)
         for p in await repos.personas.list_active():
             await repos.agents.create(agent_id=p.name, persona_name=p.name)
         await repos.mailbox.ensure_mailbox("owner")

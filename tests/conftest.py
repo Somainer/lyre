@@ -20,9 +20,14 @@ from lyre.persistence.sqlite_impl import SqliteRepositories
 @pytest_asyncio.fixture
 async def repos(tmp_path: Path) -> AsyncIterator[SqliteRepositories]:
     db_path = tmp_path / "lyre-test.db"
+    # Personas live on disk now (FilesystemPersonaRepository). A per-test
+    # tmp dir keeps writes isolated; tests that need pre-seeded personas
+    # use `ensure_user_personas(personas_dir)` to copy the shipped ones in.
+    personas_dir = tmp_path / "personas"
+    personas_dir.mkdir(exist_ok=True)
     conn = await init_db(db_path)
     try:
-        yield SqliteRepositories(conn)
+        yield SqliteRepositories(conn, personas_dir=personas_dir)
     finally:
         await conn.close()
 

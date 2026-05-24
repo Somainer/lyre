@@ -65,7 +65,7 @@
 | Tab | 触发时机 |
 |---|---|
 | **Costs** | Q7 解冻——预算控制纳入 MVP 之后 |
-| **Personas** | 当前 personas 表清单 + 各 persona 的 system_prompt 预览（编辑由文件直接做：仓库内 shipped 或 ~/.lyre/personas/<name>.md 覆盖）|
+| **Personas** | 当前已注册 persona 清单（从 ~/.lyre/personas/<name>/identity.md walk 出来；filesystem 是 SSOT）+ 各 persona 的 system_prompt 预览 |
 | **Skills** | 已批准 / 已弃用列表 + diff 查看 |
 | **Model Health** | Q9 引入的 HealthTracker / Router 状态可视化（断路器状态、最近 5min 失败率） |
 

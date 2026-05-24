@@ -60,7 +60,7 @@
 
 ## 3. 每个 Persona 的 starter prompt
 
-> 这些是**模板**，owner 可在 personas 表里改写。每个 prompt 都假设 context 装配会注入 owner identity（`~/.lyre/user.md`）、available_skills frontmatters、hosting-specific notes、tier policy summary。
+> 这些是**模板**，owner 可在 `~/.lyre/personas/<name>/identity.md` 里直接改写（SSOT；详见 §8.3）。每个 prompt 都假设 context 装配会注入 owner identity（`~/.lyre/user.md`）、available_skills frontmatters、hosting-specific notes、tier policy summary。
 
 ### 3.1 `leader`
 
@@ -261,7 +261,7 @@ worker ─propose_persona(
     system_prompt="...",
     allowed_lyre_tools=[...]
   )
-  → personas 表插一行 status='proposed', proposed_by_task_id=current_task_id
+  → 写一个 ~/.lyre/personas/<name>/identity.md，frontmatter 含 status: proposed + proposed_by_task_id
   → outbox 派生通知到 leader mailbox（persona 比 skill 重要，leader 先看）
 leader 评估
   → 如果合理 → approve_persona(persona_id, status='approved')
@@ -449,7 +449,7 @@ worker-* 自荐
   ↓
 propose_persona(...)
   ↓
-personas 表插一行 status='proposed', proposed_by_task_id=...
+写 ~/.lyre/personas/<name>/identity.md（frontmatter 含 status: proposed + proposed_by_task_id）
 outbox 派生通知到 leader mailbox（不到 owner，先 leader 把关）
   ↓
 leader 唤醒，读 mailbox 看新 persona 提案
@@ -476,19 +476,29 @@ Persona 与 Skill 自荐流几乎对称——但 persona 比 skill **重得多**
 - Persona 草率引入可能造成"agent 团队膨胀、责任划分混乱"
 - 所以 reviewer 默认是 leader 而不是 reviewer-skill，且 leader 倾向把不确定的提案 escalate 给 owner
 
-### 8.3 Schema 改动
+### 8.3 文件布局（filesystem-only，无 DB schema）
 
-`personas` 表加：
+迁移 `0009_drop_personas_table.sql` 之后 personas 完全 filesystem-only：
+`~/.lyre/personas/<name>/identity.md` 的 YAML frontmatter 记录
+status / proposed_by_task_id / reviewer 等字段，`propose()` 写一个
+`status: proposed` 的新文件，`approve()` 原地改 frontmatter 翻转
+status。和 `~/.lyre/memory/skills/proposed/` ↔ `approved/` 完全同款。
 
-```sql
-ALTER TABLE personas ADD COLUMN status TEXT NOT NULL DEFAULT 'approved'
-  CHECK (status IN ('proposed','approved','deprecated'));
-ALTER TABLE personas ADD COLUMN proposed_by_task_id TEXT REFERENCES tasks(id);
-ALTER TABLE personas ADD COLUMN reviewer TEXT;
-ALTER TABLE personas ADD COLUMN reviewed_at TEXT;
+```yaml
+---
+name: web-researcher
+role_description: "researcher who pulls web content into structured notes"
+kind: spawn_only
+allowed_lyre_tools: [python_exec, mailbox_send, ...]
+model_preference: {tier: workhorse, requires: [tool_use]}
+status: proposed                              # proposed | approved | deprecated
+proposed_by_task_id: task-uuid-...
+reviewer: leader                              # 设置当 status 翻转后
+---
+你是 Lyre 的 web researcher……（系统提示词正文）
 ```
 
-已存在的 6 个 MVP persona 全部 `status='approved'`（不走自荐流）。
+已存在的 MVP persona 全部 `status: approved`（不走自荐流）。
 
 ---
 

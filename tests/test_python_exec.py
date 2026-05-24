@@ -185,8 +185,10 @@ def test_python_exec_registered_in_default_registry() -> None:
 async def test_worker_maintainer_persona_lists_python_exec_first(
     repos: SqliteRepositories,
 ) -> None:
-    from lyre.personas.seed import seed_personas
-    await seed_personas(repos.personas)
+    from lyre.persistence.fs_personas import FilesystemPersonaRepository
+    from lyre.personas.seed import ensure_user_personas
+    assert isinstance(repos.personas, FilesystemPersonaRepository)
+    ensure_user_personas(repos.personas.personas_dir)
     worker = await repos.personas.get("worker-maintainer")
     assert worker is not None
     tools = worker.allowed_lyre_tools

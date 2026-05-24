@@ -154,7 +154,6 @@ async def _seed_worker(repos: SqliteRepositories) -> None:
             model_preference={
                 "tier": "workhorse", "requires": ["tool_use"], "prefer": [],
             },
-            needs_worktree=True,
         )
     )
     await repos.mailbox.ensure_mailbox("owner")
@@ -172,7 +171,6 @@ async def _seed_dispatcher(repos: SqliteRepositories) -> None:
             model_preference={
                 "tier": "flagship", "requires": ["tool_use"], "prefer": [],
             },
-            needs_worktree=False,
         )
     )
     await repos.mailbox.ensure_mailbox("owner")

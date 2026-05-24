@@ -1,141 +1,90 @@
 """Tests for the WorktreeManager.
 
-Real ssh-keygen + ssh-agent + ssh-add are invoked. Skip if any tool is missing.
+After the worktree / git_context split, WorktreeManager is a pure
+tmpdir lifecycle — no SSH, no git, no clone. SSH + git provisioning
+moved to ``runtime.git_context.GitContextProvisioner`` (see
+``test_git_context.py``).
 """
 
 from __future__ import annotations
 
-import os
-import shutil
-import signal
 from pathlib import Path
 
 import pytest
 
-from lyre.runtime.worktree import (
-    WorktreeError,
-    WorktreeManager,
-    _parse_ssh_agent_output,
-)
-
-_HAVE_SSH = all(
-    shutil.which(t) is not None for t in ("ssh-keygen", "ssh-agent", "ssh-add", "git")
-)
-
-pytestmark = pytest.mark.skipif(
-    not _HAVE_SSH,
-    reason="ssh-keygen / ssh-agent / ssh-add / git not on PATH",
-)
+from lyre.runtime.worktree import WorktreeManager
 
 
-def test_parse_ssh_agent_output_handles_bash_format() -> None:
-    sample = (
-        b"SSH_AUTH_SOCK=/tmp/ssh-XYZ/agent.123; export SSH_AUTH_SOCK;\n"
-        b"SSH_AGENT_PID=42; export SSH_AGENT_PID;\n"
-        b"echo Agent pid 42;\n"
+@pytest.mark.asyncio
+async def test_prepare_creates_clean_tmpdir(tmp_path: Path) -> None:
+    """First call → fresh dir at ``<root>/<task_id>``, no SSH files,
+    no git, nothing — just an empty sandbox the worker can write into.
+    """
+    wm = WorktreeManager(root=tmp_path / "worktrees")
+    handle = await wm.prepare("t-1")
+
+    assert handle.task_id == "t-1"
+    assert handle.dir == tmp_path / "worktrees" / "t-1"
+    assert handle.dir.is_dir()
+    # Critical invariant: no SSH dir, no ssh-agent, no .git — the
+    # worktree is just a tmpdir until something (GitContextProvisioner
+    # or the worker itself) populates it.
+    assert not (handle.dir / ".ssh").exists()
+    assert not (handle.dir / ".git").exists()
+    assert list(handle.dir.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_prepare_is_idempotent_on_same_task_id(tmp_path: Path) -> None:
+    """Kill-restart safety: re-running prepare for the same task_id
+    reuses the existing dir (with whatever the previous wakeup wrote
+    into it) rather than wiping it."""
+    wm = WorktreeManager(root=tmp_path / "worktrees")
+    handle1 = await wm.prepare("t-1")
+    (handle1.dir / "midwork.txt").write_text("partial result", encoding="utf-8")
+
+    handle2 = await wm.prepare("t-1")
+    assert handle2.dir == handle1.dir
+    assert (handle2.dir / "midwork.txt").read_text(encoding="utf-8") == (
+        "partial result"
     )
-    sock, pid = _parse_ssh_agent_output(sample)
-    assert sock == "/tmp/ssh-XYZ/agent.123"
-    assert pid == 42
-
-
-def test_parse_ssh_agent_output_raises_on_garbage() -> None:
-    with pytest.raises(WorktreeError):
-        _parse_ssh_agent_output(b"nothing parseable here")
 
 
 @pytest.mark.asyncio
-async def test_prepare_creates_dir_keypair_and_agent(tmp_path: Path) -> None:
-    mgr = WorktreeManager(root=tmp_path)
-    handle = await mgr.prepare("task-abc")
-    try:
-        assert handle.dir.is_dir()
-        assert handle.dir.name == "task-abc"
-        assert handle.ssh_priv_key_path.exists()
-        # Public key is the standard ssh format.
-        assert handle.ssh_pub_key.startswith("ssh-ed25519 ")
-        assert "lyre/task-task-abc" in handle.ssh_pub_key
-        # Agent process is alive (signal 0 = check).
-        os.kill(handle.ssh_agent_pid, 0)
-        # Socket exists.
-        assert Path(handle.ssh_auth_sock).exists()
-    finally:
-        await mgr.cleanup(handle)
+async def test_cleanup_removes_dir(tmp_path: Path) -> None:
+    """Success path: ``remove_dir=True`` wipes the dir."""
+    wm = WorktreeManager(root=tmp_path / "worktrees")
+    handle = await wm.prepare("t-1")
+    (handle.dir / "scratch.txt").write_text("x", encoding="utf-8")
+    assert handle.dir.exists()
 
-
-@pytest.mark.asyncio
-async def test_cleanup_kills_agent_and_removes_dir(tmp_path: Path) -> None:
-    import asyncio as _asyncio
-
-    mgr = WorktreeManager(root=tmp_path)
-    handle = await mgr.prepare("task-1")
-    await mgr.cleanup(handle, remove_dir=True)
-
+    await wm.cleanup(handle, remove_dir=True)
     assert not handle.dir.exists()
-    # Agent shutdown after SIGTERM can take a moment on macOS. Poll up to 2s.
-    deadline = 2.0
-    interval = 0.05
-    elapsed = 0.0
-    dead = False
-    while elapsed < deadline:
-        try:
-            os.kill(handle.ssh_agent_pid, 0)
-        except ProcessLookupError:
-            dead = True
-            break
-        await _asyncio.sleep(interval)
-        elapsed += interval
-    assert dead, f"ssh-agent pid {handle.ssh_agent_pid} still alive after {deadline}s"
 
 
 @pytest.mark.asyncio
 async def test_cleanup_keeps_dir_when_remove_dir_false(tmp_path: Path) -> None:
-    mgr = WorktreeManager(root=tmp_path)
-    handle = await mgr.prepare("task-keep")
-    await mgr.cleanup(handle, remove_dir=False)
+    """Failure path: ``remove_dir=False`` leaves the dir for postmortem."""
+    wm = WorktreeManager(root=tmp_path / "worktrees")
+    handle = await wm.prepare("t-1")
+    (handle.dir / "scratch.txt").write_text("x", encoding="utf-8")
+
+    await wm.cleanup(handle, remove_dir=False)
     assert handle.dir.exists()
-    assert handle.ssh_priv_key_path.exists()
+    assert (handle.dir / "scratch.txt").read_text(encoding="utf-8") == "x"
 
 
 @pytest.mark.asyncio
-async def test_prepare_reuses_existing_keypair_on_restart(tmp_path: Path) -> None:
-    """Q5: kill-restart should reuse the same keypair. We simulate by calling
-    prepare twice — the second call must NOT regenerate the key file."""
-    mgr = WorktreeManager(root=tmp_path)
-    h1 = await mgr.prepare("task-restart")
-    pub1 = h1.ssh_pub_key
-    # Mimic process death: kill agent, leave files.
-    os.kill(h1.ssh_agent_pid, signal.SIGTERM)
-    h2 = await mgr.prepare("task-restart")
-    try:
-        assert h2.ssh_pub_key == pub1, "keypair must be reused across restarts"
-        assert h2.ssh_agent_pid != h1.ssh_agent_pid, "new agent must be spawned"
-    finally:
-        await mgr.cleanup(h2)
+async def test_two_tasks_get_isolated_dirs(tmp_path: Path) -> None:
+    """Same WorktreeManager + two task_ids = two independent dirs.
+    Tasks must not be able to step on each other even if they're
+    running concurrent wakeups."""
+    wm = WorktreeManager(root=tmp_path / "worktrees")
+    h1 = await wm.prepare("t-1")
+    h2 = await wm.prepare("t-2")
 
-
-@pytest.mark.asyncio
-async def test_two_tasks_get_isolated_dirs_and_agents(tmp_path: Path) -> None:
-    mgr = WorktreeManager(root=tmp_path)
-    h1 = await mgr.prepare("task-a")
-    h2 = await mgr.prepare("task-b")
-    try:
-        assert h1.dir != h2.dir
-        assert h1.ssh_auth_sock != h2.ssh_auth_sock
-        assert h1.ssh_agent_pid != h2.ssh_agent_pid
-        assert h1.ssh_pub_key != h2.ssh_pub_key
-    finally:
-        await mgr.cleanup(h1)
-        await mgr.cleanup(h2)
-
-
-@pytest.mark.asyncio
-async def test_env_overlay_carries_auth_sock_and_pid(tmp_path: Path) -> None:
-    mgr = WorktreeManager(root=tmp_path)
-    h = await mgr.prepare("task-env")
-    try:
-        overlay = h.env_overlay()
-        assert overlay["SSH_AUTH_SOCK"] == h.ssh_auth_sock
-        assert overlay["SSH_AGENT_PID"] == str(h.ssh_agent_pid)
-    finally:
-        await mgr.cleanup(h)
+    assert h1.dir != h2.dir
+    (h1.dir / "a.txt").write_text("one", encoding="utf-8")
+    (h2.dir / "a.txt").write_text("two", encoding="utf-8")
+    assert (h1.dir / "a.txt").read_text(encoding="utf-8") == "one"
+    assert (h2.dir / "a.txt").read_text(encoding="utf-8") == "two"

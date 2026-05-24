@@ -174,35 +174,32 @@ CREATE INDEX outbox_undispatched ON outbox(created_at);
 -- PG: CREATE INDEX outbox_undispatched ON outbox(created_at) WHERE dispatched_at IS NULL;
 ```
 
-### 3.3 Persona 配置组：`personas`
+### 3.3 Persona 配置：filesystem-only (no DB table)
 
-```sql
--- Persona 定义（global，跨任务共享）
--- 支持动态 persona 自荐（propose_persona）；详见 PERSONAS.md §8
-CREATE TABLE personas (
-  name                 TEXT PRIMARY KEY,                -- 'leader' / 'worker-maintainer' / ...
-  role_description     TEXT NOT NULL,
-  system_prompt        TEXT NOT NULL,
-  allowed_lyre_tools   TEXT NOT NULL DEFAULT '[]',      -- JSON array of tool names
-  model_preference     TEXT,                            -- JSON {tier, requires, prefer}
-  needs_worktree       INTEGER NOT NULL DEFAULT 1,      -- 0/1。leader-persona 通常 0
-  status               TEXT NOT NULL DEFAULT 'approved' -- 'proposed' / 'approved' / 'deprecated'
-                       CHECK (status IN ('proposed','approved','deprecated')),
-  proposed_by_task_id  TEXT REFERENCES tasks(id),
-  reviewer             TEXT,                            -- 审定 persona name 或 'owner'
-  reviewed_at          TEXT,
-  metadata             TEXT,                            -- JSON
-  created_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-  updated_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-);
-CREATE INDEX personas_status ON personas(status);
+Persona 定义不再有 DB 表。 SSOT 是 `~/.lyre/personas/<name>/identity.md`
+（YAML frontmatter + 系统提示词正文），由
+`FilesystemPersonaRepository` 直接 walk 该目录读取。
 
--- 约定：'owner' 这一行需要有对应的 personas 行（即使 owner 不是 LLM agent）
--- INSERT INTO personas (name, role_description, system_prompt, needs_worktree)
---   VALUES ('owner', '背后有人的 actor', '', 0);
+```
+~/.lyre/personas/
+├── leader/
+│   ├── identity.md          # frontmatter (name/kind/allowed_lyre_tools/
+│   │                        #              model_preference/status/...) + body
+│   └── APPEND.md            # 可选：owner 注入的额外语气/风格
+├── worker-maintainer/
+│   └── identity.md
+└── ...
 ```
 
-> **Owner identity 不在 DB**。`~/.lyre/user.md` 是用户独写的文件，不再走 `persona_profiles` 表。其他 persona 也不再有"长期档案"概念——agent 想记录跨 wakeup 信息就写自己的 `~/.lyre/memory/facts/agent-<id>-notes.md`。
+迁移 `0009_drop_personas_table.sql` 删掉旧的 `personas` 表并把
+`agents.persona_name` / `tasks.persona_name` / `wakeups.persona_name`
+的 FK 也一并去掉（runtime 仍然用 persona_name 字符串去查文件，但 DB
+不再约束它必须命中某一行）。
+
+> **Owner identity 不在 DB**。`~/.lyre/user.md` 是用户独写的文件——
+> 其他 persona 也是同款模式（owner-curated markdown，runtime 只读不
+> 写）；agent 想记录跨 wakeup 信息就写自己的
+> `~/.lyre/memory/facts/agent-<id>-notes.md`。
 
 ### 3.4 Memory 组：`local_hot` / `artifacts` / `skills`
 

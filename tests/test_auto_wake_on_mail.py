@@ -46,7 +46,6 @@ async def _seed_dispatcher(repos: SqliteRepositories) -> None:
             model_preference={
                 "tier": "flagship", "requires": ["tool_use"], "prefer": [],
             },
-            needs_worktree=False,
         )
     )
     # Post-A3: Phase 0 iterates agents, not personas.
@@ -455,7 +454,6 @@ async def test_unread_mail_to_dispatcher_does_not_auto_wake_worker(
             model_preference={
                 "tier": "workhorse", "requires": ["tool_use"], "prefer": [],
             },
-            needs_worktree=False,
         )
     )
     await repos.agents.create(
@@ -490,7 +488,7 @@ async def test_owner_persona_never_auto_woken(
     # Seed an owner persona
     await repos.personas.upsert(
         Persona(name="owner", role_description="o", system_prompt="o",
-                model_preference=None, needs_worktree=False)
+                model_preference=None)
     )
     await repos.mailbox.insert_message(
         MailboxMessage(

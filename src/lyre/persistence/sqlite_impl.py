@@ -9,21 +9,24 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import time
 import uuid as _uuid
 from datetime import datetime
-from typing import Any
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 import aiosqlite
 
+from .fs_personas import FilesystemPersonaRepository
 from .models import (
     Agent,
     Artifact,
     Blob,
+    GitContext,
     MailboxMessage,
     MailReaction,
     OutboxRow,
-    Persona,
     ScheduledMail,
     Skill,
     Task,
@@ -43,6 +46,9 @@ from .repositories import (
     TaskRepository,
     WakeupRepository,
 )
+
+if TYPE_CHECKING:
+    from ..config import PersonaOverride
 
 
 def _uuid7() -> str:
@@ -120,134 +126,11 @@ def _parse_json(value: Any) -> Any:
 
 
 # -----------------------------------------------------------------------
-# Persona
+# Persona — the SQLite implementation was deleted in migration 0009.
+# Personas are filesystem-only (~/.lyre/personas/<name>/identity.md),
+# served via ``lyre.persistence.fs_personas.FilesystemPersonaRepository``,
+# which ``SqliteRepositories`` instantiates below.
 # -----------------------------------------------------------------------
-class SqlitePersonaRepository:
-    def __init__(self, conn: aiosqlite.Connection):
-        self.conn = conn
-
-    async def get(self, name: str) -> Persona | None:
-        async with self.conn.execute(
-            "SELECT * FROM personas WHERE name = ?", (name,)
-        ) as cur:
-            row = await cur.fetchone()
-        if not row:
-            return None
-        return self._row_to_persona(row)
-
-    async def list_active(self, status: str = "approved") -> list[Persona]:
-        async with self.conn.execute(
-            "SELECT * FROM personas WHERE status = ?", (status,)
-        ) as cur:
-            rows = await cur.fetchall()
-        return [self._row_to_persona(r) for r in rows]
-
-    async def upsert(self, persona: Persona) -> None:
-        await self.conn.execute(
-            """
-            INSERT INTO personas (
-              name, display_name, kind,
-              role_description, system_prompt, allowed_lyre_tools,
-              model_preference, needs_worktree, status, metadata
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(name) DO UPDATE SET
-              display_name     = excluded.display_name,
-              kind             = excluded.kind,
-              role_description = excluded.role_description,
-              system_prompt    = excluded.system_prompt,
-              allowed_lyre_tools = excluded.allowed_lyre_tools,
-              model_preference = excluded.model_preference,
-              needs_worktree   = excluded.needs_worktree,
-              status           = excluded.status,
-              metadata         = excluded.metadata,
-              updated_at       = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-            """,
-            (
-                persona.name,
-                persona.display_name,
-                persona.kind,
-                persona.role_description,
-                persona.system_prompt,
-                json.dumps(persona.allowed_lyre_tools),
-                _json(persona.model_preference),
-                1 if persona.needs_worktree else 0,
-                persona.status,
-                _json(persona.metadata),
-            ),
-        )
-        await self.conn.commit()
-
-    async def propose(
-        self,
-        name: str,
-        role_description: str,
-        system_prompt: str,
-        allowed_lyre_tools: list[str],
-        source_task_id: str,
-        **kwargs: Any,
-    ) -> None:
-        await self.conn.execute(
-            """
-            INSERT INTO personas (
-              name, role_description, system_prompt, allowed_lyre_tools,
-              model_preference, needs_worktree, status, proposed_by_task_id, metadata
-            ) VALUES (?, ?, ?, ?, ?, ?, 'proposed', ?, ?)
-            """,
-            (
-                name,
-                role_description,
-                system_prompt,
-                json.dumps(allowed_lyre_tools),
-                _json(kwargs.get("model_preference")),
-                1 if kwargs.get("needs_worktree", True) else 0,
-                source_task_id,
-                _json(kwargs.get("metadata")),
-            ),
-        )
-        await self.conn.commit()
-
-    async def approve(
-        self,
-        persona_name: str,
-        reviewer: str,
-        status: str,
-        comment: str | None = None,
-    ) -> None:
-        await self.conn.execute(
-            """
-            UPDATE personas SET status = ?, reviewer = ?, reviewed_at = ?,
-                                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-            WHERE name = ?
-            """,
-            (status, reviewer, _now_iso(), persona_name),
-        )
-        await self.conn.commit()
-
-    @staticmethod
-    def _row_to_persona(row: aiosqlite.Row) -> Persona:
-        keys = set(row.keys())
-        # display_name / kind columns added in migration 0006 — NULL on
-        # pre-0006 rows. The Persona model handles those defaults
-        # (display_name → None → label falls back to name; kind → "spawn_only").
-        return Persona(
-            name=row["name"],
-            display_name=(
-                row["display_name"] if "display_name" in keys else None
-            ),
-            kind=(
-                (row["kind"] or "spawn_only") if "kind" in keys
-                else "spawn_only"
-            ),
-            role_description=row["role_description"],
-            system_prompt=row["system_prompt"],
-            allowed_lyre_tools=_parse_json(row["allowed_lyre_tools"]) or [],
-            model_preference=_parse_json(row["model_preference"]),
-            needs_worktree=bool(row["needs_worktree"]),
-            status=row["status"],
-            proposed_by_task_id=row["proposed_by_task_id"],
-            reviewer=row["reviewer"],
-            metadata=_parse_json(row["metadata"]),
-        )
 
 
 # -----------------------------------------------------------------------
@@ -397,12 +280,16 @@ class SqliteTaskRepository:
         # for callers that haven't migrated. dispatch_task and Phase 0 will
         # populate agent_id once their plumbing is updated.
 
+        git_ctx_json = (
+            spec.git_context.model_dump_json() if spec.git_context else None
+        )
         await self.conn.execute(
             """
             INSERT INTO tasks (
               id, parent_task_id, agent_id, persona_name, goal, acceptance,
-              status, lease_duration_s, tier_overrides, deadline, metadata
-            ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)
+              status, lease_duration_s, tier_overrides, deadline, metadata,
+              git_context
+            ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -415,6 +302,7 @@ class SqliteTaskRepository:
                 _json(spec.tier_overrides),
                 spec.deadline.isoformat() if spec.deadline else None,
                 _json(spec.metadata),
+                git_ctx_json,
             ),
         )
         await self.conn.commit()
@@ -620,6 +508,7 @@ class SqliteTaskRepository:
     @staticmethod
     def _row_to_task(row: aiosqlite.Row) -> Task:
         # agent_id is a new (nullable) column from migration 0003.
+        # git_context is a new (nullable) column from migration 0008.
         # SQLite's Row.keys() doesn't expose missing columns; trying to read
         # them raises IndexError. Guard so callers on a pre-0003 schema
         # (notably test fixtures that mocked rows) don't crash.
@@ -627,6 +516,15 @@ class SqliteTaskRepository:
             agent_id = row["agent_id"]
         except (KeyError, IndexError):
             agent_id = None
+        git_ctx_raw: str | None
+        try:
+            git_ctx_raw = row["git_context"]
+        except (KeyError, IndexError):
+            git_ctx_raw = None
+        git_ctx = (
+            GitContext.model_validate_json(git_ctx_raw)
+            if git_ctx_raw else None
+        )
         return Task(
             id=row["id"],
             parent_task_id=row["parent_task_id"],
@@ -640,6 +538,7 @@ class SqliteTaskRepository:
             checkpoint=_parse_json(row["checkpoint"]),
             tier_overrides=_parse_json(row["tier_overrides"]),
             metadata=_parse_json(row["metadata"]),
+            git_context=git_ctx,
         )
 
 
@@ -1751,9 +1650,34 @@ class SqliteRepositories:
     local_hot: LocalHotRepository
     blobs: BlobRepository
 
-    def __init__(self, conn: aiosqlite.Connection):
+    def __init__(
+        self,
+        conn: aiosqlite.Connection,
+        *,
+        personas_dir: Path | None = None,
+        persona_overrides: dict[str, PersonaOverride] | None = None,
+    ):
+        """``personas_dir`` is the filesystem root for persona definitions
+        (``~/.lyre/personas/`` in production; a tmp dir in most tests).
+        When omitted, a fresh writable tempdir is allocated so tests that
+        construct ``SqliteRepositories(conn)`` without thinking about
+        personas can still ``upsert`` / ``list_active`` against it.
+
+        ``persona_overrides`` overlays single fields from ``config.toml
+        [personas.<name>]`` on every persona read (model_preference,
+        allowed_lyre_tools). Identity.md remains the SSOT for everything
+        else.
+        """
         self.conn = conn
-        self.personas = SqlitePersonaRepository(conn)
+        # No personas_dir → allocate one. ``mkdtemp`` returns a writable
+        # path so ``upsert`` works; the dir is small and gets reaped with
+        # /tmp eventually. Production paths (main.py, onboard.py) always
+        # pass an explicit ``personas_dir``.
+        if personas_dir is None:
+            personas_dir = Path(tempfile.mkdtemp(prefix="lyre-personas-"))
+        self.personas = FilesystemPersonaRepository(
+            personas_dir, persona_overrides=persona_overrides,
+        )
         self.agents = SqliteAgentRepository(conn)
         self.tasks = SqliteTaskRepository(conn)
         self.wakeups = SqliteWakeupRepository(conn)

@@ -1,38 +1,33 @@
--- Lyre initial schema
+-- Lyre initial schema (single-file baseline).
 -- See docs/design/PERSISTENCE_SCHEMA.md for design and Postgres equivalents.
--- This file is idempotent (CREATE TABLE IF NOT EXISTS) so it can be re-run safely.
+-- Idempotent (CREATE TABLE IF NOT EXISTS) so it's safe to re-run.
+--
+-- Note: there's no `personas` table. Personas live entirely on disk at
+-- ``~/.lyre/personas/<name>/identity.md`` and are served via
+-- ``lyre.persistence.fs_personas.FilesystemPersonaRepository``. Tables
+-- below that store a ``persona_name`` keep it as a plain TEXT column —
+-- no FK, no cascade.
 
 ------------------------------------------------------------
--- Personas (global)
+-- Mailboxes (referenced by mailbox_messages)
 ------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS personas (
-  name                 TEXT PRIMARY KEY,
-  role_description     TEXT NOT NULL,
-  system_prompt        TEXT NOT NULL,
-  allowed_lyre_tools   TEXT NOT NULL DEFAULT '[]',
-  model_preference     TEXT,  -- JSON with tier/requires/prefer
-  needs_worktree       INTEGER NOT NULL DEFAULT 1,
-  status               TEXT NOT NULL DEFAULT 'approved'
-                       CHECK (status IN ('proposed','approved','deprecated')),
-  proposed_by_task_id  TEXT,
-  reviewer             TEXT,
-  reviewed_at          TEXT,
-  metadata             TEXT,
-  created_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-  updated_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+-- mailboxes.recipient is conceptually an agent_id. No hard FK because
+-- bootstrap order requires the `owner` mailbox before any agent exists.
+-- Tool-level validation in mailbox_send/read rejects unknown recipients.
+CREATE TABLE IF NOT EXISTS mailboxes (
+  recipient                TEXT PRIMARY KEY,
+  metadata                 TEXT
 );
-
-CREATE INDEX IF NOT EXISTS personas_status ON personas(status);
 
 ------------------------------------------------------------
 -- Agents (running instances of a persona)
 ------------------------------------------------------------
--- persona = role definition (the personas table; one md file)
+-- persona = role definition (markdown file on disk; see fs_personas.py)
 -- agent   = running instance with own identity, mailbox, task queue.
 --           Multiple agents can share one persona.
 CREATE TABLE IF NOT EXISTS agents (
   id                TEXT PRIMARY KEY,
-  persona_name      TEXT NOT NULL REFERENCES personas(name),
+  persona_name      TEXT NOT NULL,
   status            TEXT NOT NULL DEFAULT 'idle'
                     CHECK (status IN ('idle','busy','archived')),
   -- parent_agent_id: the agent that spawned this one (or NULL for
@@ -54,7 +49,7 @@ CREATE INDEX IF NOT EXISTS agents_parent ON agents(parent_agent_id);
 CREATE TABLE IF NOT EXISTS tasks (
   id                TEXT PRIMARY KEY,
   parent_task_id    TEXT REFERENCES tasks(id),
-  persona_name      TEXT NOT NULL REFERENCES personas(name),
+  persona_name      TEXT NOT NULL,
   agent_id          TEXT REFERENCES agents(id),
   goal              TEXT NOT NULL,
   acceptance        TEXT NOT NULL,
@@ -68,6 +63,10 @@ CREATE TABLE IF NOT EXISTS tasks (
   tier_overrides    TEXT,
   deadline          TEXT,
   metadata          TEXT,
+  -- Optional per-task git working copy. JSON-encoded GitContext
+  -- (repo_url / base_branch / target_branch). NULL means the worker
+  -- gets a clean tmpdir sandbox without any git provisioning.
+  git_context       TEXT,
   created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   updated_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   completed_at      TEXT
@@ -92,7 +91,7 @@ CREATE INDEX IF NOT EXISTS tasks_completed
 CREATE TABLE IF NOT EXISTS wakeups (
   id                    TEXT PRIMARY KEY,
   task_id               TEXT NOT NULL REFERENCES tasks(id),
-  persona_name          TEXT NOT NULL REFERENCES personas(name),
+  persona_name          TEXT NOT NULL,
   agent_id              TEXT REFERENCES agents(id),
   started_at            TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   ended_at              TEXT,
@@ -109,8 +108,8 @@ CREATE TABLE IF NOT EXISTS wakeups (
   -- resends the full message list, so per-turn input_tokens equals the
   -- running context size — this column captures the max.
   context_peak_tokens   INTEGER,
-  -- Number of mid-wakeup auto-compactions (>0 means we crossed the threshold
-  -- at least once).
+  -- Number of mid-wakeup auto-compactions (>0 means we crossed the
+  -- threshold at least once).
   compaction_count      INTEGER NOT NULL DEFAULT 0
 );
 
@@ -123,24 +122,14 @@ CREATE INDEX IF NOT EXISTS wakeups_agent ON wakeups(agent_id, started_at);
 --   * list_recent / list_since / sum_tokens_since / MAX(started_at) /
 --     ORDER BY started_at DESC — covered by an outright started_at index.
 --   * MAX(ended_at) in the broadcaster snapshot — ended index.
--- Without these, py-spy showed the dashboard pegged 28/28s inside the
--- aiosqlite worker thread doing full table scans on wakeups.
 CREATE INDEX IF NOT EXISTS wakeups_active ON wakeups(started_at)
   WHERE ended_at IS NULL;
 CREATE INDEX IF NOT EXISTS wakeups_started ON wakeups(started_at);
 CREATE INDEX IF NOT EXISTS wakeups_ended ON wakeups(ended_at);
 
 ------------------------------------------------------------
--- Mailboxes + messages + outbox
+-- Mailbox messages + outbox + scheduled mail
 ------------------------------------------------------------
--- mailboxes.recipient is conceptually an agent_id. No hard FK because
--- bootstrap order requires the `owner` mailbox before any agent exists.
--- Tool-level validation in mailbox_send/read rejects unknown recipients.
-CREATE TABLE IF NOT EXISTS mailboxes (
-  recipient                TEXT PRIMARY KEY,
-  metadata                 TEXT
-);
-
 CREATE TABLE IF NOT EXISTS mailbox_messages (
   id              INTEGER PRIMARY KEY AUTOINCREMENT,
   recipient       TEXT NOT NULL REFERENCES mailboxes(recipient),
@@ -152,6 +141,9 @@ CREATE TABLE IF NOT EXISTS mailbox_messages (
   --   first non-empty line of body truncated to 140 char.
   title           TEXT,
   body            TEXT NOT NULL,
+  -- JSON list of multimodal attachment descriptors (image / document
+  -- blob_ids resolved at send time by adapters). NULL for plain-text mail.
+  attachments     TEXT,
   task_id         TEXT REFERENCES tasks(id),
   parent_msg_id   INTEGER REFERENCES mailbox_messages(id),
   -- Broadcast: broadcast_id groups copies of one multi-recipient send;
@@ -174,26 +166,40 @@ CREATE INDEX IF NOT EXISTS mailbox_messages_unread
 -- read_messages_paged + read_messages share the shape
 --   WHERE recipient = ? [AND id <|> ?] ORDER BY id [DESC|ASC] LIMIT ?
 -- The composite (recipient, urgency, id) index above CAN'T short-circuit
--- that ordering — for a single recipient its entries are sorted by
--- (urgency, id), so SQLite has to pull every row for the recipient and
--- sort in memory to pick the top N by id. On a busy mailbox this is
--- the hottest path on the Mail page (and the MailboxBroadcaster poll).
--- A plain (recipient, id) index lets SQLite reverse-scan and stop at
--- LIMIT, which is what we want.
+-- that ordering — a plain (recipient, id) index lets SQLite reverse-scan
+-- and stop at LIMIT.
 CREATE INDEX IF NOT EXISTS mailbox_messages_recipient_id
   ON mailbox_messages(recipient, id);
 -- read_recent_for_audit and Activity-builder span all recipients
--- filtered by delivered_at >= cutoff. Without this it was a full
--- table scan every Home / Activity render.
+-- filtered by delivered_at >= cutoff.
 CREATE INDEX IF NOT EXISTS mailbox_messages_delivered
   ON mailbox_messages(delivered_at);
 
+-- Reactions: lightweight ack channel that doesn't generate a new
+-- mailbox_messages row. Lyre tracks the (msg, reactor) tuple so a
+-- recipient can "read & acknowledge" without writing prose back.
+CREATE TABLE IF NOT EXISTS mail_reactions (
+  msg_id       INTEGER NOT NULL REFERENCES mailbox_messages(id),
+  reactor      TEXT NOT NULL REFERENCES agents(id),
+  kind         TEXT NOT NULL CHECK (kind IN ('ack')),
+  created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  PRIMARY KEY (msg_id, reactor, kind)
+);
+
+CREATE INDEX IF NOT EXISTS mail_reactions_msg_id
+  ON mail_reactions(msg_id, created_at);
+
+-- Outbox: agent → mailbox_messages with at-least-once delivery via the
+-- async dispatcher. task_id / wakeup_id are nullable so out-of-band
+-- enqueues (channel webhooks, CLI sends) can flow through the same
+-- pipe without inventing fake tasks.
 CREATE TABLE IF NOT EXISTS outbox (
   id                 INTEGER PRIMARY KEY AUTOINCREMENT,
-  task_id            TEXT NOT NULL REFERENCES tasks(id),
-  wakeup_id          TEXT NOT NULL REFERENCES wakeups(id),
+  task_id            TEXT REFERENCES tasks(id),
+  wakeup_id          TEXT REFERENCES wakeups(id),
   kind               TEXT NOT NULL CHECK (kind IN
-                       ('mailbox_send','tier1_notification')),
+                       ('mailbox_send','tier1_notification',
+                        'channel_publish','channel_reaction_publish')),
   payload            TEXT NOT NULL,
   external_id        TEXT NOT NULL,
   created_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
@@ -206,9 +212,7 @@ CREATE TABLE IF NOT EXISTS outbox (
 CREATE INDEX IF NOT EXISTS outbox_undispatched ON outbox(created_at)
   WHERE dispatched_at IS NULL;
 
-------------------------------------------------------------
--- Scheduled mail (future mail / cron)
-------------------------------------------------------------
+-- Scheduled mail (future mail / cron).
 -- Lifecycle:
 --   pending    — scheduled_for is in the future; scheduler tick delivers when due
 --   completed  — delivered (and, for recurring, no more occurrences in window)
@@ -255,7 +259,7 @@ CREATE INDEX IF NOT EXISTS scheduled_mail_creator
   ON scheduled_mail(created_by_agent, status);
 
 ------------------------------------------------------------
--- Local-hot, Artifacts, Skills
+-- Local-hot, Artifacts, Skills, Blobs
 ------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS local_hot (
   task_id      TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -300,8 +304,27 @@ CREATE TABLE IF NOT EXISTS skills (
 CREATE INDEX IF NOT EXISTS skills_status ON skills(status);
 CREATE INDEX IF NOT EXISTS skills_scope ON skills(scope, status);
 
+-- Blob registry: multimodal attachments (images, PDFs, ...) the dashboard
+-- uploads and adapters resolve at send time. Bytes live in the object
+-- store; this table is the metadata index.
+CREATE TABLE IF NOT EXISTS blobs (
+  id           TEXT PRIMARY KEY,         -- sha256 hex of the file contents
+  media_type   TEXT NOT NULL,            -- e.g. 'image/png', 'application/pdf'
+  size_bytes   INTEGER NOT NULL,
+  -- Original filename when uploaded via dashboard. Optional, no semantic
+  -- meaning — just preserved for human display ("screenshot.png" beats
+  -- raw hash in a mail-detail page). NULL for blobs that arrive without
+  -- a filename (tool returns, future cases).
+  filename     TEXT,
+  -- Who originated this blob — same shape as mailbox.sender / agent.id.
+  source       TEXT NOT NULL,
+  created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
+CREATE INDEX IF NOT EXISTS blobs_created ON blobs(created_at);
+
 ------------------------------------------------------------
--- Schema version (for future migrations)
+-- Schema version
 ------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS schema_migrations (
   version    INTEGER PRIMARY KEY,

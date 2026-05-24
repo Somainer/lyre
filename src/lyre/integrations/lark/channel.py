@@ -446,12 +446,22 @@ class LarkChannel:
         Lark. Returns the new Lark message id (text post) so the
         outbox dispatcher records it on metadata; the image posts
         (one per attachment) are not threaded back to Lyre — they
-        ride alongside the text post in the same Lark thread."""
+        ride alongside the text post in the same Lark thread.
+
+        ``reply_to_external_id``: when set (it's the Lark
+        ``message_id`` of the parent mail's published post), we use
+        the ``/messages/:id/reply`` endpoint so the reply nests
+        under the parent in the owner's Lark client. Without this,
+        every agent reply showed up as a fresh top-level message
+        even though Lyre's own DB threaded them correctly via
+        ``parent_msg_id``."""
         from lark_oapi.api.im.v1 import (
             CreateImageRequest,
             CreateImageRequestBody,
             CreateMessageRequest,
             CreateMessageRequestBody,
+            ReplyMessageRequest,
+            ReplyMessageRequestBody,
         )
 
         # Compose the text body — prefix with the sender so owner
@@ -459,21 +469,38 @@ class LarkChannel:
         # as plaintext (the bot account doesn't render rich cards
         # in MVP; that's a follow-up).
         text_body = f"[{msg.sender}] {msg.body or ''}"
+        text_content = _json.dumps({"text": text_body})
+        text_uuid = f"lyre-mail-{msg.id}"  # SDK-side dedup token
 
-        text_req = (
-            CreateMessageRequest.builder()
-            .receive_id_type("open_id")
-            .request_body(
-                CreateMessageRequestBody.builder()
-                .receive_id(self.cfg.authorized_user_id)
-                .msg_type("text")
-                .content(_json.dumps({"text": text_body}))
-                .uuid(f"lyre-mail-{msg.id}")  # SDK-side dedup token
+        if reply_to_external_id is not None:
+            reply_req = (
+                ReplyMessageRequest.builder()
+                .message_id(reply_to_external_id)
+                .request_body(
+                    ReplyMessageRequestBody.builder()
+                    .msg_type("text")
+                    .content(text_content)
+                    .uuid(text_uuid)
+                    .build()
+                )
                 .build()
             )
-            .build()
-        )
-        text_resp = await self._api_client.im.v1.message.acreate(text_req)
+            text_resp = await self._api_client.im.v1.message.areply(reply_req)
+        else:
+            text_req = (
+                CreateMessageRequest.builder()
+                .receive_id_type("open_id")
+                .request_body(
+                    CreateMessageRequestBody.builder()
+                    .receive_id(self.cfg.authorized_user_id)
+                    .msg_type("text")
+                    .content(text_content)
+                    .uuid(text_uuid)
+                    .build()
+                )
+                .build()
+            )
+            text_resp = await self._api_client.im.v1.message.acreate(text_req)
         if not text_resp.success():
             raise RuntimeError(
                 f"Lark text post failed: code={text_resp.code} "
@@ -520,22 +547,39 @@ class LarkChannel:
                         code=up_resp.code, msg=up_resp.msg,
                     )
                     continue
-                img_req = (
-                    CreateMessageRequest.builder()
-                    .receive_id_type("open_id")
-                    .request_body(
-                        CreateMessageRequestBody.builder()
-                        .receive_id(self.cfg.authorized_user_id)
-                        .msg_type("image")
-                        .content(_json.dumps(
-                            {"image_key": up_resp.data.image_key},
-                        ))
-                        .uuid(f"lyre-mail-{msg.id}-img-{blob_id[:8]}")
+                img_content = _json.dumps(
+                    {"image_key": up_resp.data.image_key},
+                )
+                img_uuid = f"lyre-mail-{msg.id}-img-{blob_id[:8]}"
+                if reply_to_external_id is not None:
+                    img_req = (
+                        ReplyMessageRequest.builder()
+                        .message_id(reply_to_external_id)
+                        .request_body(
+                            ReplyMessageRequestBody.builder()
+                            .msg_type("image")
+                            .content(img_content)
+                            .uuid(img_uuid)
+                            .build()
+                        )
                         .build()
                     )
-                    .build()
-                )
-                img_resp = await self._api_client.im.v1.message.acreate(img_req)
+                    img_resp = await self._api_client.im.v1.message.areply(img_req)
+                else:
+                    img_create = (
+                        CreateMessageRequest.builder()
+                        .receive_id_type("open_id")
+                        .request_body(
+                            CreateMessageRequestBody.builder()
+                            .receive_id(self.cfg.authorized_user_id)
+                            .msg_type("image")
+                            .content(img_content)
+                            .uuid(img_uuid)
+                            .build()
+                        )
+                        .build()
+                    )
+                    img_resp = await self._api_client.im.v1.message.acreate(img_create)
                 if not img_resp.success():
                     log.warning(
                         "lark_image_post_failed",

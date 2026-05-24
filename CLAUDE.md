@@ -80,7 +80,7 @@ These are **settled**. PRs that violate them won't land.
 ## Architecture: the agent/persona/wakeup/task model
 
 - **Persona** (`src/lyre/personas/<name>.md`) = static role definition with
-  YAML frontmatter (`allowed_lyre_tools`, `model_preference`, `needs_worktree`)
+  YAML frontmatter (`allowed_lyre_tools`, `model_preference`, `kind`)
   and a markdown system-prompt body. After onboarding it lives at
   `~/.lyre/personas/<name>/identity.md` (the SSOT).
 - **Agent** = a running *instance* of a persona. One persona can have many
@@ -154,7 +154,7 @@ prompt-cache efficiency):
 | `src/lyre/dashboard/` | FastAPI + HTMX + SSE web UI |
 | `src/lyre/personas/` | Shipped persona markdowns (copied to `~/.lyre/` on onboard) |
 | `src/lyre/data/model_registry.yaml` | Packaged provider/model entries |
-| `migrations/` | SQLite migrations, numbered `0NNN_*.sql`, **append-only** |
+| `migrations/` | SQLite schema. MVP phase: single-file baseline (`0001_initial.sql`); owner nukes their local DB on schema changes rather than carrying historical migrations. |
 | `tests/` | Mirrors `src/lyre/`; `conftest.py` + `fake_adapter.py` + `helpers.py` are shared fixtures |
 | `docs/design/` | Chinese architecture docs — source of truth for *why* decisions |
 
@@ -166,9 +166,10 @@ prompt-cache efficiency):
   sentences (`test_loop_continues_after_tool_use_with_end_turn_stop_reason`).
   Test suite is designed to run **fully offline** — no provider keys needed,
   adapter integration uses `tests/fake_adapter.py`.
-- **Migrations are append-only.** Schema changes go in a new
-  `migrations/0NNN_*.sql` with the next ordinal. Never edit a landed
-  migration.
+- **Schema changes: edit `0001_initial.sql` in place.** MVP phase has
+  a single-file baseline; the owner nukes their local DB on schema
+  changes rather than carrying a chain of CREATE-rename-drop
+  migrations. No 0002, no V2-table rebuild dance.
 - **Ruff config** in `pyproject.toml`: target py311, line-length 100,
   selects `E,F,I,B,UP,ASYNC,SIM`. Ignored: `E501` (formatter handles),
   `ASYNC240` (pathlib in async fns is fine for cwd/dir ops), `SIM102/SIM105`

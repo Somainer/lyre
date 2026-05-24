@@ -128,7 +128,6 @@ async def test_worker_can_clone_edit_commit_push(
             model_preference={
                 "tier": "workhorse", "requires": ["tool_use"], "prefer": [],
             },
-            needs_worktree=True,
         )
     )
     task_id = await repos.tasks.create(

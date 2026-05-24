@@ -1,12 +1,12 @@
 """shell_exec tool — agent's interface to host commands.
 
-Cwd defaults to ToolContext.extras['worktree'] (set by scheduler when it spins
-up a per-task tmpdir). If no worktree is configured, the tool refuses to run
-(can be relaxed for personas that explicitly opt in via 'needs_worktree=False'
-and pass cwd=null).
+Cwd defaults to ToolContext.extras['worktree'] (set by scheduler for
+every wakeup — every LLM persona gets a sandbox tmpdir now). If the
+task was dispatched with a ``git_context``, the worktree is already a
+checked-out git working copy with an active SSH agent; otherwise it's
+an empty tmpdir. Either way, ``cwd`` defaults to that tmpdir.
 
-Sprint 1 scope: serves the lisa-lang smoke test — git, gh, sbt, basic editing
-commands. Read-only PATH inheritance, no shell expansion.
+Read-only PATH inheritance, no shell expansion.
 """
 
 from __future__ import annotations
