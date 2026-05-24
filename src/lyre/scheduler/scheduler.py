@@ -195,6 +195,26 @@ class Scheduler:
             # OS to reap when the parent exits.
             await asyncio.gather(*reapers, return_exceptions=True)
 
+    async def _log_terminal_task_orphan_wakeups(self) -> None:
+        """One-shot startup audit: log any wakeup row left open against
+        a task that's already in a terminal state. This combination
+        means a previous run died after the task finished but before
+        its wakeup row got finalised — runtime metadata corruption
+        that ``has_active_for_agent``'s task-status JOIN now masks at
+        dispatch time (so it no longer wedges the scheduler), but
+        which is still worth surfacing to the operator. We do NOT
+        auto-close these here — keeping the row visible until someone
+        looks is the whole point of "log, don't repair".
+        """
+        orphans = await self.repos.wakeups.find_terminal_task_orphans(limit=10)
+        if not orphans:
+            return
+        log.warning(
+            "scheduler_terminal_task_orphan_wakeups_detected",
+            count=len(orphans),
+            samples=orphans,
+        )
+
     async def run(self) -> None:
         log.info(
             "scheduler_started",
@@ -204,6 +224,7 @@ class Scheduler:
             max_concurrent_tasks=self._max_concurrent,
             spawn_subprocess=self.spawn_subprocess,
         )
+        await self._log_terminal_task_orphan_wakeups()
         while not self._stop_event.is_set():
             try:
                 await self._tick()
@@ -671,6 +692,26 @@ class Scheduler:
         task = await self.repos.tasks.get(task_id)
         if task is None:
             return
+
+        # Sweep stale wakeups for this task BEFORE opening a new one.
+        # A previous attempt may have died after INSERTing its wakeup
+        # row but before any path could write ended_at — kill-test
+        # crash, host shutdown without graceful drain, or just the
+        # claim-lease-fails return path below from an earlier tick.
+        # If we don't close them here, the orphan row keeps tripping
+        # has_active_for_agent for this agent (the scheduler dispatch
+        # gate), starving every future pending task. Sweeping is by
+        # task_id so we never touch wakeups for OTHER live tasks of
+        # the same agent (there shouldn't be any — we're about to be
+        # the one wakeup — but the narrow filter is the safer one).
+        abandoned = await self.repos.wakeups.close_orphans_for_task(task_id)
+        if abandoned:
+            log.warning(
+                "scheduler_closed_orphan_wakeups",
+                task_id=task_id,
+                count=abandoned,
+            )
+
         # Resolve the running agent. After A3 every task has agent_id; legacy
         # callers that only set persona_name still work — we treat the
         # persona name as a degenerate agent_id (which is exactly how the
@@ -696,7 +737,16 @@ class Scheduler:
             task_id, wakeup_id, duration_sec=task.lease_duration_s
         )
         if not claimed:
-            log.warning("lease_unclaimed", task_id=task_id)
+            # The wakeup row got INSERTed before we attempted the claim
+            # (wakeups.start commits unconditionally). If we just return
+            # here, the row stays at ended_at IS NULL forever — exactly
+            # the orphan pattern close_orphans_for_task exists to fix.
+            # Close our own freshly-inserted row in the same code path
+            # rather than relying on the next _run_task to sweep it.
+            log.warning(
+                "lease_unclaimed", task_id=task_id, wakeup_id=wakeup_id,
+            )
+            await self.repos.wakeups.end(wakeup_id, end_status="abandoned")
             return
 
         transcript = TranscriptWriter(self.config.object_store_path, wakeup_id)
