@@ -587,8 +587,14 @@ async def _list_agents(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]
 
       - available: idle AND zero in-flight tasks. Free to take new work.
       - queued:    idle AND ≥1 in-flight task waiting. Don't add more.
-      - busy:      currently inside a wakeup.
+      - busy:      currently inside a wakeup (an open ``wakeups`` row).
       - archived:  retired; cannot accept new work.
+
+    "busy" is derived from ``wakeups.list_active()``, not from any
+    column on the agent record — the runtime doesn't write back a
+    ``busy`` status anywhere, so reading agent.status would only ever
+    see the stale post-onboard ``idle``. Matching the dashboard's
+    ``_derive_occupancy_status`` keeps both surfaces consistent.
 
     `active_task_id` / `last_active_at` give the leader enough context
     to write a meaningful kick-off mail without round-tripping
@@ -604,6 +610,12 @@ async def _list_agents(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]
         key = t.agent_id or t.persona_name
         if t.status in _IN_FLIGHT:
             in_flight_by_agent.setdefault(key, []).append(t)
+
+    # Active wakeups: anything still open (ended_at IS NULL) is a
+    # genuine running wakeup. Used to mark agents as ``busy`` — the
+    # only authoritative signal, since agent.status never flips.
+    active_wakeups = await ctx.repos.wakeups.list_active()
+    busy_agent_ids = {w.agent_id for w in active_wakeups if w.agent_id}
 
     # last_active_at: most recent wakeup_started_at per agent.
     recent_wakeups = await ctx.repos.wakeups.list_recent(limit=200)
@@ -621,7 +633,7 @@ async def _list_agents(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]
     def _occupancy(agent: Agent) -> str:
         if agent.status == "archived":
             return "archived"
-        if agent.status == "busy":
+        if agent.id in busy_agent_ids:
             return "busy"
         return "queued" if in_flight_by_agent.get(agent.id) else "available"
 

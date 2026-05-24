@@ -28,8 +28,12 @@ CREATE TABLE IF NOT EXISTS mailboxes (
 CREATE TABLE IF NOT EXISTS agents (
   id                TEXT PRIMARY KEY,
   persona_name      TEXT NOT NULL,
+  -- Lifecycle only: 'idle' (alive, may or may not be running a wakeup
+  -- right now) or 'archived'. There used to be a 'busy' value here
+  -- but the runtime never wrote it — running state is derived from
+  -- wakeups.ended_at IS NULL by list_agents and the dashboard.
   status            TEXT NOT NULL DEFAULT 'idle'
-                    CHECK (status IN ('idle','busy','archived')),
+                    CHECK (status IN ('idle','archived')),
   -- parent_agent_id: the agent that spawned this one (or NULL for
   -- bootstrap agents `owner`/`leader`). String "owner" is also valid
   -- when the human owner created the agent directly via CLI/dashboard.
