@@ -300,7 +300,11 @@ async def test_forward_msg_id_lands_in_metadata(ctx: ToolContext) -> None:
 
 @pytest.mark.asyncio
 async def test_refuse_to_send_to_self(ctx: ToolContext) -> None:
-    with pytest.raises(ToolError, match="refusing to send to self"):
+    """Immediate self-send is blocked (auto-wake-on-mail would
+    instantly fire and trivial self-loops would be too easy). The
+    scheduled-mail path has its own test that confirms self-send is
+    allowed when delivery is delayed."""
+    with pytest.raises(ToolError, match="immediate mail to self"):
         await MAILBOX_SEND.handler(
             ctx,
             {"to": ["dispatcher", "owner"], "body": "x", "_tool_use_id": "t"},
