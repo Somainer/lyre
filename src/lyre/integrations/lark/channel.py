@@ -725,6 +725,17 @@ _URGENCY_TEMPLATE: dict[str, str] = {
     "low":     "grey",
 }
 
+# Traffic-light marker prepended to the body's ``**from <sender>**``
+# attribution line. Only the elevated urgencies get a marker — flagging
+# every normal mail with a coloured dot would be visual noise. blocker
+# / high mail tends to be terse, often arrives without a meaningful
+# title (so no coloured header bar), and the body-level dot is the
+# only urgency signal owner sees in those cases.
+_URGENCY_BODY_MARKER: dict[str, str] = {
+    "blocker": "🔴",
+    "high":    "🟠",
+}
+
 
 def _build_owner_mail_card(
     sender: str, body: str, urgency: str, title: str | None = None,
@@ -736,20 +747,20 @@ def _build_owner_mail_card(
     backticks. Cards via ``lark_md`` text components render properly
     and let us colour-code by urgency too.
 
-    Two layouts, depending on whether the sender supplied a meaningful
-    subject line:
+    Layout: an attribution line — ``[<dot>] **from <sender>**`` where
+    the dot is 🔴/🟠 for blocker/high urgency and omitted otherwise —
+    is always the first line of the body, then a blank line, then the
+    message body verbatim. Uniform sender attribution, owner doesn't
+    have to scan two places to know who's talking.
 
-      * **Meaningful title** (``title`` differs from what we'd
-        auto-derive from the body's first line) — the title is the
-        prominent header, and ``from <sender>`` rides as a small
-        markdown line at the top of the body. This is the "looks like
-        an email subject" layout, mirroring how the CLI ``mailbox`` /
-        dashboard inbox surface title-first.
-      * **Auto-derived or missing title** — falls back to
-        ``[<sender>]`` in the header with the body as-is. Reproducing
-        the body's first line in the header would just look like a
-        visual stutter, and the sender is the only piece of metadata
-        still worth surfacing.
+    The ``header`` block is only attached when the sender supplied a
+    *meaningful* title — i.e. one distinct from what we'd auto-derive
+    from the body's first line. An auto-derived title would just
+    duplicate body[0] in the header, so we drop the header entirely
+    for those — cleaner than the previous ``[<sender>]`` placeholder.
+    When the header is present, ``template`` colours it by urgency
+    (blocker→red etc); when absent, the body-level dot is the only
+    urgency signal the owner gets.
 
     Image attachments still ride as separate ``msg_type=image`` posts
     threaded to the same reply parent — embedding them inside the card
@@ -757,25 +768,21 @@ def _build_owner_mail_card(
     existing thread layout.
     """
     template = _URGENCY_TEMPLATE.get(urgency, "blue")
+    marker = _URGENCY_BODY_MARKER.get(urgency, "")
 
     # Auto-derive check: the persistence layer fills missing titles with
-    # the body's first non-empty line (see sqlite_impl._derive_title_from_body).
+    # the body's first non-empty line (sqlite_impl._derive_title_from_body).
     # Recomputing here lets the card tell "owner cares about this subject"
     # apart from "no subject given" without threading an extra flag through.
-    auto_derived = title is None or title == _derive_title_from_body(body)
-    if auto_derived:
-        header_text = f"[{sender}]"
-        body_content = body or "_(empty message)_"
-    else:
-        header_text = title or ""
-        body_content = f"**from {sender}**\n\n{body}" if body else f"**from {sender}**"
+    has_meaningful_title = (
+        title is not None and title != _derive_title_from_body(body)
+    )
 
-    return {
+    attribution = f"{marker} **from {sender}**" if marker else f"**from {sender}**"
+    body_content = f"{attribution}\n\n{body}" if body else attribution
+
+    card: dict[str, Any] = {
         "config": {"wide_screen_mode": True, "update_multi": False},
-        "header": {
-            "title": {"tag": "plain_text", "content": header_text},
-            "template": template,
-        },
         "elements": [
             {
                 "tag": "div",
@@ -786,6 +793,12 @@ def _build_owner_mail_card(
             },
         ],
     }
+    if has_meaningful_title:
+        card["header"] = {
+            "title": {"tag": "plain_text", "content": title},
+            "template": template,
+        }
+    return card
 
 
 def _extract_body_and_images(
