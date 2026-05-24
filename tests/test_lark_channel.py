@@ -18,6 +18,7 @@ import pytest
 from lyre.config import LarkConfig
 from lyre.integrations.lark.channel import (
     LarkChannel,
+    _build_owner_mail_card,
     _extract_body_and_images,
     _sniff_image_mime,
 )
@@ -156,6 +157,47 @@ async def test_channel_refuses_without_authorized_user_id(
 
 
 # ---------------------------------------------------------------------------
+# _build_owner_mail_card — pure function, no SDK
+# ---------------------------------------------------------------------------
+
+
+def test_card_has_sender_in_header_and_body_as_lark_md() -> None:
+    """Card must put the sender in the header (so owner sees who's
+    talking at a glance) and the body in a lark_md text element (so
+    markdown renders instead of showing raw asterisks)."""
+    card = _build_owner_mail_card(
+        sender="analyst/auth",
+        body="**done**: see `~/.lyre/memory/facts/specs-auth.md`",
+        urgency="normal",
+    )
+    assert card["header"]["title"]["content"] == "[analyst/auth]"
+    assert card["header"]["template"] == "blue"  # normal → blue
+    # The body element renders via lark_md (markdown), not plain_text.
+    body_el = card["elements"][0]
+    assert body_el["tag"] == "div"
+    assert body_el["text"]["tag"] == "lark_md"
+    assert "**done**" in body_el["text"]["content"]
+    assert "`~/.lyre/memory/facts/specs-auth.md`" in body_el["text"]["content"]
+
+
+def test_card_urgency_maps_to_header_template() -> None:
+    """Urgency colours the header bar so owner can triage at a glance
+    in the Lark client. Unknown urgency falls back to blue."""
+    assert _build_owner_mail_card("x", "y", "blocker")["header"]["template"] == "red"
+    assert _build_owner_mail_card("x", "y", "high")["header"]["template"] == "orange"
+    assert _build_owner_mail_card("x", "y", "normal")["header"]["template"] == "blue"
+    assert _build_owner_mail_card("x", "y", "low")["header"]["template"] == "grey"
+    assert _build_owner_mail_card("x", "y", "weird")["header"]["template"] == "blue"
+
+
+def test_card_empty_body_renders_placeholder() -> None:
+    """Lark cards refuse empty content — substitute a placeholder so
+    the card is still well-formed (and visually says 'empty')."""
+    card = _build_owner_mail_card("x", "", "normal")
+    assert card["elements"][0]["text"]["content"] == "_(empty message)_"
+
+
+# ---------------------------------------------------------------------------
 # publish_owner_mail — outbound text + image with fake SDK client
 # ---------------------------------------------------------------------------
 
@@ -227,14 +269,20 @@ async def test_publish_text_only_returns_lark_message_id(
         ext_id = await ch.publish_owner_mail(msg, reply_to_external_id=None)
 
         assert ext_id == "lark_msg_001"
-        # One text post, no image post.
+        # One card post, no image post.
         assert ch._api_client.im.v1.message.acreate.await_count == 1
         assert ch._api_client.im.v1.image.acreate.await_count == 0
-        # The body got the sender-tag prefix.
+        # The outbound request is an interactive card carrying the
+        # sender in the header and the body as lark_md (markdown).
         call = ch._api_client.im.v1.message.acreate.await_args
-        # CreateMessageRequest is a builder result; we can introspect via
-        # the request object's body — easier path: just verify the call happened.
-        assert call is not None
+        sent_req = call.args[0]
+        assert sent_req.body.msg_type == "interactive"
+        card = _json.loads(sent_req.body.content)
+        assert card["header"]["title"]["content"] == (
+            "[worker-maintainer/refactor-auth]"
+        )
+        assert card["elements"][0]["text"]["tag"] == "lark_md"
+        assert card["elements"][0]["text"]["content"] == "status: done"
     finally:
         await conn.close()
 

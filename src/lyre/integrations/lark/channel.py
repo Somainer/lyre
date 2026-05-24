@@ -464,12 +464,15 @@ class LarkChannel:
             ReplyMessageRequestBody,
         )
 
-        # Compose the text body — prefix with the sender so owner
-        # knows which agent is talking. Markdown survives in Lark
-        # as plaintext (the bot account doesn't render rich cards
-        # in MVP; that's a follow-up).
-        text_body = f"[{msg.sender}] {msg.body or ''}"
-        text_content = _json.dumps({"text": text_body})
+        # Build an interactive card so Lark renders the body's
+        # markdown (lists, code blocks, links, bold). Plain text posts
+        # showed everything as raw asterisks and backticks. Header
+        # carries the sender id + urgency-based colour.
+        card_content = _json.dumps(_build_owner_mail_card(
+            sender=msg.sender,
+            body=msg.body or "",
+            urgency=msg.urgency,
+        ))
         text_uuid = f"lyre-mail-{msg.id}"  # SDK-side dedup token
 
         if reply_to_external_id is not None:
@@ -478,8 +481,8 @@ class LarkChannel:
                 .message_id(reply_to_external_id)
                 .request_body(
                     ReplyMessageRequestBody.builder()
-                    .msg_type("text")
-                    .content(text_content)
+                    .msg_type("interactive")
+                    .content(card_content)
                     .uuid(text_uuid)
                     .build()
                 )
@@ -493,8 +496,8 @@ class LarkChannel:
                 .request_body(
                     CreateMessageRequestBody.builder()
                     .receive_id(self.cfg.authorized_user_id)
-                    .msg_type("text")
-                    .content(text_content)
+                    .msg_type("interactive")
+                    .content(card_content)
                     .uuid(text_uuid)
                     .build()
                 )
@@ -503,7 +506,7 @@ class LarkChannel:
             text_resp = await self._api_client.im.v1.message.acreate(text_req)
         if not text_resp.success():
             raise RuntimeError(
-                f"Lark text post failed: code={text_resp.code} "
+                f"Lark card post failed: code={text_resp.code} "
                 f"msg={text_resp.msg}"
             )
         lark_msg_id = (
@@ -656,6 +659,55 @@ _REACTION_TO_LARK_EMOJI: dict[str, str] = {
 # Helpers — kept module-level so they're easy to test without spinning up
 # a full LarkChannel.
 # ---------------------------------------------------------------------------
+
+
+# Urgency → Lark card header color template. Lark's built-in palette
+# (see open.feishu.cn card docs) — these are the values that
+# actually render colored bars in the owner's Lark client.
+_URGENCY_TEMPLATE: dict[str, str] = {
+    "blocker": "red",
+    "high":    "orange",
+    "normal":  "blue",
+    "low":     "grey",
+}
+
+
+def _build_owner_mail_card(
+    sender: str, body: str, urgency: str,
+) -> dict[str, Any]:
+    """Lark interactive card with markdown body.
+
+    Plain ``msg_type=text`` posts don't render markdown — the owner saw
+    everything (lists, code blocks, links) as raw asterisks and
+    backticks. Cards via ``lark_md`` text components render properly
+    and let us colour-code by urgency too.
+
+    Header carries the sender id ("which agent is talking"); the body
+    is the agent's message verbatim, interpreted as markdown by Lark.
+    Image attachments still ride as separate ``msg_type=image`` posts
+    threaded to the same reply parent — embedding them inside the card
+    would require extra ``img_key`` round-trips for no UX gain over the
+    existing thread layout.
+    """
+    template = _URGENCY_TEMPLATE.get(urgency, "blue")
+    return {
+        "config": {"wide_screen_mode": True, "update_multi": False},
+        "header": {
+            "title": {"tag": "plain_text", "content": f"[{sender}]"},
+            "template": template,
+        },
+        "elements": [
+            {
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    # Empty body → placeholder so the card has visible
+                    # text (Lark refuses cards with empty content).
+                    "content": body or "_(empty message)_",
+                },
+            },
+        ],
+    }
 
 
 def _extract_body_and_images(
