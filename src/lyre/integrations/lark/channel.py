@@ -35,6 +35,11 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 import structlog
 
+# Recomputing the same auto-derive used at insert time lets us tell
+# "owner specified a real subject" apart from "title fell back to the
+# body's first line" when rendering Lark cards — keep them in sync.
+from ...persistence.sqlite_impl import _derive_title_from_body
+
 if TYPE_CHECKING:
     from ...config import LarkConfig
     from ...persistence.models import MailboxMessage
@@ -479,6 +484,7 @@ class LarkChannel:
             sender=msg.sender,
             body=msg.body or "",
             urgency=msg.urgency,
+            title=msg.title,
         ))
         text_uuid = f"lyre-mail-{msg.id}"  # SDK-side dedup token
 
@@ -721,7 +727,7 @@ _URGENCY_TEMPLATE: dict[str, str] = {
 
 
 def _build_owner_mail_card(
-    sender: str, body: str, urgency: str,
+    sender: str, body: str, urgency: str, title: str | None = None,
 ) -> dict[str, Any]:
     """Lark interactive card with markdown body.
 
@@ -730,18 +736,44 @@ def _build_owner_mail_card(
     backticks. Cards via ``lark_md`` text components render properly
     and let us colour-code by urgency too.
 
-    Header carries the sender id ("which agent is talking"); the body
-    is the agent's message verbatim, interpreted as markdown by Lark.
+    Two layouts, depending on whether the sender supplied a meaningful
+    subject line:
+
+      * **Meaningful title** (``title`` differs from what we'd
+        auto-derive from the body's first line) — the title is the
+        prominent header, and ``from <sender>`` rides as a small
+        markdown line at the top of the body. This is the "looks like
+        an email subject" layout, mirroring how the CLI ``mailbox`` /
+        dashboard inbox surface title-first.
+      * **Auto-derived or missing title** — falls back to
+        ``[<sender>]`` in the header with the body as-is. Reproducing
+        the body's first line in the header would just look like a
+        visual stutter, and the sender is the only piece of metadata
+        still worth surfacing.
+
     Image attachments still ride as separate ``msg_type=image`` posts
     threaded to the same reply parent — embedding them inside the card
     would require extra ``img_key`` round-trips for no UX gain over the
     existing thread layout.
     """
     template = _URGENCY_TEMPLATE.get(urgency, "blue")
+
+    # Auto-derive check: the persistence layer fills missing titles with
+    # the body's first non-empty line (see sqlite_impl._derive_title_from_body).
+    # Recomputing here lets the card tell "owner cares about this subject"
+    # apart from "no subject given" without threading an extra flag through.
+    auto_derived = title is None or title == _derive_title_from_body(body)
+    if auto_derived:
+        header_text = f"[{sender}]"
+        body_content = body or "_(empty message)_"
+    else:
+        header_text = title or ""
+        body_content = f"**from {sender}**\n\n{body}" if body else f"**from {sender}**"
+
     return {
         "config": {"wide_screen_mode": True, "update_multi": False},
         "header": {
-            "title": {"tag": "plain_text", "content": f"[{sender}]"},
+            "title": {"tag": "plain_text", "content": header_text},
             "template": template,
         },
         "elements": [
@@ -749,9 +781,7 @@ def _build_owner_mail_card(
                 "tag": "div",
                 "text": {
                     "tag": "lark_md",
-                    # Empty body → placeholder so the card has visible
-                    # text (Lark refuses cards with empty content).
-                    "content": body or "_(empty message)_",
+                    "content": body_content,
                 },
             },
         ],

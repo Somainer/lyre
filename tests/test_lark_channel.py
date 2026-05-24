@@ -234,10 +234,11 @@ def test_urgency_prefix_alone_yields_empty_body() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_card_has_sender_in_header_and_body_as_lark_md() -> None:
-    """Card must put the sender in the header (so owner sees who's
-    talking at a glance) and the body in a lark_md text element (so
-    markdown renders instead of showing raw asterisks)."""
+def test_card_no_title_falls_back_to_sender_in_header() -> None:
+    """When no title is provided (or it auto-derived to the body's first
+    line), header shows ``[<sender>]`` and the body renders as-is — no
+    ``from <sender>`` prefix, since the sender is already in the header.
+    Body uses lark_md so markdown actually renders."""
     card = _build_owner_mail_card(
         sender="analyst/auth",
         body="**done**: see `~/.lyre/memory/facts/specs-auth.md`",
@@ -245,12 +246,51 @@ def test_card_has_sender_in_header_and_body_as_lark_md() -> None:
     )
     assert card["header"]["title"]["content"] == "[analyst/auth]"
     assert card["header"]["template"] == "blue"  # normal → blue
-    # The body element renders via lark_md (markdown), not plain_text.
     body_el = card["elements"][0]
     assert body_el["tag"] == "div"
     assert body_el["text"]["tag"] == "lark_md"
-    assert "**done**" in body_el["text"]["content"]
-    assert "`~/.lyre/memory/facts/specs-auth.md`" in body_el["text"]["content"]
+    # Body is verbatim — no "from sender" line prepended.
+    assert body_el["text"]["content"].startswith("**done**")
+    assert "from analyst/auth" not in body_el["text"]["content"]
+
+
+def test_card_meaningful_title_goes_in_header_with_sender_in_body() -> None:
+    """A sender-supplied title that differs from the body's first line
+    is "meaningful" — show it as the prominent header and surface the
+    sender as a small ``**from <sender>**`` line at the top of the body.
+    This is the email-subject layout."""
+    card = _build_owner_mail_card(
+        sender="worker-maintainer-1",
+        body="Hit 429s on the prod sync.\nTwo options...",
+        urgency="blocker",
+        title="Need decision on rate-limit policy",
+    )
+    assert card["header"]["title"]["content"] == "Need decision on rate-limit policy"
+    assert card["header"]["template"] == "red"  # blocker → red
+    body = card["elements"][0]["text"]["content"]
+    # "from <sender>" rides on top, then a blank line, then the body verbatim.
+    assert body.startswith("**from worker-maintainer-1**\n\n")
+    assert body.endswith("Hit 429s on the prod sync.\nTwo options...")
+
+
+def test_card_auto_derived_title_skipped_in_header() -> None:
+    """If the title was auto-derived from the body's first line (the
+    persistence layer does this when sender didn't supply one), the
+    title would just duplicate body[0] in the header — fall back to the
+    ``[<sender>]`` layout instead. Keeps the card from showing the same
+    sentence twice."""
+    body = "Quick status update.\n\nAll three workers green."
+    derived = "Quick status update."  # what _derive_title_from_body returns
+    card = _build_owner_mail_card(
+        sender="dispatcher",
+        body=body,
+        urgency="normal",
+        title=derived,
+    )
+    assert card["header"]["title"]["content"] == "[dispatcher]"
+    body_el_content = card["elements"][0]["text"]["content"]
+    assert body_el_content == body
+    assert "**from dispatcher**" not in body_el_content
 
 
 def test_card_urgency_maps_to_header_template() -> None:
@@ -265,9 +305,22 @@ def test_card_urgency_maps_to_header_template() -> None:
 
 def test_card_empty_body_renders_placeholder() -> None:
     """Lark cards refuse empty content — substitute a placeholder so
-    the card is still well-formed (and visually says 'empty')."""
+    the card is still well-formed (and visually says 'empty'). Only
+    applies to the no-title fall-back layout; with a meaningful title
+    the empty-body case still gets the ``from <sender>`` line."""
     card = _build_owner_mail_card("x", "", "normal")
     assert card["elements"][0]["text"]["content"] == "_(empty message)_"
+
+
+def test_card_meaningful_title_with_empty_body() -> None:
+    """Title-only mail (empty body, sender-supplied subject) — header
+    shows the title, body falls back to just the ``from <sender>`` line
+    so the card still has visible content."""
+    card = _build_owner_mail_card(
+        sender="watchdog", body="", urgency="high", title="Heartbeat missed",
+    )
+    assert card["header"]["title"]["content"] == "Heartbeat missed"
+    assert card["elements"][0]["text"]["content"] == "**from watchdog**"
 
 
 # ---------------------------------------------------------------------------
