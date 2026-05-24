@@ -3,6 +3,8 @@
 **Status:** Draft — spec, not yet implemented.
 **Scope:** Make every wakeup terminate via an explicit declaration. The
 runtime stops inferring intent from "the model produced no tool_use."
+Net tool surface change is **zero**: `end_wakeup` replaces
+`report_progress`, which an audit (§3) found to be vestigial.
 
 ## 1. Motivation
 
@@ -46,11 +48,42 @@ tuple (`{:reply, R, S}` / `{:noreply, S}` / `{:stop, Reason, S}`).
 The wakeup is one callback invocation; `end_wakeup` is its return
 statement.
 
-## 3. Tool Surface
+## 3. Tool Surface — `end_wakeup` replaces `report_progress`
 
-A new tool, `end_wakeup`, sits next to `report_progress` (which keeps
-its existing crash-recovery checkpoint role — *the two are separate
-concerns and should not be conflated*).
+This spec does NOT add net tool surface. It removes `report_progress`
+and `tasks.checkpoint` and introduces `end_wakeup`.
+
+### 3a. Audit: why `report_progress` is redundant
+
+`report_progress(checkpoint, note)` writes a free-form JSON blob into
+`tasks.checkpoint`. The whole codebase has exactly two consumers of
+that column:
+
+- `runtime/context.py` injects `tasks.checkpoint` into the next
+  wakeup's task description as `【续做 checkpoint】\n{checkpoint}\n`.
+  Nothing parses the JSON; it is `str(obj)`-formatted and concatenated
+  into the prompt.
+- `query_task_status` exposes it via the read-only API.
+
+Compared to `update_scratchpad` (which writes
+`memory/scratchpad/<flat-id>.md`), the only unique behaviour
+`report_progress` offers is *auto-injection into the task description
+of the next wakeup of the same task*. Personas already instruct the
+agent to read its scratchpad at every wakeup start, so this
+convenience adds little — and at the cost of carrying a second
+state-continuity surface with different scope (per-task vs per-agent),
+different durability (dropped with the task vs persistent across
+tasks), and no size cap / curation pattern.
+
+The "checkpoint is structured, scratchpad is free-form" framing is
+illusory: nothing inspects the JSON, the LLM reads markdown equally
+well, and the JSON wrapper just costs tokens.
+
+The audit conclusion: `report_progress` is vestigial. Folding the
+crash-recovery continuity story into `update_scratchpad` loses
+nothing real and removes one tool plus one DB column.
+
+### 3b. `end_wakeup` tool
 
 ```jsonc
 {
@@ -175,21 +208,20 @@ no end_wakeup declared after nudge (§6)           → failed_silent_close
 `failed_runtime_exception` and `failed_silent_close` are runtime-only
 end_statuses; they are NOT exposed as values agents can pass.
 
-## 5. Mid-flight vs Terminal calls
+## 5. Terminal-only semantics
 
-`end_wakeup` is *terminal-only*: calling it ends the wakeup. The
-runtime stops processing further model output after the tool result
-returns. If the model attempts to produce more `tool_use` blocks
-after `end_wakeup`, they are dropped with a transcript warning.
+`end_wakeup` is terminal: calling it ends the wakeup. The runtime
+stops processing further model output after the tool result returns.
+If the model attempts to produce more `tool_use` blocks after
+`end_wakeup`, they are dropped with a transcript warning
+(`wakeup_post_end_tool_calls_ignored`).
 
-`report_progress` remains *mid-flight only*: free-form
-crash-recovery checkpoint, may be called as often as the agent likes,
-does NOT end the wakeup.
-
-These two split cleanly:
-
-- "I want my work-in-progress saved in case I crash" → `report_progress`
-- "I'm done with this turn; here's why" → `end_wakeup`
+The "where do I park work-in-progress so a crash doesn't lose it"
+concern is now served by `update_scratchpad` alone. Personas already
+treat the scratchpad as the agent's working-memory canvas; task-scoped
+continuity belongs there under an `## Active task: <id> — <goal>`
+heading the agent maintains itself. No separate `tasks.checkpoint`
+state is needed (see §3a audit).
 
 ## 6. Runtime Enforcement
 
@@ -259,6 +291,27 @@ mailbox via `task_terminated`.
 
 ## 7. Migration
 
+### Removing `report_progress` and `tasks.checkpoint`
+
+- Delete `REPORT_PROGRESS` tool + `_report_progress` handler in
+  `runtime/tools/progress.py`. The file becomes
+  `report_side_effect`-only (consider renaming the module to
+  `side_effect.py`; minor cleanup).
+- Delete the `update_checkpoint` DAO method on `TaskRepository`
+  (protocol + Sqlite impl) and any callers.
+- Delete the `tasks.checkpoint` column from `migrations/0001_initial.sql`.
+  Per project policy ("edit 0001_initial.sql in place"), owners nuke
+  their local DB.
+- Delete the `checkpoint` field from `Task` / `TaskSpec` Pydantic
+  models.
+- Delete the `tasks.checkpoint` injection block in
+  `runtime/context.py:547-548`.
+- Drop the `checkpoint` field from `query_task_status` response.
+- Persona edits in `src/lyre/personas/{analyst,worker-maintainer,dispatcher}.md`:
+  references to `report_progress(checkpoint={...})` are replaced with
+  `update_scratchpad(...)` (under an `## Active task` heading) and the
+  new `end_wakeup` instructions from §6a.
+
 ### Existing personas
 
 Every shipped persona (`src/lyre/personas/*.md`) needs a paragraph
@@ -278,11 +331,15 @@ and applies regardless of persona edits.
 
 ### Existing tasks / wakeups
 
-No DB migration. The schema accepts new `wakeups.end_status` string
-values without change (the column is `TEXT`, no CHECK). Old rows with
-`end_status IN ('completed','silent_close','needs_continuation','failed')`
-continue to render correctly in the dashboard; the new values
-(`awaiting_mail`, `failed_loop_exhausted`, ...) extend the set.
+Schema change is the `tasks.checkpoint` column removal (one line in
+`0001_initial.sql`). Owners nuke local DB per project policy. No
+data migration is provided; the column's content was per-task
+crash-recovery state which is by definition transient.
+
+`wakeups.end_status` remains `TEXT` with no CHECK and accepts the
+new values (`yielded`, `awaiting_<on>`, `failed_<reason>`,
+`failed_silent_close`, `failed_runtime_exception`) without schema
+change.
 
 The dashboard's `_severity_for_wakeup` map gains entries for the new
 values:
@@ -297,12 +354,17 @@ values:
 
 ### Test suite
 
-`tests/fake_adapter.py` based tests that previously ended their
-fake-turn sequences with `TurnComplete(stop_reason='end_turn')` and
-no `tool_use` must add a final `ToolUseComplete(name='end_wakeup', ...)`
-before the terminal `TurnComplete`. The number of affected tests is
-bounded (the project standardises adapter setup); a sweep + lint pass
-catches them.
+Two sweep passes:
+
+1. `tests/fake_adapter.py`-based tests that previously ended their
+   fake-turn sequences with `TurnComplete(stop_reason='end_turn')`
+   and no `tool_use` must add a final
+   `ToolUseComplete(name='end_wakeup', ...)` before the terminal
+   `TurnComplete`. The number of affected tests is bounded.
+2. Existing `report_progress` tests (`test_tools.py`, `test_persistence.py`,
+   relevant chaos cases) get removed or rewritten against
+   `update_scratchpad` if the underlying assertion was about
+   continuity rather than the specific tool.
 
 ## 8. Implementation Sketch
 
@@ -310,17 +372,24 @@ Approximate file-by-file impact:
 
 | File | Change |
 |---|---|
-| `src/lyre/runtime/tools/progress.py` | Add `END_WAKEUP` tool + handler. `report_progress` unchanged. |
-| `src/lyre/runtime/tools/builtin.py` | Register `END_WAKEUP` in the default registry. |
+| `src/lyre/runtime/tools/progress.py` | Delete `REPORT_PROGRESS` + handler. Add `END_WAKEUP` tool + handler. (Consider renaming module to `side_effect.py`; module-level cleanup is a nicety, not a requirement.) |
+| `src/lyre/runtime/tools/builtin.py` | Remove `REPORT_PROGRESS` registration; add `END_WAKEUP`. |
+| `src/lyre/persistence/models.py` | Drop `checkpoint` field from `Task` / `TaskSpec`. |
+| `src/lyre/persistence/repositories.py` | Drop `update_checkpoint` method from `TaskRepository` protocol. |
+| `src/lyre/persistence/sqlite_impl.py` | Drop `update_checkpoint` impl. Drop `checkpoint` from `_row_to_task` deserialiser. |
+| `migrations/0001_initial.sql` | Remove the `checkpoint TEXT` column from the `tasks` table. |
+| `src/lyre/runtime/tools/tasks.py` | Drop `checkpoint` from `query_task_status` response. |
+| `src/lyre/runtime/context.py` | Drop the `task.checkpoint` injection block. Inject the §6a identity-preamble paragraph. Remove the now-redundant ack-and-stop warning text. |
 | `src/lyre/runtime/agent_loop.py` | Detect `end_wakeup` call in tool dispatch; set loop-state flag; stop accepting more output. Add nudge logic + hard fallback. Change `AgentLoopResult` to carry the declared status + reason + awaiting info. |
-| `src/lyre/scheduler/scheduler.py` | Replace `_wakeup_status_to_task_status` map: read directly from the declaration. Map awaiting kinds to `tasks.status='needs_input'` + remember `awaiting_on/ref` (likely on `wakeups.end_status` plus a `wakeups.awaiting_ref` column? — see §10). |
-| `src/lyre/runtime/context.py` (identity preamble) | Inject the §6a paragraph. Remove the now-redundant ack-and-stop warning. |
+| `src/lyre/scheduler/scheduler.py` | Replace `_wakeup_status_to_task_status` map: read directly from the declaration. Map awaiting kinds to `tasks.status='needs_input'` + remember `awaiting_on/ref` (see Q1 in §10). |
 | `src/lyre/dashboard/activity.py` | Severity map updates per §7. |
-| `src/lyre/personas/*.md` | Add the per-persona migration paragraph. |
-| `tests/test_agent_loop_*.py` etc. | Append `end_wakeup` to fake-turn sequences. New tests for the contract itself (§9). |
+| `src/lyre/personas/{analyst,worker-maintainer,dispatcher}.md` | Replace `report_progress` references with `update_scratchpad`. Add the per-persona migration paragraph for `end_wakeup`. Update `allowed_lyre_tools` frontmatter (drop `report_progress`, add `end_wakeup`). |
+| `tests/test_agent_loop_*.py`, `tests/test_scheduler.py`, ... | Append `end_wakeup` to fake-turn sequences. New tests for the contract itself (§9). |
+| `tests/test_tools.py`, `tests/test_persistence.py`, `tests/test_chaos_kill_points.py` | Remove `report_progress` / `checkpoint` tests; rewrite continuity-oriented assertions against `update_scratchpad` where applicable. |
 
-Estimated diff: +400 / -150 across runtime; +60 / -20 across personas
-+ tests adds ~12 new test functions.
+Estimated diff: +500 / -300 across runtime + persistence; +80 / -40
+across personas; tests net out near zero (new contract tests offset
+removed checkpoint tests).
 
 ## 9. Test Plan
 
@@ -334,10 +403,10 @@ New tests (all offline, via `tests/fake_adapter.py`):
 6. **Failed with non-recoverable: `end_wakeup(status='failed', failure_reason='precondition_failed', recoverable=False)`** → as above, recoverable hint propagated.
 7. **Nudge succeeds**: fake turn produces no tool_use → runtime nudges → next fake turn produces `end_wakeup(status='done')` → wakeup accepts the declaration.
 8. **Nudge fails, hard fallback**: fake turn produces no tool_use → nudge → another no-tool turn → runtime force-writes `failed_silent_close`.
-9. **Mid-flight `report_progress` is not confused with terminal**: agent calls `report_progress(checkpoint={...})` several times mid-wakeup, then `end_wakeup(status='done')` — only the last drives status.
-10. **Trailing tool calls after `end_wakeup` are dropped**: fake turn calls `end_wakeup(...)` then another `mailbox_send` — the mailbox_send is logged as a warning, not executed.
-11. **Schema validation**: `end_wakeup(status='awaiting')` without `awaiting_on` → `ToolError`; `end_wakeup(status='failed')` without `failure_reason` → `ToolError`.
-12. **Identity preamble contains the §6a paragraph** — regression test ensuring future preamble edits don't drop it.
+9. **Trailing tool calls after `end_wakeup` are dropped**: fake turn calls `end_wakeup(...)` then another `mailbox_send` — the mailbox_send is logged as a warning, not executed.
+10. **Schema validation**: `end_wakeup(status='awaiting')` without `awaiting_on` → `ToolError`; `end_wakeup(status='failed')` without `failure_reason` → `ToolError`.
+11. **Identity preamble contains the §6a paragraph** — regression test ensuring future preamble edits don't drop it.
+12. **No `report_progress` / `checkpoint` symbol leaks**: a grep-based regression test (or `ruff`/`mypy` natural coverage from the removals) confirming no production code references the deleted surface.
 
 ## 10. Open Questions
 
