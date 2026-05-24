@@ -11,6 +11,7 @@ allowed_lyre_tools:
   - mailbox_get_message
   - mark_read
   - mailbox_react
+  - end_wakeup
   - report_side_effect
   - query_task_status
   - read_memory

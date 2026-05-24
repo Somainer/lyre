@@ -13,6 +13,7 @@ allowed_lyre_tools:
   - cancel_scheduled_mail
   - dispatch_task
   - query_task_status
+  - end_wakeup
   - read_memory
   - update_scratchpad
   - list_personas

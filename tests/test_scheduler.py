@@ -77,8 +77,10 @@ async def test_scheduler_runs_task_with_fake_adapter(
             TurnComplete(stop_reason="tool_use"),
         ]
     )
-    fake.push_turn(
-        [ContentDelta(text="done."), Usage(input_tokens=60, output_tokens=2), TurnComplete(stop_reason="end_turn")]
+    fake.push_done(
+        summary="said hello",
+        input_tokens=60, output_tokens=2,
+        prefix_events=[ContentDelta(text="done.")],
     )
 
     registry = fake_registry(fake_entry(id="fake.workhorse", tier="workhorse"))
@@ -122,12 +124,10 @@ async def test_scheduler_records_wakeup_metering_and_model(
         TaskSpec(persona_name="worker", goal="g", acceptance="a")
     )
     fake = FakeAdapter()
-    fake.push_turn(
-        [
-            ContentDelta(text="ok"),
-            Usage(input_tokens=42, output_tokens=7),
-            TurnComplete(stop_reason="end_turn"),
-        ]
+    fake.push_done(
+        summary="ok",
+        input_tokens=42, output_tokens=7,
+        prefix_events=[ContentDelta(text="ok")],
     )
     registry = fake_registry(
         fake_entry(id="fake.workhorse", tier="workhorse", provider="anthropic")

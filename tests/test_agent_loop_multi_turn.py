@@ -72,13 +72,11 @@ async def test_run_multi_turn_with_one_tool_call(loop_setup) -> None:
             TurnComplete(stop_reason="tool_use"),
         ]
     )
-    # Turn 2: model sees the tool_result, decides done.
-    adapter.push_turn(
-        [
-            ContentDelta(text="All done."),
-            Usage(input_tokens=120, output_tokens=4),
-            TurnComplete(stop_reason="end_turn"),
-        ]
+    # Turn 2: model sees the tool_result, declares done.
+    adapter.push_done(
+        summary="All done.",
+        input_tokens=120, output_tokens=4,
+        prefix_events=[ContentDelta(text="All done.")],
     )
 
     loop = AgentLoop(
@@ -100,8 +98,12 @@ async def test_run_multi_turn_with_one_tool_call(loop_setup) -> None:
 
     assert result.status == "completed"
     assert result.turns == 2
-    assert len(result.tool_calls) == 1
+    # tool_calls includes the terminal end_wakeup declaration (runtime
+    # contract — every wakeup ends with one). The real work-tool is
+    # the mailbox_send at index 0.
+    assert len(result.tool_calls) == 2
     assert result.tool_calls[0]["name"] == "mailbox_send"
+    assert result.tool_calls[1]["name"] == "end_wakeup"
     assert result.text == "All done."
     # Usage was accumulated across turns.
     assert result.usage["input_tokens"] == 220
@@ -138,7 +140,10 @@ async def test_run_blocks_disallowed_tool(loop_setup) -> None:
             TurnComplete(stop_reason="tool_use"),
         ]
     )
-    adapter.push_turn([ContentDelta(text="ok ignored"), TurnComplete(stop_reason="end_turn")])
+    adapter.push_done(
+        summary="ok ignored",
+        prefix_events=[ContentDelta(text="ok ignored")],
+    )
 
     loop = AgentLoop(
         candidates=[fake_entry(id="m")],
@@ -178,7 +183,10 @@ async def test_run_handles_tool_error_gracefully(loop_setup) -> None:
             TurnComplete(stop_reason="tool_use"),
         ]
     )
-    adapter.push_turn([ContentDelta(text="retry handled"), TurnComplete(stop_reason="end_turn")])
+    adapter.push_done(
+        summary="retry handled",
+        prefix_events=[ContentDelta(text="retry handled")],
+    )
 
     loop = AgentLoop(
         candidates=[fake_entry(id="m")],
@@ -244,15 +252,25 @@ async def test_run_respects_max_turns(loop_setup) -> None:
 
 
 @pytest.mark.asyncio
-async def test_run_with_no_tools_single_turn(loop_setup) -> None:
+async def test_run_with_only_end_wakeup_single_turn(loop_setup) -> None:
+    """Minimum legal wakeup: text plus the terminal end_wakeup
+    declaration, no other tools. Validates that the contract path
+    works when the persona has no work-tools available.
+    """
     adapter, ctx, transcript = loop_setup
-    adapter.push_turn([ContentDelta(text="hi"), TurnComplete(stop_reason="end_turn")])
+    adapter.push_done(
+        summary="hi",
+        prefix_events=[ContentDelta(text="hi")],
+    )
     loop = AgentLoop(
         candidates=[fake_entry(id="m")],
         adapter_for=lambda e: adapter,
         model_name_for=lambda e: e.id,
         transcript=transcript,
-        tool_registry=None, tool_context=None, allowed_tools=[],
+        tool_registry=build_default_registry(),
+        tool_context=ctx,
+        # No work-tools — end_wakeup is auto-injected by the runtime.
+        allowed_tools=[],
     )
     result = await loop.run(
         system_prompt="",
@@ -264,3 +282,4 @@ async def test_run_with_no_tools_single_turn(loop_setup) -> None:
     assert result.turns == 1
     assert result.status == "completed"
     assert result.text == "hi"
+    assert result.declared_status == "done"

@@ -32,6 +32,12 @@ class ToolContext:
     agent_id: str | None = None
     # Extra slots added later (worktree dir, ssh sock, etc.)
     extras: dict[str, Any] = field(default_factory=dict)
+    # Captured end_wakeup(...) call args. Populated by the END_WAKEUP
+    # handler when the agent declares wakeup termination; the agent
+    # loop reads this after each tool dispatch to decide whether the
+    # wakeup is over. None means no terminal declaration yet — see
+    # docs/design/WAKEUP_END_CONTRACT.md.
+    end_wakeup_declaration: dict[str, Any] | None = None
 
     @property
     def self_mailbox(self) -> str:

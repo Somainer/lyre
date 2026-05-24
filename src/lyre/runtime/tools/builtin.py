@@ -22,7 +22,7 @@ from .mailbox import (
     MAILBOX_SEND,
     MARK_READ,
 )
-from .progress import REPORT_SIDE_EFFECT
+from .progress import END_WAKEUP, REPORT_SIDE_EFFECT
 from .python import PYTHON_EXEC
 from .shell import SHELL_EXEC
 from .tasks import DISPATCH_TASK, QUERY_TASK_STATUS
@@ -38,6 +38,7 @@ def build_default_registry() -> ToolRegistry:
         MARK_READ,
         LIST_SCHEDULED_MAIL,
         CANCEL_SCHEDULED_MAIL,
+        END_WAKEUP,
         REPORT_SIDE_EFFECT,
         DISPATCH_TASK,
         QUERY_TASK_STATUS,

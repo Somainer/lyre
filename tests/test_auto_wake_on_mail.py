@@ -546,12 +546,12 @@ async def test_full_tick_picks_up_auto_dispatched_task(
         )
     )
 
-    from lyre.adapter.llm_adapter import ContentDelta, TurnComplete
+    from lyre.adapter.llm_adapter import ContentDelta
     fake = FakeAdapter()
-    fake.push_turn([
-        ContentDelta(text="ack"),
-        TurnComplete(stop_reason="end_turn"),
-    ])
+    fake.push_done(
+        summary="ack",
+        prefix_events=[ContentDelta(text="ack")],
+    )
     scheduler = Scheduler(
         repos, cfg, poll_interval_s=0.05,
         registry=fake_registry(fake_entry(id="m-flagship", tier="flagship")),

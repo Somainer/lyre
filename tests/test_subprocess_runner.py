@@ -84,6 +84,26 @@ def _write_jsonl_script(path: Path, turns: list[list[dict]]) -> None:
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+_end_wakeup_counter = 0
+
+
+def _end_wakeup_turn_events(summary: str = "ok") -> list[dict]:
+    """Canonical end_wakeup terminal event sequence as JSONL dicts,
+    matching the WAKEUP_END_CONTRACT. Append (or splice in) to any
+    script that wants the wakeup to terminate cleanly."""
+    global _end_wakeup_counter
+    _end_wakeup_counter += 1
+    return [
+        {
+            "type": "tool_use_complete",
+            "id": f"_sub_end_wakeup_{_end_wakeup_counter}",
+            "name": "end_wakeup",
+            "input": {"status": "done", "summary": summary},
+        },
+        {"type": "turn_complete", "stop_reason": "end_turn"},
+    ]
+
+
 async def _run_subprocess_task(
     env: dict, task_id: str, *, expect_returncode: int = 0,
 ) -> tuple[int, bytes, bytes]:
@@ -138,7 +158,7 @@ async def test_subprocess_runs_scripted_task_to_completion(
             ],
             [
                 {"type": "content_delta", "text": "done"},
-                {"type": "turn_complete", "stop_reason": "end_turn"},
+                *_end_wakeup_turn_events("done"),
             ],
         ])
         env = {**sandbox["env"], "LYRE_MOCK_ADAPTER_SCRIPT": str(script_path)}
@@ -224,7 +244,7 @@ async def test_subprocess_sigkill_mid_task_recovers_via_expired_lease(
         await asyncio.sleep(1.2)
 
         # (c) Inline scheduler recovers
-        from lyre.adapter.llm_adapter import ContentDelta, TurnComplete
+        from lyre.adapter.llm_adapter import ContentDelta
         from lyre.runtime.model_registry import (
             ModelCost,
             ModelEndpoint,
@@ -248,10 +268,10 @@ async def test_subprocess_sigkill_mid_task_recovers_via_expired_lease(
         )
         registry = ModelRegistry(entries=[entry])
         fake = FakeAdapter()
-        fake.push_turn([
-            ContentDelta(text="recovered cleanly"),
-            TurnComplete(stop_reason="end_turn"),
-        ])
+        fake.push_done(
+            summary="recovered cleanly",
+            prefix_events=[ContentDelta(text="recovered cleanly")],
+        )
         cfg = Config(
             db_path=sandbox["db"],
             object_store_path=sandbox["obj"],
@@ -299,7 +319,7 @@ async def test_scheduler_subprocess_mode_dispatches_and_completes(
         _write_jsonl_script(script_path, [
             [
                 {"type": "content_delta", "text": "done"},
-                {"type": "turn_complete", "stop_reason": "end_turn"},
+                *_end_wakeup_turn_events("done"),
             ],
         ])
 
@@ -380,7 +400,7 @@ async def test_scheduler_runs_two_tasks_concurrently(
         _write_jsonl_script(script_path, [
             [
                 {"type": "content_delta", "text": "done"},
-                {"type": "turn_complete", "stop_reason": "end_turn"},
+                *_end_wakeup_turn_events("done"),
             ],
         ])
         env = {**sandbox["env"], "LYRE_MOCK_ADAPTER_SCRIPT": str(script_path)}
@@ -452,7 +472,7 @@ async def test_scheduler_respects_max_concurrent_cap(
         _write_jsonl_script(script_path, [
             [
                 {"type": "content_delta", "text": "done"},
-                {"type": "turn_complete", "stop_reason": "end_turn"},
+                *_end_wakeup_turn_events("done"),
             ],
         ])
         env = {**sandbox["env"], "LYRE_MOCK_ADAPTER_SCRIPT": str(script_path)}
@@ -525,7 +545,7 @@ async def test_concurrent_subprocess_writes_dont_corrupt_db(
         _write_jsonl_script(script_path, [
             [
                 {"type": "content_delta", "text": "done"},
-                {"type": "turn_complete", "stop_reason": "end_turn"},
+                *_end_wakeup_turn_events("done"),
             ],
         ])
         env = {**sandbox["env"], "LYRE_MOCK_ADAPTER_SCRIPT": str(script_path)}

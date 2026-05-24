@@ -46,6 +46,19 @@ log = structlog.get_logger()
 
 @dataclass
 class AgentLoopResult:
+    # Coarse outcome string, kept for back-compat with logging /
+    # legacy callers. The DETAILED declaration fields below are
+    # authoritative for the scheduler-side persistence path.
+    #
+    # Possible values:
+    #   "completed"          — agent declared status='done'
+    #   "yielded"            — agent declared status='in_progress'
+    #   "awaiting"           — agent declared status='awaiting'
+    #   "failed"             — agent declared status='failed' (any reason)
+    #   "silent_close"       — runtime forced fallback because the
+    #                          agent never declared, even after nudge
+    #   "needs_continuation" — loop hit max_turns / max_tokens before
+    #                          any declaration
     status: str
     text: str
     usage: dict[str, Any] = field(default_factory=dict)
@@ -62,10 +75,47 @@ class AgentLoopResult:
     context_peak_tokens: int = 0
     # How many times the wakeup auto-compacted its message history.
     compaction_count: int = 0
+    # End-of-wakeup declaration metadata, captured from the agent's
+    # terminal end_wakeup(...) call (or synthesised by the runtime on
+    # silent-close fallback). See WAKEUP_END_CONTRACT.md.
+    declared_status: str | None = None
+    declared_summary: str | None = None
+    declared_awaiting_on: str | None = None
+    declared_awaiting_ref: str | None = None
+    declared_failure_reason: str | None = None
+    declared_recoverable: bool | None = None
 
 
 class AllCandidatesFailedError(RuntimeError):
     """Raised when every model candidate exhausted at least one fallback try."""
+
+
+def _coarse_status_from_declaration(
+    declaration: dict[str, Any],
+    final_stop_reason: str | None,
+) -> str:
+    """Map the end-of-wakeup declaration to the coarse legacy
+    ``AgentLoopResult.status`` string.
+
+    The scheduler reads the structured ``declared_*`` fields for
+    persistence; this string is mainly for logging / back-compat with
+    tests that inspect ``result.status``.
+    """
+    status = declaration["status"]
+    if status == "done":
+        return "completed"
+    if status == "in_progress":
+        return "yielded"
+    if status == "awaiting":
+        return "awaiting"
+    if status == "failed":
+        reason = declaration.get("failure_reason")
+        if reason == "silent_close":
+            return "silent_close"
+        if reason == "loop_exhausted" and final_stop_reason != "end_turn":
+            return "needs_continuation"
+        return "failed"
+    return "failed"
 
 
 # Tools whose presence counts as "the agent did something user-facing this
@@ -86,23 +136,27 @@ _USER_FACING_TOOLS: frozenset[str] = frozenset(
 )
 
 
-_SILENT_TURN_NUDGE_TEMPLATE = (
-    "You gathered context (mailbox_read / read_memory / list_* / "
-    "mailbox_get_message / …) and produced a response with no tool "
-    "calls. The wakeup will close on the next no-tool response, and "
-    "the senders of mail you read haven't heard back yet.\n\n"
-    "If you have the answer or a concrete next step, "
-    "`mailbox_send` it now. If you need to do more work first "
-    "(shell_exec / python_exec / dispatch_task), do that — "
-    "`mailbox_send` doesn't yield the wakeup, so the natural flow "
-    "is research → reply with result → stop.\n\n"
-    "Avoid sending a vague IOU (\"I'll look into X\") with no "
-    "follow-up tools after it — that's the ack-and-stop pattern. "
-    "If you genuinely need to defer, `dispatch_task` (with a real "
-    "task_id) or future-mail yourself (`deliver_in=…`), and tell "
-    "the asker so."
+_END_WAKEUP_NUDGE_TEMPLATE = (
+    "Your last response had no `end_wakeup` call. The wakeup cannot "
+    "terminate cleanly without one — without an explicit declaration "
+    "the runtime cannot tell whether your work succeeded, is waiting "
+    "on something, or failed.\n\n"
+    "Call `end_wakeup` now with the status that best describes your "
+    "situation:\n"
+    "  - status='done' if the task goal is met (even if 'met' means "
+    "    'read mail, nothing to do' — that's a valid done).\n"
+    "  - status='awaiting' (with awaiting_on='mail' / 'subtask' / "
+    "    'time' / 'human_decision') if you're blocked on an event.\n"
+    "  - status='in_progress' if you yielded mid-task and want "
+    "    another wakeup to resume.\n"
+    "  - status='failed' (with failure_reason) if you can't proceed.\n"
+    "\n"
+    "If you legitimately need to send a reply or do one more thing "
+    "BEFORE declaring, do that AND end with end_wakeup in the same "
+    "turn. Don't fall into the ack-and-stop pattern (\"I'll look "
+    "into X\") — that becomes a forced silent_close, which surfaces "
+    "as an alert."
 )
-_MAX_SILENT_TURN_NUDGES = 2  # give the model 2 chances before giving up
 
 # Thrashing cap: if a wakeup compacts this many times, bail to silent_close.
 # More than this means the work-in-progress itself produces oversized output
@@ -314,15 +368,23 @@ class AgentLoop:
         compaction_count = 0
 
         interrupt_events: list[dict[str, Any]] = []
-        # Silent-turn nudge state: whether THIS wakeup has produced any
-        # user-facing action (reply / dispatch / await / progress report)
-        # AND whether we've already issued a one-shot nudge. Defends
-        # against the observed DeepSeek pattern where the model gathers
-        # context (mailbox_read / list_*) then produces a final text
-        # response with no tool calls — the wakeup looks "completed" but
-        # the owner never received a reply.
+        # End-of-wakeup declaration state. ``end_wakeup_called`` flips
+        # to True the instant the agent's ``end_wakeup(...)`` tool call
+        # is dispatched successfully; the ToolContext carries the
+        # captured args via ``end_wakeup_declaration``. Once True, the
+        # loop drops any trailing tool calls in the same turn and
+        # breaks out — no more LLM calls.
+        # ``end_wakeup_nudge_used`` ensures we nudge for a declaration
+        # at most once per wakeup. See WAKEUP_END_CONTRACT.md §6b.
+        end_wakeup_called = False
+        end_wakeup_nudge_used = False
+        # ``made_user_facing_action`` is kept for one purpose only: if
+        # the runtime ends up force-declaring silent_close (no
+        # end_wakeup even after nudge), and the agent never did
+        # anything visible to mail senders, fire the silent_close
+        # apology mail so askers aren't left in the dark. See
+        # ``_emit_silent_close_fallback``.
         made_user_facing_action = False
-        silent_turn_nudges_used = 0
         # Track senders of mail this wakeup auto-marked as read. If the
         # wakeup ends without made_user_facing_action AND the nudge budget
         # was exhausted, we send each of them a fallback mail so they
@@ -454,15 +516,23 @@ class AgentLoop:
                             where="post_turn_before_break",
                         )
                         continue
-                    # Silent-turn nudge: only fires when this wakeup has
-                    # called tools that were all info-gathering (no
-                    # mailbox_send, no dispatch, etc.). Plain text-only
-                    # responses are not nudged — chat is a legit action.
+                    # End-of-wakeup nudge: if the agent ended a turn
+                    # with no tool_uses AND no end_wakeup declaration,
+                    # inject one nudge requesting an explicit terminal
+                    # call. After the nudge, if the agent still doesn't
+                    # declare, the post-loop fallback synthesises
+                    # failed/silent_close (see WAKEUP_END_CONTRACT.md
+                    # §6b). Only one nudge per wakeup — the loop exit
+                    # path drops through to the fallback otherwise.
+                    #
+                    # Skip when no tool_context is wired up — that's
+                    # the permissive low-level mechanics path where the
+                    # contract has nowhere to land.
                     if (
-                        stop_reason == "end_turn"
-                        and all_tool_calls
-                        and not made_user_facing_action
-                        and silent_turn_nudges_used < _MAX_SILENT_TURN_NUDGES
+                        self.tool_context is not None
+                        and stop_reason == "end_turn"
+                        and not end_wakeup_called
+                        and not end_wakeup_nudge_used
                     ):
                         self._append_assistant_message(
                             messages, final_text, [],
@@ -474,16 +544,13 @@ class AgentLoop:
                                 content=[
                                     LyreContentBlock(
                                         type="text",
-                                        text=_SILENT_TURN_NUDGE_TEMPLATE,
+                                        text=_END_WAKEUP_NUDGE_TEMPLATE,
                                     )
                                 ],
                             )
                         )
-                        silent_turn_nudges_used += 1
-                        self.transcript.note(
-                            f"silent_turn_nudge_injected "
-                            f"({silent_turn_nudges_used}/{_MAX_SILENT_TURN_NUDGES})"
-                        )
+                        end_wakeup_nudge_used = True
+                        self.transcript.note("end_wakeup_nudge_injected")
                         continue
                     break
 
@@ -506,9 +573,41 @@ class AgentLoop:
                 )
             messages.append(LyreMessage(role="assistant", content=assistant_blocks))
 
-            # Execute tools and feed results back.
+            # Execute tools and feed results back. If end_wakeup fires
+            # mid-list, any subsequent tool_uses in this turn are
+            # *dropped* with a synthetic error result — the wakeup is
+            # terminating, those calls would run on borrowed time and
+            # might mutate state the agent didn't intend post-declaration.
             tool_result_blocks = []
             for tu in tool_uses_this_turn:
+                if end_wakeup_called:
+                    # Trailing tool call after the terminal declaration.
+                    # Append a synthetic error tool_result (every
+                    # tool_use must have a matching tool_result, even
+                    # if we never dispatched) and log a warning so the
+                    # operator can see the contract violation.
+                    drop_msg = (
+                        "dropped: end_wakeup already declared this "
+                        "turn; further tool calls are ignored"
+                    )
+                    tool_result_blocks.append(
+                        LyreContentBlock(
+                            type="tool_result",
+                            tool_use_id=tu["id"],
+                            tool_result={"error": drop_msg},
+                            is_error=True,
+                        )
+                    )
+                    tool_outcomes.append(True)
+                    self.transcript.note(
+                        f"wakeup_post_end_tool_calls_ignored: {tu['name']}"
+                    )
+                    log.warning(
+                        "wakeup_post_end_tool_calls_ignored",
+                        tool=tu["name"],
+                        tool_use_id=tu["id"],
+                    )
+                    continue
                 result, is_error = await self._dispatch_tool(
                     tu["name"], tu["id"], tu["input"]
                 )
@@ -536,18 +635,38 @@ class AgentLoop:
                         _askers_from_mailbox_read(result)
                     )
                 # Track whether this wakeup ever ATTEMPTED a user-facing
-                # action. We use attempt (not success) because a model
-                # that tried mailbox_send and got an error already saw it
-                # and can retry — that's not the silent-turn failure
-                # pattern we're guarding against.
+                # action. Drives the silent_close apology decision: if
+                # the runtime ends up force-declaring silent_close AND
+                # the agent never did anything visible to the askers,
+                # we send a fallback apology so they aren't left in
+                # the dark.
                 if tu["name"] in _USER_FACING_TOOLS:
                     made_user_facing_action = True
+                # Capture the end_wakeup declaration as soon as it
+                # fires — the next iteration of this for-loop will
+                # short-circuit any trailing tool calls, and the
+                # outer for-turn loop will break on end_wakeup_called.
+                if (
+                    tu["name"] == "end_wakeup"
+                    and not is_error
+                    and self.tool_context is not None
+                    and self.tool_context.end_wakeup_declaration is not None
+                ):
+                    end_wakeup_called = True
                 # Kill point 2 / "mid_action_after_tool": fires right after a
                 # successful (or errored) tool dispatch. Lets chaos tests
                 # simulate process death partway through real work.
                 if self.kill_switch is not None:
                     self.kill_switch.check("mid_action_after_tool")
             messages.append(LyreMessage(role="user", content=tool_result_blocks))
+
+            # If end_wakeup just fired this turn, the wakeup is over —
+            # any tool_use blocks after end_wakeup in the same turn were
+            # already dropped during dispatch with synthetic error
+            # results, the tool_results message is in place, and we
+            # break out of the for-turn loop. No further LLM call.
+            if end_wakeup_called:
+                break
 
             # After executing tool calls we ALWAYS give the model another
             # turn to react to tool_results, regardless of stop_reason.
@@ -560,35 +679,7 @@ class AgentLoop:
             # silent failure — the model called mailbox_send, got the
             # "reminder: this doesn't end the wakeup" tool_result, but
             # the loop exited before that result was ever sent back.
-            #
-            # The real exit point is up at line ~331 (no tool_uses this
-            # turn → silent-turn nudge if applicable, else break).
             # max_turns is the safety cap on a runaway tool loop.
-            if (
-                stop_reason == "end_turn"
-                and all_tool_calls
-                and not made_user_facing_action
-                and silent_turn_nudges_used < _MAX_SILENT_TURN_NUDGES
-            ):
-                # Model gathered context (info tools only), no reply
-                # sent. Inject a nudge alongside the tool_results so the
-                # next response is forced to act.
-                messages.append(
-                    LyreMessage(
-                        role="user",
-                        content=[
-                            LyreContentBlock(
-                                type="text",
-                                text=_SILENT_TURN_NUDGE_TEMPLATE,
-                            )
-                        ],
-                    )
-                )
-                silent_turn_nudges_used += 1
-                self.transcript.note(
-                    f"silent_turn_nudge_injected "
-                    f"({silent_turn_nudges_used}/{_MAX_SILENT_TURN_NUDGES})"
-                )
 
             # ----------------------------------------------------------
             # Auto-compact: if THIS turn's input_tokens crossed the
@@ -621,15 +712,11 @@ class AgentLoop:
                         turn_input_tokens=turn_usage[0],
                         context_window=ctx_window,
                     )
-                    # Force-exit with a special stop_reason. Reuses the
-                    # silent_close fallback path below for the apology
-                    # email.
+                    # Force-exit with a special stop_reason. The post-loop
+                    # silent-close fallback then synthesises the
+                    # failed/silent_close declaration since no
+                    # end_wakeup call landed.
                     final_stop_reason = "end_turn"
-                    # Mark as silent so silent_close detection fires
-                    # (treats this wakeup as "context blew up before
-                    # the agent could finish replying").
-                    made_user_facing_action = False
-                    silent_turn_nudges_used = _MAX_SILENT_TURN_NUDGES
                     break
 
                 # Find the candidate we just successfully ran on, so
@@ -684,29 +771,109 @@ class AgentLoop:
 
         wall_ms = int((time.time() - started) * 1000)
 
-        # Silent-close detection: wakeup ended after exhausting the nudge
-        # budget without ever calling a user-facing tool. The model
-        # gathered context but never replied. Auto-send a fallback mail
-        # to each asker so the wakeup isn't experienced as pure silence.
-        silent_close = (
-            final_stop_reason == "end_turn"
-            and silent_turn_nudges_used >= _MAX_SILENT_TURN_NUDGES
+        # Resolve the end-of-wakeup declaration.
+        #
+        # Four paths land here:
+        #   1. Agent declared via end_wakeup(...) — declaration is on
+        #      the ToolContext, take it as authoritative.
+        #   2. Loop exited via end_turn-without-tools, but no
+        #      declaration even after the nudge — synthesise a
+        #      failed/silent_close declaration so downstream
+        #      persistence is uniform.
+        #   3. Loop hit max_turns (final_stop_reason != end_turn) —
+        #      synthesise failed/loop_exhausted with recoverable=True
+        #      (transient wedge, the next dispatch might succeed).
+        #   4. Loop was built WITHOUT a tool_context (low-level unit
+        #      tests of stream / fallback / interrupt mechanics where
+        #      no tool dispatch is ever wired up). The contract has
+        #      nowhere to land, so synthesise a "done" declaration
+        #      based on whether the loop exited cleanly — this keeps
+        #      the loop testable in isolation without forcing every
+        #      mechanics test to thread through a real registry.
+        declaration: dict[str, Any] | None = (
+            self.tool_context.end_wakeup_declaration
+            if self.tool_context is not None else None
+        )
+        forced_silent_close = False
+        permissive_no_context = self.tool_context is None
+        if declaration is None and permissive_no_context:
+            # Path 4: no tool_context → treat clean end_turn as
+            # "completed", exhausted loops as failed/loop_exhausted.
+            if final_stop_reason == "end_turn":
+                declaration = {
+                    "status": "done",
+                    "summary": "(test) loop ran without tool_context",
+                    "awaiting_on": None,
+                    "awaiting_ref": None,
+                    "failure_reason": None,
+                    "recoverable": None,
+                }
+            else:
+                declaration = {
+                    "status": "failed",
+                    "summary": "(test) loop exhausted turns without tool_context",
+                    "awaiting_on": None,
+                    "awaiting_ref": None,
+                    "failure_reason": "loop_exhausted",
+                    "recoverable": True,
+                }
+        elif declaration is None:
+            if final_stop_reason == "end_turn":
+                # Path 2: silent close — agent never declared.
+                forced_silent_close = True
+                declaration = {
+                    "status": "failed",
+                    "summary": (
+                        "(auto) wakeup ended without declaring an "
+                        "outcome via end_wakeup. The runtime force-"
+                        "recorded silent_close."
+                    ),
+                    "awaiting_on": None,
+                    "awaiting_ref": None,
+                    "failure_reason": "silent_close",
+                    "recoverable": False,
+                }
+                self.transcript.note("wakeup_silent_close_forced")
+                log.warning(
+                    "wakeup_silent_close_forced",
+                    turns=turn_count,
+                    tool_call_count=len(all_tool_calls),
+                )
+            else:
+                # Path 3: ran out of turns / tokens before declaration.
+                declaration = {
+                    "status": "failed",
+                    "summary": (
+                        "(auto) wakeup exhausted its turn budget "
+                        "without declaring an outcome."
+                    ),
+                    "awaiting_on": None,
+                    "awaiting_ref": None,
+                    "failure_reason": "loop_exhausted",
+                    "recoverable": True,
+                }
+                self.transcript.note("wakeup_loop_exhausted_forced")
+
+        # Silent-close apology mail: only when we force-declared
+        # silent_close AND there are mail senders waiting AND the
+        # agent never did anything visible. The apology IS the
+        # agent's reply, so we only send it when the agent didn't
+        # produce one of its own.
+        if (
+            forced_silent_close
             and not made_user_facing_action
             and bool(all_tool_calls)
-        )
-        if silent_close:
+        ):
             await self._emit_silent_close_fallback(
                 askers=silent_close_askers,
                 tool_calls=all_tool_calls,
                 final_text=final_text,
             )
 
-        result_status = (
-            "silent_close"
-            if silent_close
-            else "completed"
-            if final_stop_reason == "end_turn"
-            else "needs_continuation"
+        # Coarse legacy status string. Authoritative info is in the
+        # declared_* fields below.
+        result_status = _coarse_status_from_declaration(
+            declaration, final_stop_reason,
         )
 
         # Phantom-delegation observability: if this wakeup sent any
@@ -742,6 +909,12 @@ class AgentLoop:
             interrupt_events=interrupt_events,
             context_peak_tokens=context_peak_tokens,
             compaction_count=compaction_count,
+            declared_status=declaration["status"],
+            declared_summary=declaration["summary"],
+            declared_awaiting_on=declaration["awaiting_on"],
+            declared_awaiting_ref=declaration["awaiting_ref"],
+            declared_failure_reason=declaration["failure_reason"],
+            declared_recoverable=declaration["recoverable"],
         )
 
     # ------------------------------------------------------------------
@@ -986,9 +1159,16 @@ class AgentLoop:
     # ------------------------------------------------------------------
 
     def _tool_specs(self) -> list[LyreToolSpec]:
-        if not self.tool_registry or not self.allowed_tools:
+        if not self.tool_registry:
             return []
-        return self.tool_registry.specs_for(self.allowed_tools)
+        # ``end_wakeup`` is part of the runtime contract — every wakeup
+        # must declare termination via it, so it's always advertised to
+        # the model regardless of the persona's allowlist.
+        # WAKEUP_END_CONTRACT.md §6a.
+        names = list(self.allowed_tools) if self.allowed_tools else []
+        if "end_wakeup" not in names:
+            names.append("end_wakeup")
+        return self.tool_registry.specs_for(names)
 
     def _context_window_for(self, model_id: str | None) -> int | None:
         """Returns the active model's context_window in tokens, or None
@@ -1005,7 +1185,10 @@ class AgentLoop:
     ) -> tuple[str, bool]:
         if not self.tool_registry or not self.tool_context:
             return ("Tool dispatch not configured for this agent loop.", True)
-        if name not in self.allowed_tools:
+        # end_wakeup is part of the runtime contract — always callable
+        # regardless of the persona allowlist. Everything else has to
+        # be in the list.
+        if name != "end_wakeup" and name not in self.allowed_tools:
             return (
                 f"Tool '{name}' is not in this persona's allowlist: {self.allowed_tools}.",
                 True,

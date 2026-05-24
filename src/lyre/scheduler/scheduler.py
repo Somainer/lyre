@@ -35,7 +35,7 @@ from ..config import Config
 from ..persistence.models import Persona, ScheduledMail, TaskSpec
 from ..persistence.repositories import Repositories
 from ..runtime.adapter_factory import AdapterFactory, model_name_for_provider
-from ..runtime.agent_loop import AgentLoop
+from ..runtime.agent_loop import AgentLoop, AgentLoopResult
 from ..runtime.context import assemble_initial_user_message, assemble_system_prompt
 from ..runtime.git_context import GitContextHandle, GitContextProvisioner
 from ..runtime.health_tracker import HealthTracker
@@ -56,36 +56,39 @@ from ..runtime.worktree import WorktreeHandle, WorktreeManager
 log = structlog.get_logger()
 
 
-# Wakeup-level statuses produced by AgentLoopResult are richer than
-# the task-level TaskStatus enum that tasks.status is CHECK-constrained
-# to. Translate them at the boundary:
+# Maps an AgentLoopResult's declared end-of-wakeup state onto the
+# two columns that need to be set: wakeups.end_status (richer; used
+# by dashboard / future supervisor) and tasks.status (the CHECK-
+# constrained lifecycle enum). See docs/design/WAKEUP_END_CONTRACT.md.
 #
-#   completed          → completed  (passthrough)
-#   failed             → failed     (passthrough)
-#   cancelled          → cancelled  (passthrough)
-#   silent_close       → completed
-#       The wakeup ran but composed no user-facing reply. The task
-#       itself terminated normally — the silent-close detail lives
-#       on wakeups.end_status, not on the task.
-#   needs_continuation → failed
-#       The loop bailed because it hit max_turns or max_tokens —
-#       usually the model is stuck repeating a malformed tool call
-#       (e.g. truncated args). Marking the task failed is honest
-#       and prevents the scheduler from blindly re-enqueueing the
-#       same wedged state. Owner / dispatcher can re-dispatch with
-#       a fresh plan if recovery is desired.
-#
-# Without this mapping, writing the raw wakeup status to tasks.status
-# trips the DB CHECK constraint and the scheduler's post-loop write
-# crashes mid-tick, leaving the lease orphaned.
-_WAKEUP_TO_TASK_STATUS: dict[str, str] = {
-    "silent_close": "completed",
-    "needs_continuation": "failed",
-}
+# Inputs are the four declared statuses (done / in_progress /
+# awaiting / failed) plus the failure_reason / awaiting_on enums.
+# Both columns are derived in one place so the scheduler doesn't
+# accidentally end up writing tasks.status='awaiting_mail' (would
+# trip the CHECK) or similar mismatches.
+def _resolve_end_statuses(result: AgentLoopResult) -> tuple[str, str]:
+    """Return (wakeups.end_status, tasks.status) for this result.
 
-
-def _wakeup_status_to_task_status(wakeup_status: str) -> str:
-    return _WAKEUP_TO_TASK_STATUS.get(wakeup_status, wakeup_status)
+    Single source of truth for translating the agent's declaration
+    into persisted columns. ``wakeups.end_status`` is granular
+    (carries the failure_reason or awaiting_on suffix); ``tasks.status``
+    is the CHECK-constrained lifecycle value.
+    """
+    s = result.declared_status
+    if s == "done":
+        return "completed", "completed"
+    if s == "in_progress":
+        return "yielded", "in_progress"
+    if s == "awaiting":
+        suffix = result.declared_awaiting_on or "unknown"
+        return f"awaiting_{suffix}", "needs_input"
+    if s == "failed":
+        reason = result.declared_failure_reason or "unspecified"
+        return f"failed_{reason}", "failed"
+    # Shouldn't happen — AgentLoopResult always has declared_status
+    # populated (synthesised by the runtime when the agent didn't
+    # declare). Treat as failed to keep the system honest.
+    return "failed_unknown", "failed"
 
 
 class Scheduler:
@@ -912,9 +915,10 @@ class Scheduler:
             chosen_entry = (
                 self.registry.by_id(result.model_id) if result.model_id else None
             )
+            wakeup_end_status, task_status = _resolve_end_statuses(result)
             await self.repos.wakeups.end(
                 wakeup_id,
-                end_status=result.status,  # may be "silent_close" — wakeup-only signal
+                end_status=wakeup_end_status,
                 metering={
                     "token_input": result.usage.get("input_tokens"),
                     "token_output": result.usage.get("output_tokens"),
@@ -925,8 +929,11 @@ class Scheduler:
                     "context_peak_tokens": result.context_peak_tokens,
                     "compaction_count": result.compaction_count,
                 },
+                awaiting_on=result.declared_awaiting_on,
+                awaiting_ref=result.declared_awaiting_ref,
+                failure_reason=result.declared_failure_reason,
+                recoverable=result.declared_recoverable,
             )
-            task_status = _wakeup_status_to_task_status(result.status)
             await self.repos.tasks.update_status(task_id, task_status)
             succeeded = task_status == "completed"
             log.info(
@@ -962,8 +969,10 @@ class Scheduler:
             log.exception("task_failed", task_id=task_id, error=str(e))
             await self.repos.wakeups.end(
                 wakeup_id,
-                end_status="failed",
+                end_status="failed_runtime_exception",
                 failure_report={"error": str(e), "type": type(e).__name__},
+                failure_reason="tool_error",
+                recoverable=False,
             )
             await self.repos.tasks.update_status(task_id, "failed")
         finally:
