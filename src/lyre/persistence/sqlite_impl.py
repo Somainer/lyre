@@ -664,18 +664,95 @@ class SqliteWakeupRepository:
 
     async def has_active_for_agent(self, agent_id: str) -> bool:
         """True iff some wakeup of ``agent_id`` is currently running
-        (``ended_at IS NULL``). The scheduler uses this to enforce the
-        "agents are sequential actors" invariant: a second pending
-        task for the same agent must wait until the first one's
-        wakeup finishes, otherwise concurrent processes can race on
-        the agent's shared filesystem state (scratchpad, notes,
-        ## Auto-summary log).
+        (``ended_at IS NULL``) AND its task is still in flight. The
+        scheduler uses this to enforce the "agents are sequential
+        actors" invariant: a second pending task for the same agent
+        must wait until the first one's wakeup finishes, otherwise
+        concurrent processes can race on the agent's shared
+        filesystem state (scratchpad, notes, ## Auto-summary log).
+
+        The JOIN-and-filter against ``tasks.status`` is deliberate.
+        Without it, a wakeup row left with ``ended_at IS NULL`` after
+        its task reached a terminal state (e.g. kill-test recovery
+        re-ran the task to completion under a new wakeup, but the
+        first wakeup's process never finalised its own row) would
+        permanently latch this check shut for the whole agent — all
+        future pending tasks of that agent get skipped on every
+        scheduler tick. Pairing this filter with
+        ``close_orphans_for_task`` at recovery time covers both the
+        symptom (this check) and the source (orphan rows accumulate).
         """
         async with self.conn.execute(
-            "SELECT 1 FROM wakeups WHERE agent_id = ? AND ended_at IS NULL LIMIT 1",
+            """
+            SELECT 1
+            FROM wakeups w
+            JOIN tasks t ON t.id = w.task_id
+            WHERE w.agent_id = ?
+              AND w.ended_at IS NULL
+              AND t.status IN ('pending', 'in_progress', 'needs_input')
+            LIMIT 1
+            """,
             (agent_id,),
         ) as cur:
             return (await cur.fetchone()) is not None
+
+    async def close_orphans_for_task(
+        self, task_id: str, end_status: str = "abandoned"
+    ) -> int:
+        """Force-close wakeups of ``task_id`` still flagged active.
+
+        The recovery path (``find_expired_leases`` → ``_run_task`` for a
+        task whose previous wakeup process died) used to leave the
+        dead wakeup's row open forever: the surviving process never
+        had a handle to that row, and the end-of-wakeup write that
+        would have set ``ended_at`` never ran. The orphaned row then
+        poisoned ``has_active_for_agent`` for the rest of the agent's
+        lifetime. Sweeping by ``task_id`` at the top of every
+        ``_run_task_inline`` invocation closes whatever the prior
+        attempt left behind, without touching ``tasks.status`` (that's
+        the task's own concern — the scheduler will re-claim or skip
+        it based on lease + status in the normal way).
+        """
+        async with self.conn.execute(
+            """
+            UPDATE wakeups
+            SET ended_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                end_status = ?
+            WHERE task_id = ? AND ended_at IS NULL
+            """,
+            (end_status, task_id),
+        ) as cur:
+            n = cur.rowcount
+        await self.conn.commit()
+        return n
+
+    async def find_terminal_task_orphans(
+        self, limit: int = 10
+    ) -> list[dict[str, str]]:
+        async with self.conn.execute(
+            """
+            SELECT w.id AS wakeup_id,
+                   w.task_id,
+                   w.agent_id,
+                   t.status AS task_status
+            FROM wakeups w JOIN tasks t ON t.id = w.task_id
+            WHERE w.ended_at IS NULL
+              AND t.status IN ('completed', 'failed', 'cancelled')
+            ORDER BY w.started_at
+            LIMIT ?
+            """,
+            (limit,),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [
+            {
+                "wakeup_id": r["wakeup_id"],
+                "task_id": r["task_id"],
+                "agent_id": r["agent_id"] or "",
+                "task_status": r["task_status"],
+            }
+            for r in rows
+        ]
 
     @staticmethod
     def _row_to_wakeup(r: aiosqlite.Row) -> Wakeup:

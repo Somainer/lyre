@@ -196,6 +196,47 @@ class WakeupRepository(Protocol):
         never run concurrently. Parallelism within a persona uses
         multiple AGENT INSTANCES (e.g. ``analyst/topic-A`` +
         ``analyst/topic-B``), not multiple wakeups of one agent.
+
+        Only wakeups whose task is still in flight count — a wakeup
+        row left with ``ended_at IS NULL`` for a task that has since
+        reached a terminal state (completed/failed/cancelled) is
+        stale metadata, not a real running process, and must not
+        latch dispatch shut for the whole agent.
+        """
+        ...
+
+    async def close_orphans_for_task(
+        self, task_id: str, end_status: str = "abandoned"
+    ) -> int:
+        """Mark every wakeup of ``task_id`` still flagged active
+        (``ended_at IS NULL``) as ended right now, using ``end_status``.
+
+        Called at the top of ``Scheduler._run_task_inline`` so the
+        kill-test recovery path (where a previous wakeup's process
+        died without writing ``ended_at``, leaving an orphan row that
+        permanently trips ``has_active_for_agent``) cleans itself up
+        before opening a fresh wakeup. Returns the number of rows
+        touched so the caller can surface a warning when recovery
+        actually fired.
+        """
+        ...
+
+    async def find_terminal_task_orphans(
+        self, limit: int = 10
+    ) -> list[dict[str, str]]:
+        """Wakeups still flagged active (``ended_at IS NULL``) whose
+        task already reached a terminal state. Each dict carries
+        ``wakeup_id`` / ``task_id`` / ``agent_id`` / ``task_status``.
+
+        Called once at scheduler startup as an audit. The pairing is
+        impossible in steady-state — a terminal task can't have a
+        running wakeup — so any rows surfaced here indicate prior
+        runtime metadata corruption (typically a crash window between
+        ``tasks.update_status`` and ``wakeups.end``). The scheduler
+        logs but does NOT auto-close: the JOIN in
+        ``has_active_for_agent`` already prevents these from blocking
+        dispatch, so leaving the row visible is intentional — it
+        documents the corruption for the operator.
         """
         ...
 
