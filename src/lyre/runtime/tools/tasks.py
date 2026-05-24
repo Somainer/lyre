@@ -124,7 +124,6 @@ async def _query_task_status(ctx: ToolContext, args: dict[str, Any]) -> dict[str
         "id": t.id,
         "persona": t.persona_name,
         "status": t.status,
-        "checkpoint": t.checkpoint,
         "parent_task_id": t.parent_task_id,
     }
 

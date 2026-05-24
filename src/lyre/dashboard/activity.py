@@ -57,20 +57,45 @@ def _severity_for_task(status: str) -> str:
 
 
 def _severity_for_wakeup(end_status: str | None) -> str:
-    if end_status == "failed":
-        return "alert"
-    # silent_close is "ran but produced no reply" — operator should know.
-    if end_status == "silent_close":
-        return "alert"
+    if end_status is None:
+        return "info"
+    # Post WAKEUP_END_CONTRACT, end_status is the agent's declaration
+    # mapped through scheduler._resolve_end_statuses(). The set of
+    # possible values is now:
+    #   completed                 — agent declared done
+    #   yielded                   — agent declared in_progress
+    #   awaiting_<kind>           — agent declared awaiting
+    #   failed_<reason>           — agent or runtime declared failed
+    #   failed_runtime_exception  — uncaught Python exception
+    #   abandoned                 — scheduler force-closed an orphan
+    # plus the legacy values from before the contract: completed /
+    # silent_close / needs_continuation / failed (kept here so audit
+    # views of historical rows still render correctly).
     if end_status == "completed":
         return "ok"
-    if end_status == "needs_continuation":
-        return "warn"
+    if end_status == "yielded":
+        return "info"
+    if end_status.startswith("awaiting_"):
+        return "info"
+    if end_status == "failed_silent_close":
+        # Same operator-visibility intent as the legacy "silent_close"
+        # value — agent never declared an outcome and the runtime
+        # synthesised the fallback.
+        return "alert"
+    if end_status.startswith("failed_"):
+        return "alert"
     # "abandoned" is set when the scheduler force-closes an orphan
     # wakeup row (recovery sweep or failed claim_lease). Worth seeing
     # in the timeline so operators notice repeat occurrences, but not
     # an alert — the underlying task lifecycle is unaffected.
     if end_status == "abandoned":
+        return "warn"
+    # Legacy values from pre-contract rows.
+    if end_status == "failed":
+        return "alert"
+    if end_status == "silent_close":
+        return "alert"
+    if end_status == "needs_continuation":
         return "warn"
     return "info"
 

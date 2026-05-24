@@ -60,6 +60,26 @@ pytestmark = pytest.mark.skipif(not _HAVE_TOOLS, reason="git / ssh tooling missi
 # ---------------------------------------------------------------------------
 
 
+_end_wakeup_counter = 0
+
+
+def _end_wakeup_events(summary: str = "ok") -> list[StreamEvent]:
+    """Canonical terminal-declaration event sequence per
+    WAKEUP_END_CONTRACT — append this to any ScriptedAdapter script
+    that wants the wakeup to end cleanly."""
+    global _end_wakeup_counter
+    _end_wakeup_counter += 1
+    return [
+        ToolUseComplete(
+            id=f"_chaos_end_wakeup_{_end_wakeup_counter}",
+            name="end_wakeup",
+            input={"status": "done", "summary": summary},
+        ),
+        Usage(input_tokens=5, output_tokens=2),
+        TurnComplete(stop_reason="end_turn"),
+    ]
+
+
 class ScriptedAdapter:
     """A FakeAdapter that yields different scripts depending on which call it
     is — useful when 'first wakeup' and 'restart wakeup' need distinct
@@ -232,7 +252,7 @@ async def test_kill_1_before_action_recovers_via_expired_lease(
             Usage(input_tokens=10, output_tokens=2),
             TurnComplete(stop_reason="tool_use"),
         ],
-        [ContentDelta(text="done"), TurnComplete(stop_reason="end_turn")],
+        [ContentDelta(text="done"), *_end_wakeup_events("done")],
     ])
     scheduler2 = Scheduler(
         repos, cfg, poll_interval_s=0.05,
@@ -305,7 +325,7 @@ async def test_kill_2_mid_action_recovers_and_completes(
     fake2 = ScriptedAdapter([
         [
             ContentDelta(text="all done"),
-            TurnComplete(stop_reason="end_turn"),
+            *_end_wakeup_events("all done"),
         ],
     ])
     scheduler2 = Scheduler(
@@ -410,9 +430,9 @@ async def test_kill_3_post_commit_pre_report_agent_recovers_from_remote(
             TurnComplete(stop_reason="tool_use"),
         ],
         # Agent has finished pushing. It hasn't called report_side_effect yet.
-        # End the turn with end_turn so agent_loop returns normally. Then the
+        # End the turn with end_wakeup so agent_loop returns normally. Then the
         # scheduler-level kill_switch fires at post_action_pre_report.
-        [ContentDelta(text="pushed"), TurnComplete(stop_reason="end_turn")],
+        [ContentDelta(text="pushed"), *_end_wakeup_events("pushed")],
     ]
     fake1 = ScriptedAdapter(first_run_turns)
     kill = KillSwitch(fire_at="post_action_pre_report")
@@ -456,7 +476,7 @@ async def test_kill_3_post_commit_pre_report_agent_recovers_from_remote(
                        "payload": {"branch": branch, "url": origin_url}}),
             TurnComplete(stop_reason="tool_use"),
         ],
-        [ContentDelta(text="recovered"), TurnComplete(stop_reason="end_turn")],
+        [ContentDelta(text="recovered"), *_end_wakeup_events("recovered")],
     ]
     fake2 = ScriptedAdapter(second_run_turns)
     scheduler2 = Scheduler(
@@ -516,7 +536,7 @@ async def test_kill_4_outbox_dispatcher_resumes_after_restart(
                 input={"to": "owner", "body": "hello"}),
             TurnComplete(stop_reason="tool_use"),
         ],
-        [ContentDelta(text="done"), TurnComplete(stop_reason="end_turn")],
+        [ContentDelta(text="done"), *_end_wakeup_events("done")],
     ])
     scheduler = Scheduler(
         repos, cfg, poll_interval_s=0.05,

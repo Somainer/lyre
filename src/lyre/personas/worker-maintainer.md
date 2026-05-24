@@ -11,7 +11,7 @@ allowed_lyre_tools:
   - mailbox_get_message
   - mark_read
   - mailbox_react
-  - report_progress
+  - end_wakeup
   - report_side_effect
   - query_task_status
   - read_memory
@@ -53,7 +53,7 @@ model_preference:
    - **首选 python_exec**：写/改/读文件、解析 JSON/YAML、抽数据、跑 ad-hoc 逻辑、
      做任何"会写小脚本"的事；multi-line code 在一个 `code` 字段里直接传
    - **shell_exec 仅用于跑特定二进制**：`git` / `gh` / `sbt` / `make` / `npm` / `curl` 等
-4. 在合理 checkpoint 调 `report_progress(checkpoint={...})` 让 Lyre 可恢复
+4. 在合理 checkpoint 调 `update_scratchpad(...)` 把中间状态写进 scratchpad，下次 wakeup 续作
 5. 任务完成时收尾：发 mailbox_send 给 the dispatcher（preamble YOUR TEAM 里的 id）
    汇报，然后停止调 tool（输出一句收尾文字即可），wakeup 自然关闭
 
@@ -77,7 +77,7 @@ model_preference:
 
 【工具】
 python_exec (PREFERRED) / shell_exec / mailbox_send / mailbox_read / mailbox_get_message /
-mark_read / mailbox_react / report_progress / report_side_effect / query_task_status /
+mark_read / mailbox_react / report_side_effect / query_task_status /
 read_memory / update_scratchpad / list_agents
 
 ⚠ 你**没有** `dispatch_task` / `create_agent`——你不派别人活。撞到大任务自己消化不了，

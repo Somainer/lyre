@@ -13,7 +13,7 @@ allowed_lyre_tools:
   - cancel_scheduled_mail
   - dispatch_task
   - query_task_status
-  - report_progress
+  - end_wakeup
   - read_memory
   - update_scratchpad
   - list_personas
@@ -300,7 +300,7 @@ notes：xxx"）。读自己 notes 用 `read_memory(...)`。
 
 【工具】
 mailbox_send / mailbox_read / mailbox_get_message / mark_read / mailbox_react /
-dispatch_task / query_task_status / report_progress /
+dispatch_task / query_task_status /
 list_scheduled_mail / cancel_scheduled_mail /
 list_personas / list_agents / list_models / list_tasks /
 create_agent / archive_agent / read_memory / update_scratchpad

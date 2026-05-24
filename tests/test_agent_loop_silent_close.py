@@ -168,7 +168,7 @@ async def test_mailbox_react_skips_silent_close(silent_setup) -> None:
             TurnComplete(stop_reason="tool_use"),
         ]
     )
-    adapter.push_turn([TurnComplete(stop_reason="end_turn")])
+    adapter.push_done(summary="acked the mail, nothing else to do")
 
     loop = AgentLoop(
         candidates=[fake_entry(id="m")],
@@ -219,7 +219,7 @@ async def test_reply_in_same_wakeup_skips_silent_close(silent_setup) -> None:
             TurnComplete(stop_reason="tool_use"),
         ]
     )
-    adapter.push_turn([TurnComplete(stop_reason="end_turn")])
+    adapter.push_done(summary="replied to owner")
 
     loop = AgentLoop(
         candidates=[fake_entry(id="m")],
@@ -312,9 +312,9 @@ async def test_loop_continues_after_tool_use_with_end_turn_stop_reason(
         ]
     )
     # Turn 2: model sees the mailbox_send tool_result + the reminder
-    # field, decides nothing more to do, emits an end_turn with no
-    # tools. This is the natural exit.
-    adapter.push_turn([TurnComplete(stop_reason="end_turn")])
+    # field, decides nothing more to do, and declares end_wakeup(done).
+    # This is the natural exit per WAKEUP_END_CONTRACT.
+    adapter.push_done(summary="reply sent")
 
     loop = AgentLoop(
         candidates=[fake_entry(id="m")],

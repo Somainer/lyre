@@ -68,7 +68,7 @@ async def _seed_personas(repos: SqliteRepositories) -> None:
             role_description="worker",
             system_prompt="you write code",
             allowed_lyre_tools=[
-                "python_exec", "shell_exec", "mailbox_send", "report_progress",
+                "python_exec", "shell_exec", "mailbox_send",
             ],
             model_preference={
                 "tier": "workhorse", "requires": ["tool_use"], "prefer": [],
@@ -191,10 +191,10 @@ async def test_skill_proposal_approve_reuse_loop(
         ),
         TurnComplete(stop_reason="tool_use"),
     ])
-    worker_adapter1.push_turn([
-        ContentDelta(text="proposal sent"),
-        TurnComplete(stop_reason="end_turn"),
-    ])
+    worker_adapter1.push_done(
+        summary="proposal sent",
+        prefix_events=[ContentDelta(text="proposal sent")],
+    )
 
     scheduler1 = Scheduler(
         repos, cfg, poll_interval_s=0.05,
@@ -246,10 +246,10 @@ async def test_skill_proposal_approve_reuse_loop(
         ),
         TurnComplete(stop_reason="tool_use"),
     ])
-    reviewer_adapter.push_turn([
-        ContentDelta(text="approved"),
-        TurnComplete(stop_reason="end_turn"),
-    ])
+    reviewer_adapter.push_done(
+        summary="approved",
+        prefix_events=[ContentDelta(text="approved")],
+    )
 
     scheduler2 = Scheduler(
         repos, cfg, poll_interval_s=0.05,
@@ -273,10 +273,10 @@ async def test_skill_proposal_approve_reuse_loop(
         )
     )
     worker_adapter2 = FakeAdapter()
-    worker_adapter2.push_turn([
-        ContentDelta(text="ok using approved skill"),
-        TurnComplete(stop_reason="end_turn"),
-    ])
+    worker_adapter2.push_done(
+        summary="ok using approved skill",
+        prefix_events=[ContentDelta(text="ok using approved skill")],
+    )
     scheduler3 = Scheduler(
         repos, cfg, poll_interval_s=0.05,
         registry=_registry(),

@@ -29,40 +29,72 @@ import pytest
 
 from lyre.config import Config
 from lyre.persistence.models import TaskStatus
-from lyre.runtime.agent_loop import AgentLoop
+from lyre.runtime.agent_loop import AgentLoop, AgentLoopResult
 from lyre.runtime.health_tracker import HealthTracker
 from lyre.runtime.transcript import TranscriptWriter
-from lyre.scheduler.scheduler import _wakeup_status_to_task_status
+from lyre.scheduler.scheduler import _resolve_end_statuses
 
 from .helpers import fake_entry
 
 # ---------------------------------------------------------------------------
-# P0: wakeup-status → task-status mapping
+# P0: declared end-of-wakeup state → task-status mapping
+#
+# Post-WAKEUP_END_CONTRACT: the scheduler reads the agent's
+# end_wakeup(...) declaration off ``AgentLoopResult`` and runs it
+# through ``_resolve_end_statuses`` to get the pair (wakeups.end_status,
+# tasks.status). The CHECK-constrained tasks.status side must always
+# land on one of the lifecycle enum values — this regression test
+# pins that invariant across every declaration shape we generate.
 # ---------------------------------------------------------------------------
 
 
+def _result(
+    declared_status: str | None,
+    *,
+    awaiting_on: str | None = None,
+    failure_reason: str | None = None,
+) -> AgentLoopResult:
+    return AgentLoopResult(
+        status="ignored",
+        text="",
+        declared_status=declared_status,
+        declared_summary="ok",
+        declared_awaiting_on=awaiting_on,
+        declared_failure_reason=failure_reason,
+    )
+
+
 @pytest.mark.parametrize(
-    "wakeup_status,expected_task_status",
+    "declared_status,extra,expected_wakeup_end,expected_task_status",
     [
-        ("completed", "completed"),
-        ("failed", "failed"),
-        ("cancelled", "cancelled"),
-        ("silent_close", "completed"),
-        # The bug: ``needs_continuation`` is a wakeup-only status; it
-        # must NOT flow into ``tasks.status``. Map it to ``failed`` so
-        # the scheduler doesn't blindly retry a wedged task and burn
-        # tokens forever, AND so the post-loop write succeeds.
-        ("needs_continuation", "failed"),
+        ("done", {}, "completed", "completed"),
+        ("in_progress", {}, "yielded", "in_progress"),
+        ("awaiting", {"awaiting_on": "mail"}, "awaiting_mail", "needs_input"),
+        ("awaiting", {"awaiting_on": "subtask"}, "awaiting_subtask", "needs_input"),
+        ("failed", {"failure_reason": "loop_exhausted"},
+         "failed_loop_exhausted", "failed"),
+        ("failed", {"failure_reason": "silent_close"},
+         "failed_silent_close", "failed"),
+        ("failed", {"failure_reason": "provider_error"},
+         "failed_provider_error", "failed"),
+        # Defensive: declared_status=None (shouldn't happen post-runtime
+        # but worth pinning) lands on failed_unknown / failed.
+        (None, {}, "failed_unknown", "failed"),
     ],
 )
-def test_wakeup_status_maps_to_valid_task_status(
-    wakeup_status: str, expected_task_status: str,
+def test_declared_state_maps_to_valid_task_status(
+    declared_status: str | None,
+    extra: dict,
+    expected_wakeup_end: str,
+    expected_task_status: str,
 ) -> None:
-    mapped = _wakeup_status_to_task_status(wakeup_status)
-    assert mapped == expected_task_status
-    # And the mapped value MUST be in the literal TaskStatus set —
-    # i.e. would pass the DB CHECK constraint.
-    assert mapped in TaskStatus.__args__  # type: ignore[attr-defined]
+    result = _result(declared_status, **extra)
+    wakeup_end, task_status = _resolve_end_statuses(result)
+    assert wakeup_end == expected_wakeup_end
+    assert task_status == expected_task_status
+    # The CHECK invariant: tasks.status side MUST be one of the
+    # literal TaskStatus values.
+    assert task_status in TaskStatus.__args__  # type: ignore[attr-defined]
 
 
 # ---------------------------------------------------------------------------

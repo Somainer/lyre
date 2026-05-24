@@ -63,7 +63,6 @@ CREATE TABLE IF NOT EXISTS tasks (
   lease_duration_s  INTEGER NOT NULL DEFAULT 1800,
   lease_holder      TEXT,
   lease_until       TEXT,
-  checkpoint        TEXT,
   tier_overrides    TEXT,
   deadline          TEXT,
   metadata          TEXT,
@@ -108,6 +107,23 @@ CREATE TABLE IF NOT EXISTS wakeups (
   model                 TEXT,
   failure_report        TEXT,
   transcript_uri        TEXT,
+  -- End-of-wakeup declaration metadata (see WAKEUP_END_CONTRACT.md).
+  -- Populated when the agent calls end_wakeup(...) as its terminal
+  -- tool. Together with end_status they fully describe why the wakeup
+  -- ended and what (if anything) the next wakeup is waiting on.
+  --
+  --   awaiting_on:     mail | subtask | time | human_decision (NULL when
+  --                    end_status is not awaiting_*)
+  --   awaiting_ref:    sender id / subtask id / ISO timestamp — the
+  --                    handle the scheduler uses to resume precisely
+  --   failure_reason:  one of the closed enum in §3b of the spec
+  --                    (NULL when end_status is not failed_*)
+  --   recoverable:     0 | 1, agent's hint about whether retry might
+  --                    succeed (NULL when not failed_*)
+  awaiting_on           TEXT,
+  awaiting_ref          TEXT,
+  failure_reason        TEXT,
+  recoverable           INTEGER,
   -- Largest input_tokens reported across the wakeup's turns. Each API call
   -- resends the full message list, so per-turn input_tokens equals the
   -- running context size — this column captures the max.
