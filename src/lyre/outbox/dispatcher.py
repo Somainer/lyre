@@ -132,6 +132,7 @@ class OutboxDispatcher:
             external_id=payload.get("external_id") or row.external_id,
             sender=payload.get("sender") or "system",
             urgency=payload.get("urgency", "normal"),
+            title=payload.get("title"),
             body=payload.get("body") or "",
             task_id=payload.get("task_id") or row.task_id,
             parent_msg_id=payload.get("parent_msg_id"),

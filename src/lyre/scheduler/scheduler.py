@@ -769,6 +769,12 @@ class Scheduler:
         belt-and-suspenders for retries), the outbox dispatcher's
         UNIQUE-on-external_id constraint at the mailbox layer drops
         the duplicate silently.
+
+        Best-effort: any error raised while resolving the recipient or
+        enqueuing is logged and swallowed. The task's terminal status
+        is already committed by the caller; a notification glitch must
+        not propagate and flip that status (the success-path caller is
+        inside the wakeup try-block).
         """
         if task is None:
             # Exception path may catch before the task re-fetch lands.
@@ -779,90 +785,107 @@ class Scheduler:
         if task_status not in _TERMINAL_TASK_STATUSES:
             return  # awaiting / in_progress / pending — still in-flight
 
-        recipient = await self._resolve_terminated_task_supervisor(task)
-        if recipient is None:
-            log.warning(
-                "task_terminated_mail_no_recipient",
+        # Best-effort: this is a NOTIFICATION about an already-finalized
+        # task. It runs after tasks.update_status has committed the
+        # terminal state, so a failure here must NOT bubble up — the
+        # success-path caller is inside the wakeup try-block, and an
+        # exception would otherwise flip the just-completed task to
+        # 'failed' via the outer except handler. Swallow + log, same
+        # contract as summarize_and_append. SimulatedKill is a
+        # BaseException so this except won't mask chaos-kill semantics.
+        try:
+            recipient = await self._resolve_terminated_task_supervisor(task)
+            if recipient is None:
+                log.warning(
+                    "task_terminated_mail_no_recipient",
+                    task_id=task.id,
+                    outcome=task_status,
+                )
+                return
+
+            # The agent that ran the task is the conceptual sender — from
+            # the supervisor's perspective, "mail from worker-1 saying I
+            # died" reads naturally. Falls back to persona_name for
+            # pre-A3 tasks that never had an agent_id.
+            sender = task.agent_id or task.persona_name
+
+            urgency = _TASK_OUTCOME_URGENCY.get(task_status, "normal")
+            goal_preview = (task.goal or "").replace("\n", " ").strip()[:60]
+            title = f"[task-terminated:{task_status}] {goal_preview}"
+
+            body_lines: list[str] = [
+                f"task_id: {task.id}",
+                f"outcome: {task_status}",
+            ]
+            if declared_failure_reason:
+                body_lines.append(f"failure_reason: {declared_failure_reason}")
+            if declared_recoverable is not None:
+                body_lines.append(f"recoverable: {declared_recoverable}")
+            body_lines.append("")
+            body_lines.append(
+                f"summary: {declared_summary or '(no summary)'}"
+            )
+            if transcript_uri:
+                body_lines.append(f"transcript: {transcript_uri}")
+            body = "\n".join(body_lines)
+
+            # Structured payload — supervisor personas pattern-match on
+            # metadata.kind / metadata.failure_reason without parsing the
+            # body. Body is the human-readable fallback for inbox listings.
+            metadata: dict[str, Any] = {
+                "kind": "task_terminated",
+                "task_id": task.id,
+                "outcome": task_status,
+                "failure_reason": declared_failure_reason,
+                "recoverable": declared_recoverable,
+                "summary": declared_summary,
+                "transcript_uri": transcript_uri,
+                "parent_task_id": task.parent_task_id,
+            }
+
+            external_id = f"task_terminated:{task.id}"
+            payload = {
+                "recipient": recipient,
+                "sender": sender,
+                "urgency": urgency,
+                "title": title,
+                "body": body,
+                "task_id": task.id,
+                "external_id": external_id,
+                "parent_msg_id": None,
+                "broadcast_id": None,
+                "recipients_all": [recipient],
+                "metadata": metadata,
+                "attachments": None,
+            }
+            await self.repos.outbox.enqueue(
+                [
+                    OutboxRow(
+                        task_id=task.id,
+                        wakeup_id=wakeup_id,
+                        kind="mailbox_send",
+                        payload=payload,
+                        external_id=external_id,
+                    )
+                ]
+            )
+            log.info(
+                "task_terminated_mail_enqueued",
                 task_id=task.id,
                 outcome=task_status,
+                recipient=recipient,
+                sender=sender,
+                failure_reason=declared_failure_reason,
+                urgency=urgency,
             )
-            return
-
-        # The agent that ran the task is the conceptual sender — from
-        # the supervisor's perspective, "mail from worker-1 saying I
-        # died" reads naturally. Falls back to persona_name for
-        # pre-A3 tasks that never had an agent_id.
-        sender = task.agent_id or task.persona_name
-
-        urgency = _TASK_OUTCOME_URGENCY.get(task_status, "normal")
-        goal_preview = (task.goal or "").replace("\n", " ").strip()[:60]
-        title = f"[task-terminated:{task_status}] {goal_preview}"
-
-        body_lines: list[str] = [
-            f"task_id: {task.id}",
-            f"outcome: {task_status}",
-        ]
-        if declared_failure_reason:
-            body_lines.append(f"failure_reason: {declared_failure_reason}")
-        if declared_recoverable is not None:
-            body_lines.append(f"recoverable: {declared_recoverable}")
-        body_lines.append("")
-        body_lines.append(
-            f"summary: {declared_summary or '(no summary)'}"
-        )
-        if transcript_uri:
-            body_lines.append(f"transcript: {transcript_uri}")
-        body = "\n".join(body_lines)
-
-        # Structured payload — supervisor personas pattern-match on
-        # metadata.kind / metadata.failure_reason without parsing the
-        # body. Body is the human-readable fallback for inbox listings.
-        metadata: dict[str, Any] = {
-            "kind": "task_terminated",
-            "task_id": task.id,
-            "outcome": task_status,
-            "failure_reason": declared_failure_reason,
-            "recoverable": declared_recoverable,
-            "summary": declared_summary,
-            "transcript_uri": transcript_uri,
-            "parent_task_id": task.parent_task_id,
-        }
-
-        external_id = f"task_terminated:{task.id}"
-        payload = {
-            "recipient": recipient,
-            "sender": sender,
-            "urgency": urgency,
-            "title": title,
-            "body": body,
-            "task_id": task.id,
-            "external_id": external_id,
-            "parent_msg_id": None,
-            "broadcast_id": None,
-            "recipients_all": [recipient],
-            "metadata": metadata,
-            "attachments": None,
-        }
-        await self.repos.outbox.enqueue(
-            [
-                OutboxRow(
-                    task_id=task.id,
-                    wakeup_id=wakeup_id,
-                    kind="mailbox_send",
-                    payload=payload,
-                    external_id=external_id,
-                )
-            ]
-        )
-        log.info(
-            "task_terminated_mail_enqueued",
-            task_id=task.id,
-            outcome=task_status,
-            recipient=recipient,
-            sender=sender,
-            failure_reason=declared_failure_reason,
-            urgency=urgency,
-        )
+        except Exception as exc:  # noqa: BLE001 — best-effort notification
+            log.warning(
+                "task_terminated_mail_failed",
+                task_id=task.id,
+                outcome=task_status,
+                error=str(exc),
+                type=type(exc).__name__,
+            )
 
     async def _run_task_inline(self, task_id: str) -> None:
         task = await self.repos.tasks.get(task_id)

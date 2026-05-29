@@ -460,3 +460,50 @@ async def test_title_includes_outcome_and_goal_preview(
     # First 60 chars of the goal land in the title (truncated, not full).
     assert "investigate the auth migration regression" in title
     assert len(title) <= 100  # bound for inbox listings
+
+
+@pytest.mark.asyncio
+async def test_delivered_message_preserves_title_round_trip(
+    repos: SqliteRepositories, tmp_path: Path,
+) -> None:
+    """Round-trip the mail through the outbox dispatcher and assert the
+    DELIVERED mailbox_messages row carries our title — not the
+    auto-derived-from-body-first-line fallback.
+
+    Regression guard: the payload-level assertions above don't catch
+    the dispatcher dropping `title` on insert (it used to), because
+    they only inspect the outbox row. This test runs the actual
+    delivery so the title contract is verified end-to-end.
+    """
+    from lyre.outbox.dispatcher import OutboxDispatcher
+
+    cfg = _make_config(tmp_path)
+    await _seed(repos)
+    task_id = await repos.tasks.create(
+        TaskSpec(agent_id="worker", goal="ship the thing", acceptance="a")
+    )
+
+    fake = FakeAdapter()
+    fake.push_done(summary="shipped")
+    scheduler = _build_scheduler(repos, cfg, fake)
+    await scheduler._run_task_inline(task_id)
+
+    # Deliver: outbox → mailbox_messages.
+    dispatcher = OutboxDispatcher(repos)
+    await dispatcher.tick()
+
+    # Owner is the recipient (top-level task). Fetch the delivered row
+    # by its deterministic external_id and check the persisted title.
+    external_id = f"task_terminated:{task_id}"
+    msg_id = await repos.mailbox.find_id_by_external_id("owner", external_id)
+    assert msg_id is not None, "task_terminated mail was not delivered to owner"
+    delivered = await repos.mailbox.get_message(msg_id)
+    assert delivered is not None
+    assert delivered.title == "[task-terminated:completed] ship the thing", (
+        f"delivered title should be the supervisor-triage subject, not "
+        f"the auto-derived body line; got {delivered.title!r}"
+    )
+    # metadata round-trips too (supervisor personas pattern-match on it).
+    assert delivered.metadata is not None
+    assert delivered.metadata["kind"] == "task_terminated"
+    assert delivered.metadata["outcome"] == "completed"
