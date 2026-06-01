@@ -254,6 +254,15 @@ class Scheduler:
         if self.auto_wake_on_mail:
             await self._auto_dispatch_for_unread_mail()
 
+        # Phase 0.7 (workflow barrier resume): flip any task parked in
+        # 'needs_input' whose resume flag is set back to 'pending' so Phase 3
+        # claims it on this same tick. Inert today — nothing parks a task
+        # yet, so find_resumable() returns []. The scheduler-driven fan-in
+        # barrier (a later PR) is what raises the flag; doing the canonical
+        # needs_input -> pending transition HERE (and only here) keeps the
+        # park/resume state machine single-writer and kill-safe.
+        await self._resume_parked_tasks()
+
         # Phase 2 (chaos recovery): pick up tasks whose lease has expired
         # (process died, SIGKILL, etc.) BEFORE looking for new pending work.
         # Skip any task already covered by an in-flight subprocess —
@@ -434,6 +443,23 @@ class Scheduler:
                 triggered_by_mail_id=top.id,
                 new_task_id=task_id,
             )
+
+    async def _resume_parked_tasks(self) -> None:
+        """Phase 0.7: resume tasks parked in 'needs_input' once their resume
+        flag is set.
+
+        This is the ONLY writer of the needs_input -> pending transition.
+        Whatever satisfied the wait (a fan-in barrier predicate, a deadline,
+        an escalation) just raises ``resume_ready``; the canonical transition
+        happens here so the state machine stays single-writer and kill-safe:
+        a SIGKILL after the flag is set but before the flip re-resumes on the
+        next tick (``resume`` is guarded + idempotent). Inert until something
+        parks a task — ``find_resumable`` returns [] in steady state.
+        """
+        resumable = await self.repos.tasks.find_resumable(limit=20)
+        for t in resumable:
+            if await self.repos.tasks.resume(t.id):
+                log.info("scheduler_resumed_parked_task", task_id=t.id)
 
     async def _deliver_scheduled_mail(self) -> None:
         """Phase -1: deliver any due scheduled_mail row.

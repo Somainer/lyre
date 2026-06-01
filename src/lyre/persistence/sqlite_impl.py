@@ -12,6 +12,8 @@ import os
 import tempfile
 import time
 import uuid as _uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -379,7 +381,9 @@ class SqliteTaskRepository:
         )
         await self.conn.commit()
 
-    async def update_status(self, task_id: str, status: str) -> None:
+    async def update_status(
+        self, task_id: str, status: str, *, in_txn: bool = False
+    ) -> None:
         sql = """
             UPDATE tasks SET status = ?,
                              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
@@ -388,7 +392,99 @@ class SqliteTaskRepository:
             sql += ", completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')"
         sql += " WHERE id = ?"
         await self.conn.execute(sql, (status, task_id))
-        await self.conn.commit()
+        # in_txn=True: caller (repos.transaction()) owns the commit so this
+        # write composes atomically with sibling writes in the same block.
+        if not in_txn:
+            await self.conn.commit()
+
+    # --- Park / resume seam (scheduler-driven barriers) ------------------
+    # A task parked in 'needs_input' is invisible to BOTH find_pending
+    # (status!='pending') and find_expired_leases (status!='in_progress'),
+    # so it is neither dispatched nor lease-recovered while it waits on an
+    # external event (e.g. a fan-in barrier). The wake-readiness flag
+    # (resume_ready) is decoupled from status so multiple resume sources
+    # (barrier predicate, deadline, escalation) can independently raise it
+    # while a SINGLE writer — Phase 0.7's resume() — performs the canonical
+    # needs_input -> pending transition. This is the kill-safe alternative
+    # to a blocking "await children" primitive (deliberately absent — see
+    # context.py:317/481): the "wait" is the scheduler polling durable rows.
+
+    async def park(self, task_id: str, *, in_txn: bool = False) -> bool:
+        """Park a live task in 'needs_input'. Returns True iff a
+        pending/in_progress row flipped (a terminal task is left untouched).
+
+        The lease is NOT cleared here — the scheduler releases it in its
+        normal end-of-wakeup teardown. resume_ready is reset to 0 so a fresh
+        park always starts not-ready.
+        """
+        async with self.conn.execute(
+            """
+            UPDATE tasks
+            SET status = 'needs_input', resume_ready = 0,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+            WHERE id = ? AND status IN ('pending', 'in_progress')
+            RETURNING id
+            """,
+            (task_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        if not in_txn:
+            await self.conn.commit()
+        return row is not None
+
+    async def request_resume(self, task_id: str, *, in_txn: bool = False) -> bool:
+        """Flag a parked task ready to resume. Idempotent. Returns True iff a
+        'needs_input' row was flagged (False if it isn't parked — already
+        resumed, cancelled, or never parked). The actual transition is done
+        once by resume()."""
+        async with self.conn.execute(
+            """
+            UPDATE tasks SET resume_ready = 1,
+                             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+            WHERE id = ? AND status = 'needs_input'
+            RETURNING id
+            """,
+            (task_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        if not in_txn:
+            await self.conn.commit()
+        return row is not None
+
+    async def find_resumable(self, limit: int = 20) -> list[Task]:
+        """Parked tasks whose resume flag is set — Phase 0.7 flips these back
+        to 'pending'. Oldest-first so a backlog drains FIFO."""
+        async with self.conn.execute(
+            """
+            SELECT * FROM tasks
+            WHERE status = 'needs_input' AND resume_ready = 1
+            ORDER BY updated_at
+            LIMIT ?
+            """,
+            (limit,),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [self._row_to_task(r) for r in rows]
+
+    async def resume(self, task_id: str, *, in_txn: bool = False) -> bool:
+        """The canonical needs_input -> pending transition (Phase 0.7 only).
+        Guarded on (status='needs_input' AND resume_ready=1) so two
+        concurrent processes can't double-resume — the loser's RETURNING is
+        empty. Clears resume_ready. Idempotent across a SIGKILL: a kill after
+        the flag is set but before this commits simply re-resumes next tick."""
+        async with self.conn.execute(
+            """
+            UPDATE tasks SET status = 'pending', resume_ready = 0,
+                             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+            WHERE id = ? AND status = 'needs_input' AND resume_ready = 1
+            RETURNING id
+            """,
+            (task_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        if not in_txn:
+            await self.conn.commit()
+        return row is not None
 
     async def find_pending(self, limit: int = 10) -> list[Task]:
         async with self.conn.execute(
@@ -1765,3 +1861,31 @@ class SqliteRepositories:
         self.artifacts = SqliteArtifactRepository(conn)
         self.local_hot = SqliteLocalHotRepository(conn)
         self.blobs = SqliteBlobRepository(conn)
+
+    @asynccontextmanager
+    async def transaction(self) -> AsyncIterator[None]:
+        """Batch several DAO writes into ONE atomic commit.
+
+        Lyre runs SQLite with sqlite3's default deferred isolation level, so
+        the first DML inside this block implicitly opens a transaction and
+        every later write joins it — the driver never auto-commits between
+        statements. Composed DAO mutators take ``in_txn=True`` to SUPPRESS
+        their own trailing ``commit()`` so the whole block commits exactly
+        once here, or rolls back entirely if the body raises.
+
+        This is the "advance state AND emit signal" seam the workflow
+        scheduler needs (resolve a barrier + park/resume a task + enqueue a
+        signal as one unit). Without it each DAO call self-commits, so a
+        SIGKILL mid-sequence could leave a half-applied multi-row write — the
+        exact gap that makes a naive scheduler-driven join un-kill-safe.
+
+        Note: this composes only writes routed through ``in_txn=True``. A
+        nested call that still self-commits would prematurely end the block;
+        callers must thread ``in_txn`` through every mutator inside.
+        """
+        try:
+            yield
+            await self.conn.commit()
+        except BaseException:
+            await self.conn.rollback()
+            raise
