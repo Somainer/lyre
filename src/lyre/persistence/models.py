@@ -6,7 +6,7 @@ Maps 1:1 with PERSISTENCE_SCHEMA.md §3 tables.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple
 
 from pydantic import BaseModel, Field
 
@@ -73,6 +73,28 @@ class Agent(BaseModel):
     @property
     def description(self) -> str | None:
         return (self.metadata or {}).get("description")
+
+
+class AgentIdle(NamedTuple):
+    """Per-agent idle report for ``list_agents`` (see
+    ``AgentRepository.idle_report``).
+
+    ``idle_seconds``: wall-clock since the agent's last wakeup (its end, or its
+    start if still open; falls back to creation time if it never ran), clamped
+    at 0.
+
+    ``stale``: True iff the agent is an idle-reclaim candidate the Dispatcher may
+    archive — AGENT-spawned (``parent_agent_id`` not NULL and not ``'owner'``),
+    NON-ephemeral, idle past the configured threshold, with no in-flight task and
+    not a leg of an open fan-in barrier. Always False when reclaim is disabled
+    (threshold ≤ 0) and for the protected classes: bootstrap singletons
+    (``parent_agent_id`` NULL), human-created agents (``parent_agent_id ==
+    'owner'``), and ephemeral agents (the reaper's job). It is a HINT only — the
+    runtime never auto-archives on it.
+    """
+
+    idle_seconds: int
+    stale: bool
 
 
 PersonaKind = Literal["singleton", "seeded", "spawn_only"]

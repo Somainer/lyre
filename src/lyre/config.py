@@ -312,6 +312,18 @@ class Config:
     # ceiling exists for predictable CPU / model-API rate-limit
     # behavior, not because more would break anything.
     max_concurrent_tasks: int = 4
+    # Idle-reclaim threshold (seconds). When > 0, `list_agents` marks an
+    # AGENT-spawned, NON-ephemeral agent that has been idle this long (no
+    # in-flight task, not a leg of an open fan-in barrier) as `stale` — a hint
+    # to the Dispatcher that it may archive it. The runtime never auto-archives
+    # on this signal: reclaim is a Dispatcher decision (pull model). Only the
+    # transient children agents spawn for themselves are ever flagged; the
+    # owner's own creations are protected outright (parent_agent_id 'owner') —
+    # as are bootstrap singletons (parent_agent_id NULL) and ephemeral agents
+    # (the reaper's job) — so a standing specialist the owner wants is never at
+    # risk. 0 (default) DISABLES the hint entirely — fitting Lyre's "agents
+    # persist across restarts" default; opt in per deployment.
+    idle_reclaim_age_s: int = 0
 
     @classmethod
     def from_env(cls) -> Config:
@@ -469,6 +481,23 @@ class Config:
             # signal is honored.
             max_concurrent = 1
 
+        # ---- idle-reclaim threshold ----
+        # [scheduler] idle_reclaim_age_s = N; env `LYRE_IDLE_RECLAIM_AGE`
+        # wins (same env-beats-toml convention). 0 / absent / garbage →
+        # disabled (no stale hint). Negative is clamped to 0.
+        idle_env = os.environ.get("LYRE_IDLE_RECLAIM_AGE")
+        idle_toml = scheduler_raw.get("idle_reclaim_age_s")
+        idle_chosen = idle_env if idle_env is not None else idle_toml
+        if idle_chosen is None:
+            idle_reclaim_age_s = 0
+        else:
+            try:
+                idle_reclaim_age_s = int(idle_chosen)
+            except (ValueError, TypeError):
+                idle_reclaim_age_s = 0
+        if idle_reclaim_age_s < 0:
+            idle_reclaim_age_s = 0
+
         # ---- legacy [bootstrap] deprecation warning ----
         # The old [bootstrap] section let the owner pin dispatcher_id /
         # analyst_id / reviewer_id. Those moved to persona identity.md
@@ -517,6 +546,7 @@ class Config:
             default_dashboard_port=dashboard_port,
             auto_wake_on_mail=bool(auto_wake),
             max_concurrent_tasks=max_concurrent,
+            idle_reclaim_age_s=idle_reclaim_age_s,
         )
 
     @property

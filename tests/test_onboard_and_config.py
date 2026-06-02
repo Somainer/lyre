@@ -45,6 +45,39 @@ def test_config_uses_lyre_home_env_for_paths(
     assert cfg.user_personas_dir == tmp_path / "personas"
 
 
+def test_config_idle_reclaim_age_defaults_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LYRE_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("LYRE_IDLE_RECLAIM_AGE", raising=False)
+    assert Config.from_env().idle_reclaim_age_s == 0
+
+
+def test_config_idle_reclaim_age_env_beats_toml(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LYRE_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "config.toml").write_text(
+        "[scheduler]\nidle_reclaim_age_s = 600\n", encoding="utf-8"
+    )
+    assert Config.from_env().idle_reclaim_age_s == 600  # from toml
+    monkeypatch.setenv("LYRE_IDLE_RECLAIM_AGE", "1800")
+    assert Config.from_env().idle_reclaim_age_s == 1800  # env wins
+
+
+def test_config_idle_reclaim_age_garbage_and_negative_clamp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LYRE_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("LYRE_IDLE_RECLAIM_AGE", "not-a-number")
+    assert Config.from_env().idle_reclaim_age_s == 0  # garbage → disabled
+    monkeypatch.setenv("LYRE_IDLE_RECLAIM_AGE", "-5")
+    assert Config.from_env().idle_reclaim_age_s == 0  # negative → clamped to 0
+
+
 def test_config_reads_owner_from_toml(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

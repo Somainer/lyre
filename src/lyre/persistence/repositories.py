@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 
 from .models import (
     Agent,
+    AgentIdle,
     Artifact,
     Blob,
     FanInGroup,
@@ -93,6 +94,20 @@ class AgentRepository(Protocol):
     async def list_bootstrap_singleton_ids(self) -> set[str]:
         """Ids of live bootstrap singletons (parent_agent_id IS NULL). Phase 3
         prioritises their tasks and reserves a slot for them."""
+        ...
+
+    async def idle_report(
+        self, now: datetime, idle_threshold_s: int
+    ) -> dict[str, AgentIdle]:
+        """``{agent_id: AgentIdle(idle_seconds, stale)}`` for every non-archived
+        agent — the pull-side primitive behind ``list_agents``' idle-reclaim
+        hint. The Dispatcher reads ``stale`` and decides whether to
+        ``archive_agent``; the runtime never acts on it automatically.
+
+        ``stale`` mirrors ``find_reapable_ephemerals`` but for the NON-ephemeral
+        class (idle past ``idle_threshold_s``, spawned, no in-flight task) plus
+        an open-fan-in-leg guard, and is never set when ``idle_threshold_s <= 0``.
+        See the SQLite implementation for the exact predicate."""
         ...
 
     async def update_metadata(

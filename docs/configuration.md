@@ -24,6 +24,15 @@ All env vars are optional unless noted. Set them in your shell or a
 | `LYRE_COMPACT_THRESHOLD` | Fraction of context window above which auto-compaction fires. Must be `0 < x < 1`. | `0.7` |
 | `LYRE_MAX_TOKENS` | Per-turn output cap on a single assistant message (NOT a lifetime budget). Sized to the biggest single tool-call argument an agent writes — worker-maintainer producing code via `python_exec` is the hot path. Lower it only to box in a runaway worker. Min clamp 256. | `32768` |
 
+### Scheduler
+
+Env wins over the matching `[scheduler]` key in `config.toml`.
+
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `LYRE_MAX_CONCURRENT_TASKS` | Max tasks the scheduler runs in parallel (subprocess mode only; inline mode is serial). `0`/negative clamps to 1. | `4` |
+| `LYRE_IDLE_RECLAIM_AGE` | Seconds of idle (since last wakeup) after which `list_agents` marks a **spawned, non-ephemeral** agent `stale` — a hint the Dispatcher may `archive_agent` it. Pull-only: the runtime never auto-archives on this; bootstrap singletons and ephemeral agents (the reaper's job) are never flagged. `0` disables the hint entirely — fitting Lyre's "agents persist across restarts" default. | `0` (off) |
+
 ### Storage paths
 
 | Variable | What it controls | Default |

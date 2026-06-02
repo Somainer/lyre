@@ -25,7 +25,7 @@
 13. [分 PR 路线图](#13-分-pr-路线图)
 14. [明确非目标](#14-明确非目标)
 
-> **状态**：**PR1 + PR2 + PR3 + PR4（ephemeral 回收）+ PR4b（supervisor 重启/强度/升级）+ PR4c（加固：预留单例槽 + Phase 2 crash-loop bound）已落地**（见 §13）。其余 PR5 / PR6 待实现。整个 §5 "Hybrid Reaper" 韧性层至此完整。
+> **状态**：**PR1 + PR2 + PR3 + PR4（ephemeral 回收）+ PR4b（supervisor 重启/强度/升级）+ PR4c（加固：预留单例槽 + Phase 2 crash-loop bound）+ PR7（idle-reclaim：Dispatcher 驱动回收非 ephemeral 闲置子）已落地**（见 §13）。其余 PR5 / PR6 待实现。整个 §5 "Hybrid Reaper" 韧性层至此完整。
 >
 > **PR4/PR4b 范围说明**：原 §5 "Hybrid Reaper" 打包了回收 + 一对一重启 + 重启强度 + 升级 + 预留单例槽。落地时拆三段:**PR4 = 纯回收**（`supervision.ephemeral` 的 agent 跑完即 archive,纯 GC）；**PR4b = 韧性核心**（`supervision_state` 重启强度滑窗、一对一重启、超限升级邮件、ephemeral 的 PR3-`task_terminated` 抑制——reaper 接管其生命周期通知）；**PR4c = 加固**（§3 的预留单例槽 starvation 防护 + Phase 2 真-SIGKILL crash-loop 的强度 bound）。**PR4b 的已知缺口**:被 raw SIGKILL（无 end-of-wakeup 写）的子由 Phase 2 租约过期重跑,不经 reaper 故不计强度——repeated-SIGKILL crash-loop 暂未 bound（exception/正常失败会终结任务,**已**被 reaper bound）→ PR4c 补。
 >
@@ -349,6 +349,7 @@ async def _resume_parked_tasks(self):
 | **PR4c** ✅ **已落地** | 加固两件:(a) **预留单例槽** —— Phase 3 把 NULL-parent bootstrap 单例任务**排在最前**(稳定排序保 FIFO),并在 subprocess + max_concurrent>1 时把**非单例并发上限压到 max_concurrent-1**(归纳法保证 ≥1 槽永远可被单例取用,代价是子吞吐少 1 槽);(b) **Phase 2 crash-loop bound** —— `find_expired_leases` 恢复 ephemeral 子时先 `_ephemeral_recovery_exceeded`:计入重启强度,未超则正常重跑,超限则在一个事务里 fail 任务 + `mark_escalated` + archive agent + 升级邮件(堵住 raw-SIGKILL 反复租约重跑绕过 reaper 的洞) | 非单例封顶 max-1 / 饱和下单例优先得槽 / inline 不受 reserve 影响 / Phase2 预算内重跑 / 超限 fail+escalate+archive / 非 ephemeral 不计强度,共 6 个，全绿 |
 | **PR5** | 升级处理 + persona 文档（dispatcher/leader 聚合结果邮件 + 处理升级） | 升级邮件 high 且每窗一发 / 协调器 resume 时聚合 |
 | **PR6** | TTL 强关 + 可观测性（`list_agents`/dashboard 显示 reaped/storm_halted） | TTL 关闭泄漏 open 组 / dashboard 显示 reaped/storm_halted |
+| **PR7** ✅ **已落地** | **idle-reclaim（Dispatcher 驱动）**：reaper 只回收 ephemeral 子;**非 ephemeral 的 agent-spawned 子跑完会永久停在 `idle`,无人自动回收**。本 PR 不让调度器盲目 GC,而是 **pull**——`AgentRepository.idle_report(now, threshold)` 在 SQL 里算出每个非归档 agent 的 `idle_seconds`(自上次 wakeup,`MAX(COALESCE(ended_at,started_at))` 回退 `created_at`,`julianday` 算差) + `stale` 标记(**由 agent spawn** = `parent_agent_id` 非 NULL 且非字面 `'owner'`,∧ 非 ephemeral ∧ 超 `LYRE_IDLE_RECLAIM_AGE` ∧ 无在飞任务 ∧ 非未结 fan-in 腿);`list_agents` 透出这两字段并在有 stale 时追加回收提示;**Dispatcher persona 在派活盘点时自行 `archive_agent` 收掉真正用完的 stale 子**(决策权在 LLM,runtime 绝不自动归档;persona 含"专家保活/拿不准先留"判据,且点明无 unarchive 工具)。阈值 0(默认)整体关闭——契合"agent 跨重启持久"的缺省;三类受保护永不标 stale:bootstrap 单例(parent NULL)、**owner 亲建**(`parent='owner'`)、ephemeral。**与 §5 reaper 正交**:reaper 管 ephemeral 自动 GC,本 PR 管非 ephemeral 的人在环回收。 | 非 ephemeral agent-spawned 超阈→stale / 阈值内→否 / ephemeral→永不(仍报 idle) / 在飞任务→否 / 完成任务不挡 / 开放 fan-in 腿→否,resolved 后→是 / bootstrap 单例→否 / **owner 亲建→否** / 阈值 0 关闭 / 归档 agent 不在报告 / idle 钳非负 / list_agents 透出 + note 提示 / config env-beats-toml + garbage/负数→0,共 16 个,全绿 |
 
 > **依赖序**：PR1 是硬地基（barrier resume 与 supervisor escalation 都终结于 `needs_input→pending`，而该转换 main 上不存在）。PR3 可与 PR2 并行（已有原型分支）。
 

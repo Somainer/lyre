@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from ...persistence.models import Agent, Task
+from ..future_mail import now_utc
 from ..identity import compose_id, is_valid_agent_id
 from . import Tool, ToolContext, ToolError
 
@@ -658,6 +659,14 @@ async def _list_agents(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]
     `active_task_id` / `last_active_at` give the leader enough context
     to write a meaningful kick-off mail without round-tripping
     `list_tasks` / `mailbox_read`.
+
+    `idle_seconds` (since the last wakeup) and `stale` support idle-reclaim:
+    `stale=true` flags a spawned, NON-ephemeral agent that has been idle past
+    `LYRE_IDLE_RECLAIM_AGE` with no in-flight task and no open fan-in leg — a
+    HINT that the Dispatcher may `archive_agent` it. It is advisory only (the
+    runtime never auto-archives on it) and is always False when the knob is 0
+    (the default). Ephemeral agents are reclaimed automatically by the reaper
+    and are never flagged here.
     """
     include_archived = bool(args.get("include_archived", False))
     agents = await ctx.repos.agents.list_all(include_archived=include_archived)
@@ -689,6 +698,14 @@ async def _list_agents(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]
         # list_recent returns newest-first; keep the first hit per agent.
         last_active.setdefault(key, ts)
 
+    # idle_seconds (since last wakeup) + `stale` reclaim hint, computed in SQL.
+    # Threshold 0 (default) → `stale` is always False (feature disabled). This
+    # is a PULL signal: the Dispatcher decides whether to archive; nothing here
+    # acts on it. Ephemeral agents are handled by the orthogonal reaper, so they
+    # are never flagged stale.
+    idle_threshold = int(ctx.extras.get("idle_reclaim_age_s", 0) or 0)
+    idle = await ctx.repos.agents.idle_report(now_utc(), idle_threshold)
+
     def _occupancy(agent: Agent) -> str:
         if agent.status == "archived":
             return "archived"
@@ -699,6 +716,10 @@ async def _list_agents(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]
     enriched = []
     for a in agents:
         in_flight = in_flight_by_agent.get(a.id, [])
+        # idle_report excludes archived agents by design (they need no reclaim
+        # hint), so rep is None for them under include_archived=true → report
+        # idle_seconds=None / stale=False.
+        rep = idle.get(a.id)
         enriched.append({
             "id": a.id,
             "persona": a.persona_name,
@@ -708,28 +729,43 @@ async def _list_agents(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]
             "in_flight_count": len(in_flight),
             "active_task_id": in_flight[0].id if in_flight else None,
             "last_active_at": last_active.get(a.id),
+            "idle_seconds": rep.idle_seconds if rep else None,
+            "stale": bool(rep.stale) if rep else False,
             "created_at": a.created_at.isoformat() if a.created_at else None,
             "model_id": a.model_id,
             "description": a.description,
         })
+    note = (
+        "Reuse-vs-spawn: prefer dispatch_task to an agent with "
+        "occupancy='available'. Only call create_agent when no live "
+        "agent of the right persona is available AND queued/busy ones "
+        "would block this work."
+    )
+    # `idle_threshold > 0` is redundant with the SQL (stale is always False when
+    # disabled) but guards the hint application-side too; `any(stale)` keeps the
+    # note out when nothing is reclaimable.
+    if idle_threshold > 0 and any(e["stale"] for e in enriched):
+        note += (
+            " Housekeeping: agents with stale=true have been idle past the "
+            "reclaim threshold with no work in flight — archive_agent them to "
+            "free the population, UNLESS you expect to reuse one shortly."
+        )
     return {
         "agents": enriched,
         "count": len(enriched),
-        "note": (
-            "Reuse-vs-spawn: prefer dispatch_task to an agent with "
-            "occupancy='available'. Only call create_agent when no live "
-            "agent of the right persona is available AND queued/busy ones "
-            "would block this work."
-        ),
+        "note": note,
     }
 
 
 LIST_AGENTS = Tool(
     name="list_agents",
     description=(
-        "List currently-active agent instances (id, persona, status, model). "
-        "Pass include_archived=true to also see soft-deleted ones. "
-        "For role definitions (templates) use list_personas instead."
+        "List currently-active agent instances (id, persona, status, model, "
+        "occupancy, idle_seconds, stale). `stale=true` marks a spawned, "
+        "non-ephemeral agent idle past the reclaim threshold with no work in "
+        "flight — a hint you may archive_agent it. Pass include_archived=true "
+        "to also see soft-deleted ones. For role definitions (templates) use "
+        "list_personas instead."
     ),
     input_schema={
         "type": "object",
