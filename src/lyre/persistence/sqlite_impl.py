@@ -24,6 +24,7 @@ import aiosqlite
 from .fs_personas import FilesystemPersonaRepository
 from .models import (
     Agent,
+    AgentIdle,
     Artifact,
     Blob,
     FanInGroup,
@@ -279,6 +280,86 @@ class SqliteAgentRepository:
         ) as cur:
             rows = await cur.fetchall()
         return [self._row_to_agent(r) for r in rows]
+
+    async def idle_report(
+        self, now: datetime, idle_threshold_s: int
+    ) -> dict[str, AgentIdle]:
+        """Idle seconds + reclaim-candidacy per non-archived agent.
+
+        ``last_active`` is the latest of each agent's wakeups
+        (``COALESCE(ended_at, started_at)`` — a still-open wakeup counts as
+        active *now*), falling back to ``created_at`` when it never ran. The
+        duration is computed in SQL via ``julianday`` (SQLite parses the stored
+        ``…Z`` timestamps) so there's no tz-aware/naive arithmetic in Python.
+
+        ``stale`` is the NON-ephemeral analogue of ``find_reapable_ephemerals``:
+        AGENT-spawned (``parent_agent_id`` not NULL and not the literal
+        ``'owner'``), not ephemeral (``…ephemeral IS NOT 1`` — NULL/absent/false
+        all qualify), idle longer than ``idle_threshold_s``, no in-flight task,
+        and NOT a leg of an open fan-in barrier (else the Dispatcher could
+        archive a child whose result it's still awaiting / may re-dispatch).
+
+        Two classes are protected like the reaper protects its own: bootstrap
+        singletons (``parent_agent_id`` NULL — owner/dispatcher/…) and
+        HUMAN-created agents (``parent_agent_id == 'owner'``, the literal string
+        ``create_agent``/CLI writes for a human-spawned agent — see
+        ``models.Agent``). The latter are curated by the owner and meant to
+        persist, so the Dispatcher must not reclaim them. (The ``'owner'``
+        literal mirrors what ``main.py`` hard-codes; if that ever becomes
+        ``config.owner.name``-driven, this guard must follow.)
+
+        The ``:thr > 0`` guard makes the whole flag a no-op when reclaim is
+        disabled. Unlike the reaper this does NOT require ``EXISTS(any task)``:
+        the threshold already covers the create→first-dispatch race, and an
+        abandoned never-dispatched agent is itself a reclaim candidate.
+        """
+        now_iso = _iso(now)
+        async with self.conn.execute(
+            """
+            WITH la AS (
+              SELECT a.id AS id,
+                     a.parent_agent_id AS parent_agent_id,
+                     a.metadata AS metadata,
+                     COALESCE(
+                       (SELECT MAX(COALESCE(w.ended_at, w.started_at))
+                          FROM wakeups w WHERE w.agent_id = a.id),
+                       a.created_at
+                     ) AS last_active
+                FROM agents a
+               WHERE a.status != 'archived'
+            )
+            SELECT
+              la.id AS id,
+              MAX(0, CAST((julianday(?) - julianday(la.last_active)) * 86400.0
+                          AS INTEGER)) AS idle_seconds,
+              CASE WHEN ? > 0
+                    AND la.parent_agent_id IS NOT NULL
+                    AND la.parent_agent_id != 'owner'
+                    AND json_extract(la.metadata, '$.supervision.ephemeral')
+                          IS NOT 1
+                    AND (julianday(?) - julianday(la.last_active)) * 86400.0 > ?
+                    AND NOT EXISTS (
+                          SELECT 1 FROM tasks t
+                           WHERE t.agent_id = la.id
+                             AND t.status IN
+                                 ('pending', 'in_progress', 'needs_input'))
+                    AND NOT EXISTS (
+                          SELECT 1 FROM fan_in_members m
+                            JOIN fan_in_groups g ON g.id = m.group_id
+                           WHERE m.child_agent_id = la.id
+                             AND g.status = 'open')
+                   THEN 1 ELSE 0 END AS stale
+              FROM la
+            """,
+            (now_iso, idle_threshold_s, now_iso, idle_threshold_s),
+        ) as cur:
+            rows = await cur.fetchall()
+        return {
+            r["id"]: AgentIdle(
+                idle_seconds=int(r["idle_seconds"]), stale=bool(r["stale"])
+            )
+            for r in rows
+        }
 
     async def exists(self, agent_id: str) -> bool:
         async with self.conn.execute(
