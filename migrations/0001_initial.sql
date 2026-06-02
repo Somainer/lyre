@@ -63,6 +63,16 @@ CREATE TABLE IF NOT EXISTS tasks (
   lease_duration_s  INTEGER NOT NULL DEFAULT 1800,
   lease_holder      TEXT,
   lease_until       TEXT,
+  -- resume_ready: park/resume seam for scheduler-driven fan-in barriers.
+  -- A task parked in 'needs_input' (e.g. a coordinator awaiting a barrier)
+  -- is invisible to find_pending (status!='pending') and find_expired_leases
+  -- (status!='in_progress'). When the awaited event fires, the barrier (or a
+  -- deadline / escalation) sets resume_ready=1; Phase 0.7
+  -- (_resume_parked_tasks) is the SOLE writer that flips needs_input ->
+  -- pending. Decoupling the flag from status keeps the transition
+  -- single-writer and kill-safe (a SIGKILL between flag-set and flip simply
+  -- re-resumes next tick). 0 = not awaiting resume.
+  resume_ready      INTEGER NOT NULL DEFAULT 0,
   checkpoint        TEXT,
   tier_overrides    TEXT,
   deadline          TEXT,
@@ -79,6 +89,10 @@ CREATE TABLE IF NOT EXISTS tasks (
 CREATE INDEX IF NOT EXISTS tasks_status_lease ON tasks(status, lease_until);
 CREATE INDEX IF NOT EXISTS tasks_parent ON tasks(parent_task_id);
 CREATE INDEX IF NOT EXISTS tasks_agent_status ON tasks(agent_id, status);
+-- Phase 0.7 (_resume_parked_tasks) scans only parked tasks each tick;
+-- the partial index keeps that O(parked) instead of O(all tasks).
+CREATE INDEX IF NOT EXISTS tasks_resumable
+  ON tasks(resume_ready) WHERE status = 'needs_input';
 -- Dashboard hot paths:
 --   * find_recent ORDER BY created_at DESC
 --   * find_recently_changed WHERE updated_at >= ? + MAX(updated_at) in

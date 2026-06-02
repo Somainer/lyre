@@ -8,6 +8,7 @@ See PERSISTENCE_SCHEMA.md §4 for design rationale.
 
 from __future__ import annotations
 
+from contextlib import AbstractAsyncContextManager
 from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
@@ -119,10 +120,33 @@ class TaskRepository(Protocol):
     async def update_checkpoint(
         self, task_id: str, checkpoint: dict[str, Any], holder_wakeup_id: str
     ) -> None: ...
-    async def update_status(self, task_id: str, status: str) -> None: ...
+    async def update_status(
+        self, task_id: str, status: str, *, in_txn: bool = False
+    ) -> None: ...
     async def find_pending(self, limit: int = 10) -> list[Task]: ...
     async def find_expired_leases(self, limit: int = 10) -> list[Task]: ...
     async def find_children(self, parent_task_id: str) -> list[Task]: ...
+
+    # --- Park / resume (scheduler-driven barrier seam) -------------------
+    async def park(self, task_id: str, *, in_txn: bool = False) -> bool:
+        """Park a live (pending/in_progress) task in 'needs_input'. Returns
+        True iff a row flipped. A parked task is invisible to find_pending
+        and find_expired_leases until resume() runs."""
+        ...
+
+    async def request_resume(self, task_id: str, *, in_txn: bool = False) -> bool:
+        """Flag a parked task ready to resume (idempotent). The canonical
+        transition is done by resume()."""
+        ...
+
+    async def find_resumable(self, limit: int = 20) -> list[Task]:
+        """Parked tasks with resume_ready set — Phase 0.7 resumes these."""
+        ...
+
+    async def resume(self, task_id: str, *, in_txn: bool = False) -> bool:
+        """needs_input -> pending, guarded + idempotent (the sole writer of
+        this transition; Phase 0.7 only)."""
+        ...
 
     # Dashboard helpers (Sprint D1)
     async def find_recent(
@@ -562,3 +586,10 @@ class Repositories(Protocol):
     # Most call sites should prefer the per-repo methods; reach for
     # ``conn`` only when a typed method would be a one-off helper.
     conn: aiosqlite.Connection
+
+    def transaction(self) -> AbstractAsyncContextManager[None]:
+        """Async context manager that commits all DAO writes inside the
+        block as ONE unit (or rolls them back on error). Composed mutators
+        must be called with ``in_txn=True`` so they don't self-commit. See
+        the concrete implementation for the isolation-level rationale."""
+        ...
