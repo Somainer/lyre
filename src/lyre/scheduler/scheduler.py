@@ -32,7 +32,7 @@ import structlog
 
 from ..adapter.llm_adapter import LLMAdapter
 from ..config import Config
-from ..persistence.models import Persona, ScheduledMail, TaskSpec
+from ..persistence.models import OutboxRow, Persona, ScheduledMail, Task, TaskSpec
 from ..persistence.repositories import Repositories
 from ..runtime.adapter_factory import AdapterFactory, model_name_for_provider
 from ..runtime.agent_loop import AgentLoop
@@ -86,6 +86,20 @@ _WAKEUP_TO_TASK_STATUS: dict[str, str] = {
 
 def _wakeup_status_to_task_status(wakeup_status: str) -> str:
     return _WAKEUP_TO_TASK_STATUS.get(wakeup_status, wakeup_status)
+
+
+# task_terminated mail (OTP `monitor`/DOWN analogue): only a TERMINAL task
+# warrants notifying its supervisor; pending/in_progress/needs_input are still
+# in-flight. Failure rides urgency=high so MailWatcher surfaces it mid-wakeup
+# even to a busy supervisor; completion/cancellation are normal.
+_TERMINAL_TASK_STATUSES: frozenset[str] = frozenset(
+    {"completed", "failed", "cancelled"}
+)
+_TASK_OUTCOME_URGENCY: dict[str, str] = {
+    "completed": "normal",
+    "failed": "high",
+    "cancelled": "normal",
+}
 
 
 class Scheduler:
@@ -534,6 +548,119 @@ class Scheduler:
         for t in resumable:
             if await self.repos.tasks.resume(t.id):
                 log.info("scheduler_resumed_parked_task", task_id=t.id)
+
+    async def _resolve_terminated_task_supervisor(self, task: Task) -> str | None:
+        """The agent that should receive a ``task_terminated`` mail for
+        ``task`` — Lyre's OTP `monitor` analogue, but unidirectional so a
+        worker's death never cascade-kills its supervisor.
+
+        Resolution order:
+          1. ``parent_task_id`` set + that parent task's agent is live and
+             not archived → the parent's agent (dispatch creates the monitor).
+          2. Otherwise ``owner`` — top-level tasks root at the human owner.
+        An archived parent falls through to owner so the signal isn't lost.
+        Returns None only when even the owner record is missing (fresh test
+        DBs), in which case the caller skips the enqueue.
+        """
+        if task.parent_task_id:
+            parent = await self.repos.tasks.get(task.parent_task_id)
+            if parent is not None and parent.agent_id:
+                parent_agent = await self.repos.agents.get(parent.agent_id)
+                if parent_agent is not None and parent_agent.status != "archived":
+                    return parent.agent_id
+        owner = await self.repos.agents.get("owner")
+        if owner is not None and owner.status != "archived":
+            return "owner"
+        return None
+
+    async def _emit_task_terminated_mail(
+        self,
+        task: Task | None,
+        wakeup_id: str,
+        task_status: str,
+        *,
+        summary: str | None,
+        failure_reason: str | None,
+        transcript_uri: str | None,
+    ) -> None:
+        """Notify the supervisor that ``task`` reached a terminal state, via an
+        ordinary outbox ``mailbox_send`` — same durable, idempotent, Phase-0-
+        auto-waking path as any agent-to-agent mail. Supervisors then react to
+        child terminations instead of polling ``query_task_status``.
+
+        ``metadata.kind == 'task_terminated'`` lets a supervisor pattern-match
+        without parsing the body. external_id is ``task_terminated:<task_id>``
+        so a double-fire (e.g. a retried tick) dedupes at the mailbox UNIQUE.
+
+        Deliberately SUPPRESSED in two cases, so this doesn't fight other
+        subsystems:
+          * fan-in member tasks — the barrier (PR2) already aggregates their
+            results as low-urgency mail; a normal-urgency notice here would
+            prematurely auto-wake the coordinator on the first child.
+          * auto-dispatched 'check inbox' tasks — internal scheduler bookkeeping,
+            not work the owner should be pinged about.
+        And for TOP-LEVEL tasks we notify the owner only on FAILURE: a
+        successful top-level task already replies to the owner through the
+        agent's own mail, so a system completion ping would just be noise — but
+        a silent failure is exactly the "sudden failed 没人知道" gap we close.
+        """
+        if task is None or task_status not in _TERMINAL_TASK_STATUSES:
+            return
+        meta = task.metadata or {}
+        if meta.get("fan_in_group") is not None or meta.get("auto_dispatched"):
+            return
+        if task.parent_task_id is None and task_status != "failed":
+            return
+
+        recipient = await self._resolve_terminated_task_supervisor(task)
+        if recipient is None:
+            log.warning("task_terminated_no_recipient", task_id=task.id)
+            return
+
+        urgency = _TASK_OUTCOME_URGENCY.get(task_status, "normal")
+        external_id = f"task_terminated:{task.id}"
+        # The mail title is derived from the body's first line (the dispatcher
+        # does not carry an explicit title), so lead with the outcome tag; the
+        # machine signal supervisors match on is metadata.kind, not the title.
+        goal_preview = (task.goal or "").strip().splitlines()[0:1]
+        tag = f"[{task_status}] task {task.id[:8]}" + (
+            f" — {goal_preview[0][:80]}" if goal_preview else ""
+        )
+        detail = summary or f"reached terminal state: {task_status}."
+        payload = {
+            "recipient": recipient,
+            "sender": "system:supervisor",
+            "urgency": urgency,
+            "body": f"{tag}\n\n{detail}",
+            "task_id": task.id,
+            "external_id": external_id,
+            "metadata": {
+                "kind": "task_terminated",
+                "task_id": task.id,
+                "outcome": task_status,
+                "failure_reason": failure_reason,
+                "parent_task_id": task.parent_task_id,
+                "transcript_uri": transcript_uri,
+            },
+        }
+        await self.repos.outbox.enqueue(
+            [
+                OutboxRow(
+                    task_id=task.id,
+                    wakeup_id=wakeup_id,
+                    kind="mailbox_send",
+                    payload=payload,
+                    external_id=external_id,
+                )
+            ]
+        )
+        log.info(
+            "task_terminated_mail_enqueued",
+            task_id=task.id,
+            recipient=recipient,
+            outcome=task_status,
+            urgency=urgency,
+        )
 
     async def _deliver_scheduled_mail(self) -> None:
         """Phase -1: deliver any due scheduled_mail row.
@@ -1040,6 +1167,17 @@ class Scheduler:
                 fallbacks=len(result.fallback_events),
                 interrupts=len(result.interrupt_events),
             )
+            # Notify the supervisor that this task terminated (OTP monitor).
+            # needs_continuation→failed carries the wakeup status as a coarse
+            # reason until the structured end-contract lands.
+            await self._emit_task_terminated_mail(
+                task,
+                wakeup_id,
+                task_status,
+                summary=(result.text or "").strip()[:500] or None,
+                failure_reason=(result.status if task_status == "failed" else None),
+                transcript_uri=transcript.uri,
+            )
 
             # Best-effort post-wakeup summary. Replaces the old summary-agent
             # persona: instead of scheduling a separate agent that reads
@@ -1066,6 +1204,18 @@ class Scheduler:
                 failure_report={"error": str(e), "type": type(e).__name__},
             )
             await self.repos.tasks.update_status(task_id, "failed")
+            # The original "sudden failed 没人知道" path: a mid-wakeup crash
+            # never produced an end-of-wakeup declaration, so the supervisor
+            # must still be told. ``task`` may be stale (pre-wakeup) but its
+            # parent/metadata — all this needs — don't change mid-wakeup.
+            await self._emit_task_terminated_mail(
+                task,
+                wakeup_id,
+                "failed",
+                summary=f"{type(e).__name__}: {e}"[:500],
+                failure_reason=type(e).__name__,
+                transcript_uri=getattr(transcript, "uri", None),
+            )
         finally:
             # Simulated process death (Q5 chaos test): if a SimulatedKill is
             # propagating, real process would already be dead and no `finally`
