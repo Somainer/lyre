@@ -59,6 +59,9 @@ class Agent(BaseModel):
     parent_agent_id: str | None = None
     created_at: datetime | None = None
     archived_at: datetime | None = None
+    # Why this agent was archived (observability): 'reaped' / 'storm_halted' /
+    # 'idle_reclaimed' / 'manual'. NULL while live or for pre-column rows.
+    archive_reason: str | None = None
     # JSON metadata. Currently recognized keys:
     #   model_id     — override the persona's model_preference with this single
     #                  model id (router still falls back to persona prefs if

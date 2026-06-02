@@ -606,10 +606,17 @@ async def _archive_agent(
             f"refusing to archive bootstrap-seeded agent {agent_id!r}; "
             f"this would break system bootstrap"
         )
-    changed = await ctx.repos.agents.archive(agent_id)
+    # Reason is recorded for observability (list_agents / dashboard). The
+    # Dispatcher passes "idle_reclaimed" when collecting a stale agent; a bare
+    # archive defaults to "manual".
+    reason = args.get("reason")
+    if reason is not None and not isinstance(reason, str):
+        raise ToolError("reason must be a string if provided")
+    changed = await ctx.repos.agents.archive(agent_id, reason=reason or "manual")
     return {
         "agent_id": agent_id,
         "archived": bool(changed),
+        "reason": reason or "manual",
         "note": (
             "Soft delete: mailbox and history preserved. New mail / dispatch "
             "to this agent will be rejected. In-flight tasks finish normally."
@@ -622,12 +629,22 @@ ARCHIVE_AGENT = Tool(
     description=(
         "Soft-archive an agent. New mail/dispatch is blocked but mailbox and "
         "history stay. In-flight tasks finish. Cannot archive bootstrap-pinned "
-        "agents (owner, dispatcher, analyst-1, reviewer-1)."
+        "agents (owner, dispatcher, analyst-1, reviewer-1). Pass reason="
+        "'idle_reclaimed' when collecting a stale agent (defaults to 'manual') "
+        "so the dashboard can tell idle-reclaim from a hand archive."
     ),
     input_schema={
         "type": "object",
         "properties": {
             "agent_id": {"type": "string"},
+            "reason": {
+                "type": "string",
+                "description": (
+                    "Why you're archiving (observability label). Use "
+                    "'idle_reclaimed' for a stale-agent collection; omit for a "
+                    "manual archive."
+                ),
+            },
         },
         "required": ["agent_id"],
     },
@@ -732,6 +749,11 @@ async def _list_agents(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]
             "idle_seconds": rep.idle_seconds if rep else None,
             "stale": bool(rep.stale) if rep else False,
             "created_at": a.created_at.isoformat() if a.created_at else None,
+            # Why an archived agent was retired (reaped / storm_halted /
+            # idle_reclaimed / manual). None while live. Only visible with
+            # include_archived=true.
+            "archive_reason": a.archive_reason,
+            "archived_at": a.archived_at.isoformat() if a.archived_at else None,
             "model_id": a.model_id,
             "description": a.description,
         })

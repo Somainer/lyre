@@ -69,8 +69,10 @@ class AgentRepository(Protocol):
         """Used by auto-naming (`<persona>-<n>`) and persona-broadcast."""
         ...
 
-    async def archive(self, agent_id: str) -> bool:
-        """Soft delete. Returns True if the agent was active and got archived."""
+    async def archive(self, agent_id: str, reason: str | None = None) -> bool:
+        """Soft delete. Returns True if the agent was active and got archived.
+        ``reason`` (reaped / storm_halted / idle_reclaimed / manual) is recorded
+        atomically for observability (list_agents / dashboard)."""
         ...
 
     async def unarchive(self, agent_id: str) -> bool:

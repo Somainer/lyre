@@ -217,15 +217,19 @@ class SqliteAgentRepository:
             rows = await cur.fetchall()
         return [self._row_to_agent(r) for r in rows]
 
-    async def archive(self, agent_id: str) -> bool:
+    async def archive(self, agent_id: str, reason: str | None = None) -> bool:
+        """Soft-delete. ``reason`` (reaped / storm_halted / idle_reclaimed /
+        manual) is recorded for observability in the SAME write, so the
+        archival decision and its rationale are one atomic fact."""
         async with self.conn.execute(
             """
             UPDATE agents
             SET status = 'archived',
-                archived_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                archived_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                archive_reason = ?
             WHERE id = ? AND status != 'archived'
             """,
-            (agent_id,),
+            (reason, agent_id),
         ) as cur:
             changed = cur.rowcount
         await _commit(self.conn)
@@ -236,7 +240,8 @@ class SqliteAgentRepository:
             """
             UPDATE agents
             SET status = 'idle',
-                archived_at = NULL
+                archived_at = NULL,
+                archive_reason = NULL
             WHERE id = ? AND status = 'archived'
             """,
             (agent_id,),
@@ -398,6 +403,7 @@ class SqliteAgentRepository:
             parent_agent_id=row["parent_agent_id"],
             created_at=row["created_at"],
             archived_at=row["archived_at"],
+            archive_reason=row["archive_reason"],
             metadata=_parse_json(row["metadata"]),
         )
 
@@ -2159,6 +2165,7 @@ class SqliteFanInRepository:
             dry_round=row["dry_round"],
             deadline=row["deadline"],  # pydantic coerces the ISO string
             status=row["status"],
+            created_at=row["created_at"],  # needed by the global fan-in TTL
         )
 
 

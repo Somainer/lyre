@@ -73,11 +73,15 @@
       </summary>
       <div class="card" style="margin-top:var(--s-2);">
         <table class="dtable">
+          <thead><tr><th>agent id</th><th>status</th><th>reason</th><th>parent</th><th></th></tr></thead>
           <tbody>
             {% for a in archived_agents %}
+              {# reason → pill colour: storm_halted is the concerning one. #}
+              {% set rmap = {"storm_halted": "fail", "reaped": "idle", "idle_reclaimed": "idle", "manual": "idle"} %}
               <tr>
                 <td>{{ agent_id_pill(a.id, dim=True) }}</td>
                 <td>{{ status_pill("archived") }}</td>
+                <td>{% if a.archive_reason %}<span class="pill {{ rmap.get(a.archive_reason, 'idle') }}"><span class="pill-dot"></span>{{ a.archive_reason }}</span>{% else %}<span class="dim">—</span>{% endif %}</td>
                 <td>{% if a.parent_agent_id %}{{ agent_id_pill(a.parent_agent_id, dim=True, size='sm') }}{% else %}<span class="dim">bootstrap</span>{% endif %}</td>
                 <td class="dim">{{ a.description or "" }}</td>
               </tr>
