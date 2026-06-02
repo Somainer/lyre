@@ -320,6 +320,13 @@ class Scheduler:
             expired = await self.repos.tasks.find_expired_leases(limit=slots)
             expired = [t for t in expired if t.id not in self._active_subprocesses]
             for t in expired[:slots]:
+                # An ephemeral child whose lease keeps expiring is in a
+                # raw-SIGKILL crash-loop that bypasses the reaper (its task
+                # never reaches a terminal status, so Phase 0.8 never sees it).
+                # Bound it with the same restart-intensity budget; on exceed it
+                # is failed + escalated + reclaimed here instead of re-run.
+                if await self._ephemeral_recovery_exceeded(t):
+                    continue
                 log.info("scheduler_recovering_expired_lease", task_id=t.id)
                 await self._run_task(t.id)
                 slots = self._available_slots()
@@ -339,6 +346,24 @@ class Scheduler:
         pending = await self.repos.tasks.find_pending(limit=candidate_limit)
         pending = [t for t in pending if t.id not in self._active_subprocesses]
 
+        # Owner-facing bootstrap singletons (parent_agent_id NULL) must not be
+        # starved by a burst of spawned ephemeral children. Two measures:
+        #   1. dispatch their pending tasks FIRST (stable sort keeps FIFO within
+        #      each group), so a runnable singleton always beats children;
+        #   2. (subprocess mode, max_concurrent>1) RESERVE one slot for them —
+        #      non-singleton tasks are capped at max_concurrent-1 concurrent, so
+        #      children can never occupy every slot and make the owner wait.
+        #      Inductively this keeps total non-singleton subprocesses ≤
+        #      max_concurrent-1, hence ≥1 slot always reachable by a singleton.
+        singleton_ids = await self.repos.agents.list_bootstrap_singleton_ids()
+        pending.sort(key=lambda t: 0 if t.agent_id in singleton_ids else 1)
+        if self.spawn_subprocess and self._max_concurrent > 1:
+            nonsingleton_cap = max(
+                0, self._max_concurrent - 1 - len(self._active_subprocesses)
+            )
+        else:
+            nonsingleton_cap = slots
+
         # Agents are sequential actors: a second pending task for the
         # same agent must wait until that agent's current wakeup ends.
         # Without this guard two subprocesses for the same agent_id
@@ -348,6 +373,7 @@ class Scheduler:
         # multiple agent INSTANCES, not multiple wakeups of one
         # agent. See docs/design/AGENT_RUNTIME.md.
         dispatched = 0
+        dispatched_nonsingleton = 0
         # Track agents we've already claimed work for in this tick so
         # we don't dispatch two pending tasks of the same agent in
         # the same tick (the DB has_active check wouldn't notice yet).
@@ -355,6 +381,10 @@ class Scheduler:
         for t in pending:
             if dispatched >= slots:
                 break
+            is_singleton = t.agent_id in singleton_ids
+            if not is_singleton and dispatched_nonsingleton >= nonsingleton_cap:
+                # Reserved slot — only a bootstrap singleton may take it.
+                continue
             agent_id = t.agent_id
             if agent_id is not None:
                 if agent_id in claimed_in_this_tick:
@@ -368,6 +398,8 @@ class Scheduler:
                 claimed_in_this_tick.add(agent_id)
             await self._run_task(t.id)
             dispatched += 1
+            if not is_singleton:
+                dispatched_nonsingleton += 1
             if self._available_slots() <= 0:
                 break
 
@@ -658,6 +690,56 @@ class Scheduler:
                     persona=agent.persona_name,
                     outcome=outcome,
                 )
+
+    async def _ephemeral_recovery_exceeded(self, task: Task) -> bool:
+        """For Phase 2 lease recovery: if ``task`` belongs to an ephemeral
+        agent, count this recovery against the agent's restart intensity. While
+        within budget, return False (let the normal recovery re-run proceed).
+        On exceed, fail the task, escalate to the supervisor, and ARCHIVE the
+        agent — so a repeated raw-SIGKILL crash-loop (which never produces a
+        terminal task for the reaper to bound) can't recover forever. Returns
+        True iff it handled the task (caller must skip the re-run).
+
+        Non-ephemeral tasks are never bounded here — return False so ordinary
+        chaos recovery is unchanged.
+        """
+        if task.agent_id is None:
+            return False
+        agent = await self.repos.agents.get(task.agent_id)
+        if agent is None:
+            return False
+        sup = (agent.metadata or {}).get("supervision", {})
+        if not sup.get("ephemeral"):
+            return False
+
+        from ..runtime.future_mail import now_utc
+
+        now = now_utc()
+        within = await self.repos.supervision.bump_and_check_intensity(
+            task.agent_id,
+            int(sup.get("max_restarts", 3)),
+            int(sup.get("max_seconds", 60)),
+            now,
+            reason="lease_expired",
+        )
+        if within:
+            return False
+        # Exceeded: terminate the loop. Failing the task makes it terminal (so
+        # find_expired_leases stops returning it); archiving the agent keeps the
+        # reaper from then restarting the now-failed task. One transaction.
+        async with self.repos.transaction():
+            await self.repos.supervision.mark_escalated(task.agent_id, now)
+            await self.repos.tasks.update_status(task.id, "failed")
+            await self.repos.agents.archive(task.agent_id)
+            await self._insert_supervision_mail(
+                agent, task, kind="escalation", urgency="high"
+            )
+        log.warning(
+            "scheduler_ephemeral_recovery_exceeded",
+            task_id=task.id,
+            agent_id=task.agent_id,
+        )
+        return True
 
     async def _resolve_supervisor_for_agent(self, agent: Agent) -> str | None:
         """The supervisor of an ephemeral ``agent``: its spawner
