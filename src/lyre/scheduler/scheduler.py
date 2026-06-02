@@ -283,6 +283,11 @@ class Scheduler:
         # park/resume state machine single-writer and kill-safe.
         await self._resume_parked_tasks()
 
+        # Phase 0.8 (reaper): reclaim ephemeral agents whose work is done, so
+        # spawned workers (fan-in panel members etc.) don't accumulate. Inert
+        # until something spawns an ephemeral agent.
+        await self._reap_ephemeral_agents()
+
         # Phase 2 (chaos recovery): pick up tasks whose lease has expired
         # (process died, SIGKILL, etc.) BEFORE looking for new pending work.
         # Skip any task already covered by an in-flight subprocess —
@@ -548,6 +553,30 @@ class Scheduler:
         for t in resumable:
             if await self.repos.tasks.resume(t.id):
                 log.info("scheduler_resumed_parked_task", task_id=t.id)
+
+    async def _reap_ephemeral_agents(self) -> None:
+        """Phase 0.8: reclaim ephemeral agents whose work is discharged.
+
+        Erlang-style GC for the supervision tree: an agent created with
+        ``supervision.ephemeral=true`` is archived once it has run at least one
+        task and has none in flight (the find query's race/orphan handling is
+        documented on ``find_reapable_ephemerals``). Done/failure signals
+        already flow via PR3's ``task_terminated`` mail, so reclaim emits no
+        mail — it only frees the addressable slot.
+
+        Kill-safe + idempotent: ``archive()`` is guarded (``WHERE status !=
+        'archived'``) and the reapable set is recomputed from durable rows
+        each tick, so a SIGKILL mid-loop just re-reaps the stragglers next tick.
+        An agent whose task is running in a subprocess holds an in_progress
+        task, which the find query already excludes — no in-memory check needed.
+        """
+        for agent in await self.repos.agents.find_reapable_ephemerals(limit=20):
+            if await self.repos.agents.archive(agent.id):
+                log.info(
+                    "scheduler_reaped_ephemeral_agent",
+                    agent_id=agent.id,
+                    persona=agent.persona_name,
+                )
 
     async def _resolve_terminated_task_supervisor(self, task: Task) -> str | None:
         """The agent that should receive a ``task_terminated`` mail for

@@ -82,6 +82,12 @@ class AgentRepository(Protocol):
 
     async def exists(self, agent_id: str) -> bool: ...
 
+    async def find_reapable_ephemerals(self, limit: int = 20) -> list[Agent]:
+        """Ephemeral, non-archived, previously-dispatched agents with no
+        in-flight task — the reaper's reclaim candidates. See the SQLite
+        implementation for the race/orphan handling."""
+        ...
+
     async def update_metadata(
         self, agent_id: str, metadata: dict[str, Any]
     ) -> None: ...

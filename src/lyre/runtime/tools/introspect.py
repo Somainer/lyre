@@ -436,6 +436,21 @@ async def _create_agent(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any
             )
         metadata["model_id"] = model_id
 
+    # Supervision / lifecycle spec (OTP child_spec analogue). Today only
+    # `ephemeral` is acted on: an ephemeral agent is automatically reclaimed
+    # (archived) by the scheduler's reaper once it has run at least one task
+    # and has no in-flight task. The restart-policy fields are accepted and
+    # stored for the forthcoming supervisor PR.
+    supervision = args.get("supervision")
+    if supervision is not None:
+        if not isinstance(supervision, dict):
+            raise ToolError("supervision must be an object")
+        if "ephemeral" in supervision and not isinstance(
+            supervision["ephemeral"], bool
+        ):
+            raise ToolError("supervision.ephemeral must be a boolean")
+        metadata["supervision"] = supervision
+
     await ctx.repos.agents.create(
         agent_id=agent_id,
         persona_name=persona_name,
@@ -520,6 +535,21 @@ CREATE_AGENT = Tool(
             "description": {
                 "type": "string",
                 "description": "Optional free-form note about this agent's purpose.",
+            },
+            "supervision": {
+                "type": "object",
+                "description": (
+                    "Optional lifecycle spec. Set `{\"ephemeral\": true}` for a "
+                    "short-lived worker (e.g. a fan-in panel member): the "
+                    "runtime auto-reclaims it once it has finished its task(s) "
+                    "and has none in flight, so spawned agents don't accumulate."
+                ),
+                "properties": {
+                    "ephemeral": {
+                        "type": "boolean",
+                        "description": "Auto-reclaim this agent when its work is done.",
+                    },
+                },
             },
         },
         "required": ["persona"],
