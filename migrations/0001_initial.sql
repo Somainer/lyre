@@ -192,6 +192,14 @@ CREATE INDEX IF NOT EXISTS mailbox_messages_recipient_id
 -- filtered by delivered_at >= cutoff.
 CREATE INDEX IF NOT EXISTS mailbox_messages_delivered
   ON mailbox_messages(delivered_at);
+-- Workflow fan-in barrier: Phase 0.5 counts delivered result-mails per group
+-- by json_extract(metadata,'$.fan_in.group_id'). An expression index keeps
+-- that count off a full-table scan. SQLite may decline an expression index
+-- for some GROUP BY/HAVING shapes — PR2 ships an EXPLAIN QUERY PLAN test that
+-- asserts it is consulted, else the barrier falls back to a bounded scan of
+-- the coordinator's own inbox (recipient-narrowed), never lifetime mail.
+CREATE INDEX IF NOT EXISTS mailbox_messages_fan_in
+  ON mailbox_messages(json_extract(metadata, '$.fan_in.group_id'), recipient);
 
 -- Reactions: lightweight ack channel that doesn't generate a new
 -- mailbox_messages row. Lyre tracks the (msg, reactor) tuple so a
@@ -340,6 +348,49 @@ CREATE TABLE IF NOT EXISTS blobs (
 );
 
 CREATE INDEX IF NOT EXISTS blobs_created ON blobs(created_at);
+
+------------------------------------------------------------
+-- Workflow fan-in barrier (deterministic orchestration).
+-- See docs/design/WORKFLOW_ORCHESTRATION.md. The barrier is mailbox-driven:
+-- results ride mailbox_messages; these rows carry ONLY the coordination
+-- contract (fan_in_groups) and the per-slot lineage roster (fan_in_members),
+-- never inter-agent payload. The scheduler is a read-only mailbox client that
+-- resolves a group when COUNT(DISTINCT leg_key) of delivered result-mails
+-- reaches `quorum` (or `deadline` passes).
+------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS fan_in_groups (
+  id                   TEXT PRIMARY KEY,            -- coordinator-minted
+  coordinator_agent_id TEXT NOT NULL REFERENCES agents(id),
+  parent_task_id       TEXT REFERENCES tasks(id),   -- the task that opened it
+  expect_replies       INTEGER NOT NULL,            -- intended width (durable)
+  quorum               INTEGER NOT NULL,            -- trips at >= quorum delivered
+  result_schema        TEXT NOT NULL,               -- JSON Schema each result validates against
+  budget_tokens        INTEGER,                     -- reserved for loop-until-budget (PR7)
+  dry_round            INTEGER NOT NULL DEFAULT 0,   -- reserved for loop-until-dry (PR7)
+  -- NOT NULL: every group is reapable, so a dead coordinator cannot leak an
+  -- open group forever — Phase 0.5 expires it past deadline (liveness).
+  deadline             TEXT NOT NULL,
+  status               TEXT NOT NULL DEFAULT 'open'
+                       CHECK (status IN ('open','quorum_met','expired','cancelled','resolved')),
+  created_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  resolved_at          TEXT
+);
+-- Partial index: Phase 0.5 scans ONLY open groups each tick → O(open).
+CREATE INDEX IF NOT EXISTS fan_in_groups_open
+  ON fan_in_groups(deadline) WHERE status = 'open';
+CREATE INDEX IF NOT EXISTS fan_in_groups_coordinator
+  ON fan_in_groups(coordinator_agent_id, status);
+
+CREATE TABLE IF NOT EXISTS fan_in_members (
+  group_id       TEXT NOT NULL REFERENCES fan_in_groups(id),
+  leg_key        INTEGER NOT NULL,                  -- stable slot key, 0..expect_replies-1
+  child_task_id  TEXT NOT NULL REFERENCES tasks(id),
+  child_agent_id TEXT NOT NULL REFERENCES agents(id),
+  -- (group_id, leg_key) is the dedup key, NOT child_task_id: a re-dispatched
+  -- child gets a fresh task id, so keying on that would not dedup on replay.
+  PRIMARY KEY (group_id, leg_key)
+);
+CREATE INDEX IF NOT EXISTS fan_in_members_group ON fan_in_members(group_id);
 
 ------------------------------------------------------------
 -- Schema version

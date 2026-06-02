@@ -22,6 +22,10 @@ SkillStatus = Literal["proposed", "approved", "deprecated"]
 # record only carries the lifecycle distinction.
 AgentStatus = Literal["idle", "archived"]
 Urgency = Literal["blocker", "high", "normal", "low"]
+# Fan-in group lifecycle (workflow barrier). 'open' → results accumulate;
+# 'quorum_met' → predicate satisfied + coordinator notified; 'expired' →
+# deadline hit with a partial set; 'cancelled' → coordinator gave up.
+FanInStatus = Literal["open", "quorum_met", "expired", "cancelled", "resolved"]
 OutboxKind = Literal[
     "mailbox_send",
     "tier1_notification",
@@ -371,3 +375,43 @@ class Artifact(BaseModel):
     size_bytes: int | None = None
     metadata: dict[str, Any] | None = None
     created_at: datetime | None = None
+
+
+class FanInGroup(BaseModel):
+    """A workflow fan-in barrier — pure coordination contract, NO payload.
+
+    A coordinator opens a group, then dispatches N children whose results
+    ride the mailbox (each child mailbox_sends a typed result-mail tagged
+    with this group_id). The scheduler's Phase 0.5 counts DELIVERED
+    result-mails (not completed tasks — that would race the outbox) and,
+    when ``quorum`` are in, marks the group 'quorum_met' and pings the
+    coordinator. Results live in mail; this row only carries the contract.
+    """
+
+    id: str
+    coordinator_agent_id: str
+    parent_task_id: str | None = None
+    expect_replies: int
+    quorum: int
+    result_schema: dict[str, Any]
+    budget_tokens: int | None = None
+    dry_round: int = 0
+    deadline: datetime
+    status: FanInStatus = "open"
+    created_at: datetime | None = None
+    resolved_at: datetime | None = None
+
+
+class FanInMember(BaseModel):
+    """A roster slot binding (group_id, leg_key) to the child that owns it.
+
+    Payload-free: it carries lineage (which agent may submit this leg), NOT
+    the result. The (group_id, leg_key) PK is the stable dedup key across a
+    re-dispatched child (which gets a fresh task id), and the source of the
+    send-time lineage check that stops a forged result-mail.
+    """
+
+    group_id: str
+    leg_key: int
+    child_task_id: str
+    child_agent_id: str

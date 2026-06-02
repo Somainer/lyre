@@ -21,6 +21,9 @@ dependencies = [
   "aiosqlite>=0.20.0",
   # Data types
   "pydantic>=2.0",
+  # Workflow fan-in: validate typed result-mails against a result_schema at
+  # send time (provider-neutral, pure Python — no adapter dependency).
+  "jsonschema>=4.0",
   # CLI
   "click>=8.1",
   # Config
@@ -52,6 +55,7 @@ dev = [
   "mypy>=1.10",
   "types-pyyaml",
   "types-croniter",
+  "types-jsonschema",
 ]
 
 [project.scripts]

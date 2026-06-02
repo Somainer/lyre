@@ -18,6 +18,8 @@ from .models import (
     Agent,
     Artifact,
     Blob,
+    FanInGroup,
+    FanInMember,
     MailboxMessage,
     MailReaction,
     OutboxRow,
@@ -108,7 +110,7 @@ class PersonaRepository(Protocol):
 
 
 class TaskRepository(Protocol):
-    async def create(self, spec: TaskSpec) -> str: ...
+    async def create(self, spec: TaskSpec, *, in_txn: bool = False) -> str: ...
     async def get(self, task_id: str) -> Task | None: ...
     async def claim_lease(
         self, task_id: str, holder_wakeup_id: str, duration_sec: int
@@ -346,6 +348,12 @@ class MailboxRepository(Protocol):
         """Insert a delivered message (used by dispatcher; idempotent on external_id)."""
         ...
 
+    async def count_fan_in_results(self, recipient: str, group_id: str) -> int:
+        """COUNT(DISTINCT leg_key) of fan-in result-mails delivered to
+        ``recipient`` for ``group_id``. The barrier predicate input — counts
+        the delivery event, not child-task completion."""
+        ...
+
     async def get_message(self, msg_id: int) -> MailboxMessage | None:
         """Fetch ANY mailbox message by primary id, regardless of recipient.
         Used by `mailbox_get_message` for thread/reply/forward context.
@@ -540,6 +548,25 @@ class ArtifactRepository(Protocol):
     async def find_by_task(self, task_id: str) -> list[Artifact]: ...
 
 
+class FanInRepository(Protocol):
+    """Workflow fan-in barrier: the coordination contract + lineage roster.
+    Payload-free — results ride mailbox_messages, not these rows."""
+
+    async def create_group(self, group: FanInGroup, *, in_txn: bool = False) -> str: ...
+    async def get(self, group_id: str) -> FanInGroup | None: ...
+    async def add_member(self, member: FanInMember, *, in_txn: bool = False) -> None: ...
+    async def get_member(self, group_id: str, leg_key: int) -> FanInMember | None: ...
+    async def members(self, group_id: str) -> list[FanInMember]: ...
+    async def any_open(self) -> bool: ...
+    async def find_open(self, limit: int = 20) -> list[FanInGroup]: ...
+    async def set_status(
+        self, group_id: str, status: str, *, guard: str | None = None, in_txn: bool = False
+    ) -> bool:
+        """With ``guard`` set, flip only when current status == guard (the
+        single-winner idiom). Returns True iff a row flipped."""
+        ...
+
+
 class LocalHotRepository(Protocol):
     async def put(self, task_id: str, key: str, value: Any) -> None: ...
     async def get(self, task_id: str, key: str) -> Any | None: ...
@@ -579,6 +606,7 @@ class Repositories(Protocol):
     artifacts: ArtifactRepository
     local_hot: LocalHotRepository
     blobs: BlobRepository
+    fan_in: FanInRepository
     # Raw connection for queries that span multiple tables or need SQL
     # features beyond a single repo's API surface (cross-table joins,
     # JSON1 path filters, dashboard snapshot aggregates). SQLite-typed by

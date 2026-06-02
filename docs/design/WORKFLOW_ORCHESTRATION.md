@@ -25,7 +25,10 @@
 13. [分 PR 路线图](#13-分-pr-路线图)
 14. [明确非目标](#14-明确非目标)
 
-> **状态**：设计已定稿；**PR1（`needs_input` park/resume + `repos.transaction()`）已落地**（见 §13）。其余 PR2–PR6 待实现。
+> **状态**：设计已定稿；**PR1（`needs_input` park/resume + `repos.transaction()`）+ PR2（mailbox 驱动 barrier）已落地**（见 §13）。其余 PR3–PR6 待实现。
+>
+> **实现修正（PR2 落地，修复 v2 文稿的内部矛盾）**：barrier 解析后**通过一封高优先级 `system:fan-in` "ready" 邮件 + 既有 Phase 0 auto-wake 唤醒协调器**；协调器的开启-wakeup **正常 `completed`、绝不 park 进 `needs_input`**。原因正是 §10 铁律一(b)：把 dispatcher-as-coordinator park 进 `needs_input` 会令其对 Phase 0 不可见,从而**重蹈 `await_subagents` 的阻塞老路、违反 owner 准入判据**。结果邮件以 **low urgency** 静默累积(`read_unread(min_urgency='normal')` 忽略 low),只有 barrier 的 ready 邮件(high)触发唤醒,避免 partial-inbox 提前唤醒。**Mail-before-flip** 顺序(先投 ready 邮件、再 guarded 翻状态)使其 kill-safe 自愈,无需把 `insert_message` 纳入事务。
+> PR1 的 `needs_input` park/resume(Phase 0.7)作为通用原语**保留**,但 barrier **刻意不用它**。下文 §3 / §7 / §11 中"`fan_in_open` park 协调器 → Phase 0.7 resume"之处,以此修正为"协调器 `completed` → fan-in-ready 邮件 → Phase 0 auto-wake"。
 
 ---
 

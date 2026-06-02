@@ -25,6 +25,8 @@ from .models import (
     Agent,
     Artifact,
     Blob,
+    FanInGroup,
+    FanInMember,
     GitContext,
     MailboxMessage,
     MailReaction,
@@ -39,6 +41,7 @@ from .repositories import (
     AgentRepository,
     ArtifactRepository,
     BlobRepository,
+    FanInRepository,
     LocalHotRepository,
     MailboxRepository,
     OutboxRepository,
@@ -255,7 +258,7 @@ class SqliteTaskRepository:
     def __init__(self, conn: aiosqlite.Connection):
         self.conn = conn
 
-    async def create(self, spec: TaskSpec) -> str:
+    async def create(self, spec: TaskSpec, *, in_txn: bool = False) -> str:
         task_id = _uuid7()
 
         # Resolve (agent_id, persona_name): the canonical key is agent_id. We
@@ -307,7 +310,8 @@ class SqliteTaskRepository:
                 git_ctx_json,
             ),
         )
-        await self.conn.commit()
+        if not in_txn:
+            await self.conn.commit()
         return task_id
 
     async def get(self, task_id: str) -> Task | None:
@@ -1160,6 +1164,26 @@ class SqliteMailboxRepository:
         await self.conn.commit()
         return row["id"] if row else -1
 
+    async def count_fan_in_results(self, recipient: str, group_id: str) -> int:
+        """Distinct fan-in legs whose result-mail has been DELIVERED to
+        ``recipient`` for ``group_id``. This is the barrier predicate input
+        (Phase 0.5): it counts mailbox rows — the delivery event the
+        coordinator actually depends on — not completed child tasks, so it
+        can never trip while a result is still an undispatched outbox row.
+        COUNT(DISTINCT leg_key) collapses an idempotent redelivery to one.
+        """
+        async with self.conn.execute(
+            """
+            SELECT COUNT(DISTINCT json_extract(metadata, '$.fan_in.leg_key')) AS n
+            FROM mailbox_messages
+            WHERE recipient = ?
+              AND json_extract(metadata, '$.fan_in.group_id') = ?
+            """,
+            (recipient, group_id),
+        ) as cur:
+            row = await cur.fetchone()
+        return int(row["n"]) if row and row["n"] is not None else 0
+
     async def get_message(self, msg_id: int) -> MailboxMessage | None:
         async with self.conn.execute(
             "SELECT * FROM mailbox_messages WHERE id = ?", (msg_id,)
@@ -1801,6 +1825,151 @@ class SqliteBlobRepository:
 # -----------------------------------------------------------------------
 # Aggregate facade
 # -----------------------------------------------------------------------
+# -----------------------------------------------------------------------
+# Fan-in barrier (workflow orchestration)
+# -----------------------------------------------------------------------
+class SqliteFanInRepository:
+    """Workflow fan-in barrier rows: the coordination contract
+    (``fan_in_groups``) + the per-slot lineage roster (``fan_in_members``).
+
+    Payload-free by design — results ride mailbox_messages, never these
+    rows. See docs/design/WORKFLOW_ORCHESTRATION.md.
+    """
+
+    def __init__(self, conn: aiosqlite.Connection):
+        self.conn = conn
+
+    async def create_group(self, group: FanInGroup, *, in_txn: bool = False) -> str:
+        await self.conn.execute(
+            """
+            INSERT INTO fan_in_groups (
+              id, coordinator_agent_id, parent_task_id, expect_replies,
+              quorum, result_schema, budget_tokens, deadline, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open')
+            """,
+            (
+                group.id,
+                group.coordinator_agent_id,
+                group.parent_task_id,
+                group.expect_replies,
+                group.quorum,
+                _json(group.result_schema),
+                group.budget_tokens,
+                group.deadline.isoformat(),
+            ),
+        )
+        if not in_txn:
+            await self.conn.commit()
+        return group.id
+
+    async def get(self, group_id: str) -> FanInGroup | None:
+        async with self.conn.execute(
+            "SELECT * FROM fan_in_groups WHERE id = ?", (group_id,)
+        ) as cur:
+            row = await cur.fetchone()
+        return self._row_to_group(row) if row else None
+
+    async def add_member(self, member: FanInMember, *, in_txn: bool = False) -> None:
+        await self.conn.execute(
+            """
+            INSERT INTO fan_in_members (group_id, leg_key, child_task_id, child_agent_id)
+            VALUES (?, ?, ?, ?)
+            """,
+            (member.group_id, member.leg_key, member.child_task_id, member.child_agent_id),
+        )
+        if not in_txn:
+            await self.conn.commit()
+
+    async def get_member(self, group_id: str, leg_key: int) -> FanInMember | None:
+        async with self.conn.execute(
+            "SELECT * FROM fan_in_members WHERE group_id = ? AND leg_key = ?",
+            (group_id, leg_key),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        return FanInMember(
+            group_id=row["group_id"],
+            leg_key=row["leg_key"],
+            child_task_id=row["child_task_id"],
+            child_agent_id=row["child_agent_id"],
+        )
+
+    async def members(self, group_id: str) -> list[FanInMember]:
+        async with self.conn.execute(
+            "SELECT * FROM fan_in_members WHERE group_id = ? ORDER BY leg_key",
+            (group_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [
+            FanInMember(
+                group_id=r["group_id"],
+                leg_key=r["leg_key"],
+                child_task_id=r["child_task_id"],
+                child_agent_id=r["child_agent_id"],
+            )
+            for r in rows
+        ]
+
+    async def any_open(self) -> bool:
+        """Fast Phase 0.5 early-return probe."""
+        async with self.conn.execute(
+            "SELECT 1 FROM fan_in_groups WHERE status = 'open' LIMIT 1"
+        ) as cur:
+            return (await cur.fetchone()) is not None
+
+    async def find_open(self, limit: int = 20) -> list[FanInGroup]:
+        async with self.conn.execute(
+            "SELECT * FROM fan_in_groups WHERE status = 'open' ORDER BY deadline LIMIT ?",
+            (limit,),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [self._row_to_group(r) for r in rows]
+
+    async def set_status(
+        self,
+        group_id: str,
+        status: str,
+        *,
+        guard: str | None = None,
+        in_txn: bool = False,
+    ) -> bool:
+        """Transition a group's status. With ``guard`` set, only flips when
+        the current status equals it — the single-winner idiom (claim_lease
+        shape) so two scheduler processes can't both resolve one group.
+        Returns True iff a row flipped. resolved_at is stamped on any
+        non-open status."""
+        resolved = ", resolved_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')"
+        tail = " AND status = ?" if guard is not None else ""
+        params: tuple[Any, ...] = (
+            (status, group_id, guard) if guard is not None else (status, group_id)
+        )
+        async with self.conn.execute(
+            f"UPDATE fan_in_groups SET status = ?{resolved} "
+            f"WHERE id = ?{tail} RETURNING id",
+            params,
+        ) as cur:
+            row = await cur.fetchone()
+        if not in_txn:
+            await self.conn.commit()
+        return row is not None
+
+    @staticmethod
+    def _row_to_group(row: aiosqlite.Row) -> FanInGroup:
+        return FanInGroup(
+            id=row["id"],
+            coordinator_agent_id=row["coordinator_agent_id"],
+            parent_task_id=row["parent_task_id"],
+            expect_replies=row["expect_replies"],
+            quorum=row["quorum"],
+            result_schema=_parse_json(row["result_schema"]) or {},
+            budget_tokens=row["budget_tokens"],
+            dry_round=row["dry_round"],
+            deadline=row["deadline"],  # pydantic coerces the ISO string
+            status=row["status"],
+        )
+
+
 class SqliteRepositories:
     """Bundle all SQLite repositories sharing one aiosqlite connection.
 
@@ -1822,6 +1991,7 @@ class SqliteRepositories:
     artifacts: ArtifactRepository
     local_hot: LocalHotRepository
     blobs: BlobRepository
+    fan_in: FanInRepository
 
     def __init__(
         self,
@@ -1861,6 +2031,7 @@ class SqliteRepositories:
         self.artifacts = SqliteArtifactRepository(conn)
         self.local_hot = SqliteLocalHotRepository(conn)
         self.blobs = SqliteBlobRepository(conn)
+        self.fan_in = SqliteFanInRepository(conn)
 
     @asynccontextmanager
     async def transaction(self) -> AsyncIterator[None]:
