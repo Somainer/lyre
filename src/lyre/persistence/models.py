@@ -402,6 +402,20 @@ class FanInGroup(BaseModel):
     resolved_at: datetime | None = None
 
 
+class SupervisionState(BaseModel):
+    """Per-agent restart-intensity window (Erlang/OTP MaxR/MaxT). The reaper
+    bumps this on each restart; if ``restart_count`` would exceed the agent's
+    ``max_restarts`` inside ``max_seconds`` of ``window_start_at``, it escalates
+    instead of restarting."""
+
+    agent_id: str
+    restart_count: int = 0
+    window_start_at: datetime
+    last_restart_at: datetime | None = None
+    last_reason: str | None = None
+    escalated_at: datetime | None = None
+
+
 class FanInMember(BaseModel):
     """A roster slot binding (group_id, leg_key) to the child that owns it.
 

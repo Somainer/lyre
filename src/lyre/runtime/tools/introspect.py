@@ -449,6 +449,17 @@ async def _create_agent(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any
             supervision["ephemeral"], bool
         ):
             raise ToolError("supervision.ephemeral must be a boolean")
+        restart = supervision.get("restart")
+        if restart is not None and restart not in (
+            "temporary", "transient", "permanent"
+        ):
+            raise ToolError(
+                "supervision.restart must be temporary / transient / permanent"
+            )
+        for k in ("max_restarts", "max_seconds"):
+            v = supervision.get(k)
+            if v is not None and (not isinstance(v, int) or v < 0):
+                raise ToolError(f"supervision.{k} must be a non-negative integer")
         metadata["supervision"] = supervision
 
     await ctx.repos.agents.create(
@@ -548,6 +559,24 @@ CREATE_AGENT = Tool(
                     "ephemeral": {
                         "type": "boolean",
                         "description": "Auto-reclaim this agent when its work is done.",
+                    },
+                    "restart": {
+                        "type": "string",
+                        "enum": ["temporary", "transient", "permanent"],
+                        "description": (
+                            "Restart policy on terminal outcome: temporary "
+                            "(default, never restart), transient (restart only "
+                            "on failure), permanent (restart on any outcome). "
+                            "Bounded by max_restarts/max_seconds, then escalated."
+                        ),
+                    },
+                    "max_restarts": {
+                        "type": "integer",
+                        "description": "Max restarts in the window (default 3).",
+                    },
+                    "max_seconds": {
+                        "type": "integer",
+                        "description": "Restart-intensity window in seconds (default 60).",
                     },
                 },
             },
