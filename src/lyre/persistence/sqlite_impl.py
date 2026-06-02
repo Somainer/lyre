@@ -14,6 +14,7 @@ import time
 import uuid as _uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -54,6 +55,23 @@ from .repositories import (
 
 if TYPE_CHECKING:
     from ..config import PersonaOverride
+
+
+# Set for the duration of a `repos.transaction()` block. DAO mutators commit
+# through `_commit()`, which is a no-op while this is True — so every write in
+# the block joins ONE transaction that the block commits (or rolls back) once.
+# A ContextVar (not a connection attribute) so it's isolated per async task and
+# never leaks into a concurrent flow that shares the same connection. Any DAO
+# write composes atomically inside a transaction with no per-call flag — there
+# is nothing to forget, hence no silent-half-commit footgun.
+_IN_TRANSACTION: ContextVar[bool] = ContextVar("lyre_in_transaction", default=False)
+
+
+async def _commit(conn: aiosqlite.Connection) -> None:
+    """Commit, unless we're inside a ``repos.transaction()`` block (then the
+    block owns the single commit)."""
+    if not _IN_TRANSACTION.get():
+        await conn.commit()
 
 
 def _uuid7() -> str:
@@ -159,7 +177,7 @@ class SqliteAgentRepository:
             """,
             (agent_id, persona_name, parent_agent_id, _json(metadata)),
         )
-        await self.conn.commit()
+        await _commit(self.conn)
 
     async def get(self, agent_id: str) -> Agent | None:
         async with self.conn.execute(
@@ -206,7 +224,7 @@ class SqliteAgentRepository:
             (agent_id,),
         ) as cur:
             changed = cur.rowcount
-        await self.conn.commit()
+        await _commit(self.conn)
         return bool(changed)
 
     async def unarchive(self, agent_id: str) -> bool:
@@ -220,7 +238,7 @@ class SqliteAgentRepository:
             (agent_id,),
         ) as cur:
             changed = cur.rowcount
-        await self.conn.commit()
+        await _commit(self.conn)
         return bool(changed)
 
     async def exists(self, agent_id: str) -> bool:
@@ -236,7 +254,7 @@ class SqliteAgentRepository:
             "UPDATE agents SET metadata = ? WHERE id = ?",
             (_json(metadata), agent_id),
         )
-        await self.conn.commit()
+        await _commit(self.conn)
 
     @staticmethod
     def _row_to_agent(row: aiosqlite.Row) -> Agent:
@@ -258,7 +276,7 @@ class SqliteTaskRepository:
     def __init__(self, conn: aiosqlite.Connection):
         self.conn = conn
 
-    async def create(self, spec: TaskSpec, *, in_txn: bool = False) -> str:
+    async def create(self, spec: TaskSpec) -> str:
         task_id = _uuid7()
 
         # Resolve (agent_id, persona_name): the canonical key is agent_id. We
@@ -310,8 +328,7 @@ class SqliteTaskRepository:
                 git_ctx_json,
             ),
         )
-        if not in_txn:
-            await self.conn.commit()
+        await _commit(self.conn)
         return task_id
 
     async def get(self, task_id: str) -> Task | None:
@@ -341,7 +358,7 @@ class SqliteTaskRepository:
             (holder_wakeup_id, f"+{duration_sec} seconds", task_id),
         ) as cur:
             row = await cur.fetchone()
-        await self.conn.commit()
+        await _commit(self.conn)
         return row is not None
 
     async def renew_lease(
@@ -358,7 +375,7 @@ class SqliteTaskRepository:
             (f"+{duration_sec} seconds", task_id, holder_wakeup_id),
         ) as cur:
             row = await cur.fetchone()
-        await self.conn.commit()
+        await _commit(self.conn)
         return row is not None
 
     async def release_lease(self, task_id: str, holder_wakeup_id: str) -> None:
@@ -370,7 +387,7 @@ class SqliteTaskRepository:
             """,
             (task_id, holder_wakeup_id),
         )
-        await self.conn.commit()
+        await _commit(self.conn)
 
     async def update_checkpoint(
         self, task_id: str, checkpoint: dict[str, Any], holder_wakeup_id: str
@@ -383,11 +400,9 @@ class SqliteTaskRepository:
             """,
             (json.dumps(checkpoint), task_id, holder_wakeup_id),
         )
-        await self.conn.commit()
+        await _commit(self.conn)
 
-    async def update_status(
-        self, task_id: str, status: str, *, in_txn: bool = False
-    ) -> None:
+    async def update_status(self, task_id: str, status: str) -> None:
         sql = """
             UPDATE tasks SET status = ?,
                              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
@@ -396,10 +411,7 @@ class SqliteTaskRepository:
             sql += ", completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')"
         sql += " WHERE id = ?"
         await self.conn.execute(sql, (status, task_id))
-        # in_txn=True: caller (repos.transaction()) owns the commit so this
-        # write composes atomically with sibling writes in the same block.
-        if not in_txn:
-            await self.conn.commit()
+        await _commit(self.conn)
 
     # --- Park / resume seam (scheduler-driven barriers) ------------------
     # A task parked in 'needs_input' is invisible to BOTH find_pending
@@ -413,7 +425,7 @@ class SqliteTaskRepository:
     # to a blocking "await children" primitive (deliberately absent — see
     # context.py:317/481): the "wait" is the scheduler polling durable rows.
 
-    async def park(self, task_id: str, *, in_txn: bool = False) -> bool:
+    async def park(self, task_id: str) -> bool:
         """Park a live task in 'needs_input'. Returns True iff a
         pending/in_progress row flipped (a terminal task is left untouched).
 
@@ -432,11 +444,10 @@ class SqliteTaskRepository:
             (task_id,),
         ) as cur:
             row = await cur.fetchone()
-        if not in_txn:
-            await self.conn.commit()
+        await _commit(self.conn)
         return row is not None
 
-    async def request_resume(self, task_id: str, *, in_txn: bool = False) -> bool:
+    async def request_resume(self, task_id: str) -> bool:
         """Flag a parked task ready to resume. Idempotent. Returns True iff a
         'needs_input' row was flagged (False if it isn't parked — already
         resumed, cancelled, or never parked). The actual transition is done
@@ -451,8 +462,7 @@ class SqliteTaskRepository:
             (task_id,),
         ) as cur:
             row = await cur.fetchone()
-        if not in_txn:
-            await self.conn.commit()
+        await _commit(self.conn)
         return row is not None
 
     async def find_resumable(self, limit: int = 20) -> list[Task]:
@@ -470,7 +480,7 @@ class SqliteTaskRepository:
             rows = await cur.fetchall()
         return [self._row_to_task(r) for r in rows]
 
-    async def resume(self, task_id: str, *, in_txn: bool = False) -> bool:
+    async def resume(self, task_id: str) -> bool:
         """The canonical needs_input -> pending transition (Phase 0.7 only).
         Guarded on (status='needs_input' AND resume_ready=1) so two
         concurrent processes can't double-resume — the loser's RETURNING is
@@ -486,8 +496,7 @@ class SqliteTaskRepository:
             (task_id,),
         ) as cur:
             row = await cur.fetchone()
-        if not in_txn:
-            await self.conn.commit()
+        await _commit(self.conn)
         return row is not None
 
     async def find_pending(self, limit: int = 10) -> list[Task]:
@@ -667,7 +676,7 @@ class SqliteWakeupRepository:
             "VALUES (?, ?, ?, ?)",
             (wakeup_id, task_id, persona_name, agent_id),
         )
-        await self.conn.commit()
+        await _commit(self.conn)
         return wakeup_id
 
     async def end(
@@ -708,13 +717,13 @@ class SqliteWakeupRepository:
                 wakeup_id,
             ),
         )
-        await self.conn.commit()
+        await _commit(self.conn)
 
     async def set_transcript_uri(self, wakeup_id: str, uri: str) -> None:
         await self.conn.execute(
             "UPDATE wakeups SET transcript_uri = ? WHERE id = ?", (uri, wakeup_id)
         )
-        await self.conn.commit()
+        await _commit(self.conn)
 
     # Dashboard helpers
     async def list_recent(self, limit: int = 50) -> list[Wakeup]:
@@ -823,7 +832,7 @@ class SqliteWakeupRepository:
             (end_status, task_id),
         ) as cur:
             n = cur.rowcount
-        await self.conn.commit()
+        await _commit(self.conn)
         return n
 
     async def find_terminal_task_orphans(
@@ -903,7 +912,7 @@ class SqliteMailboxRepository:
             "INSERT OR IGNORE INTO mailboxes (recipient) VALUES (?)",
             (recipient,),
         )
-        await self.conn.commit()
+        await _commit(self.conn)
 
     # --- Read flow (per-message read state) ---------------------------
 
@@ -980,7 +989,7 @@ class SqliteMailboxRepository:
             """,
             (recipient, *msg_ids),
         )
-        await self.conn.commit()
+        await _commit(self.conn)
 
     async def get_max_msg_id(self, recipient: str) -> int:
         async with self.conn.execute(
@@ -1161,7 +1170,7 @@ class SqliteMailboxRepository:
             ),
         ) as cur:
             row = await cur.fetchone()
-        await self.conn.commit()
+        await _commit(self.conn)
         return row["id"] if row else -1
 
     async def count_fan_in_results(self, recipient: str, group_id: str) -> int:
@@ -1211,7 +1220,7 @@ class SqliteMailboxRepository:
         )
         async with self.conn.execute("SELECT changes()") as cur:
             row = await cur.fetchone()
-        await self.conn.commit()
+        await _commit(self.conn)
         return bool(row and row[0])
 
     async def list_reactions(self, msg_id: int) -> list[MailReaction]:
@@ -1265,7 +1274,7 @@ class SqliteMailboxRepository:
             f"WHERE id = ?",
             (external_id, msg_id),
         )
-        await self.conn.commit()
+        await _commit(self.conn)
 
     async def find_by_channel_external_id(
         self, channel_name: str, external_id: str,
@@ -1346,7 +1355,7 @@ class SqliteMailboxRepository:
             """,
             (msg_id, recipient),
         )
-        await self.conn.commit()
+        await _commit(self.conn)
 
     @staticmethod
     def _row_to_msg(row: aiosqlite.Row) -> MailboxMessage:
@@ -1420,7 +1429,7 @@ class SqliteScheduledMailRepository:
             ),
         ) as cur:
             row = await cur.fetchone()
-        await self.conn.commit()
+        await _commit(self.conn)
         # INSERT ... RETURNING always yields a row when no constraint
         # violation occurs (which would raise instead of returning None).
         assert row is not None  # noqa: S101 — narrows for mypy
@@ -1507,7 +1516,7 @@ class SqliteScheduledMailRepository:
                 """,
                 (delivered_msg_id, next_scheduled_for, mail_id),
             )
-        await self.conn.commit()
+        await _commit(self.conn)
 
     async def mark_cancelled(
         self,
@@ -1539,7 +1548,7 @@ class SqliteScheduledMailRepository:
             tuple(params),
         ) as cur:
             changed = cur.rowcount
-        await self.conn.commit()
+        await _commit(self.conn)
         return bool(changed)
 
     async def mark_bounced(self, mail_id: int, reason: str) -> None:
@@ -1552,7 +1561,7 @@ class SqliteScheduledMailRepository:
             """,
             (reason, mail_id),
         )
-        await self.conn.commit()
+        await _commit(self.conn)
 
     @staticmethod
     def _row_to_mail(row: aiosqlite.Row) -> ScheduledMail:
@@ -1602,7 +1611,7 @@ class SqliteOutboxRepository:
                 """,
                 (r.task_id, r.wakeup_id, r.kind, _json(r.payload), r.external_id),
             )
-        await self.conn.commit()
+        await _commit(self.conn)
 
     async def dequeue_batch(self, limit: int = 100) -> list[OutboxRow]:
         async with self.conn.execute(
@@ -1636,7 +1645,7 @@ class SqliteOutboxRepository:
             """,
             (row_id,),
         )
-        await self.conn.commit()
+        await _commit(self.conn)
 
     async def mark_failed(self, row_id: int, error: str) -> None:
         await self.conn.execute(
@@ -1647,7 +1656,7 @@ class SqliteOutboxRepository:
             """,
             (error, row_id),
         )
-        await self.conn.commit()
+        await _commit(self.conn)
 
 
 # -----------------------------------------------------------------------
@@ -1668,7 +1677,7 @@ class SqliteLocalHotRepository:
             """,
             (task_id, key, _json(value)),
         )
-        await self.conn.commit()
+        await _commit(self.conn)
 
     async def get(self, task_id: str, key: str) -> Any | None:
         async with self.conn.execute(
@@ -1682,7 +1691,7 @@ class SqliteLocalHotRepository:
         await self.conn.execute(
             "DELETE FROM local_hot WHERE task_id = ?", (task_id,)
         )
-        await self.conn.commit()
+        await _commit(self.conn)
 
 
 # -----------------------------------------------------------------------
@@ -1743,7 +1752,7 @@ class SqliteArtifactRepository:
             """,
             (artifact_id, task_id, wakeup_id, kind, content_hash, blob_uri, size_bytes),
         )
-        await self.conn.commit()
+        await _commit(self.conn)
         return artifact_id
 
     async def get_by_hash(self, content_hash: str) -> Artifact | None:
@@ -1777,7 +1786,7 @@ class SqliteBlobRepository:
                 blob.filename, blob.source,
             ),
         )
-        await self.conn.commit()
+        await _commit(self.conn)
 
     async def get(self, blob_id: str) -> Blob | None:
         async with self.conn.execute(
@@ -1839,7 +1848,7 @@ class SqliteFanInRepository:
     def __init__(self, conn: aiosqlite.Connection):
         self.conn = conn
 
-    async def create_group(self, group: FanInGroup, *, in_txn: bool = False) -> str:
+    async def create_group(self, group: FanInGroup) -> str:
         await self.conn.execute(
             """
             INSERT INTO fan_in_groups (
@@ -1858,8 +1867,7 @@ class SqliteFanInRepository:
                 group.deadline.isoformat(),
             ),
         )
-        if not in_txn:
-            await self.conn.commit()
+        await _commit(self.conn)
         return group.id
 
     async def get(self, group_id: str) -> FanInGroup | None:
@@ -1869,7 +1877,7 @@ class SqliteFanInRepository:
             row = await cur.fetchone()
         return self._row_to_group(row) if row else None
 
-    async def add_member(self, member: FanInMember, *, in_txn: bool = False) -> None:
+    async def add_member(self, member: FanInMember) -> None:
         await self.conn.execute(
             """
             INSERT INTO fan_in_members (group_id, leg_key, child_task_id, child_agent_id)
@@ -1877,8 +1885,7 @@ class SqliteFanInRepository:
             """,
             (member.group_id, member.leg_key, member.child_task_id, member.child_agent_id),
         )
-        if not in_txn:
-            await self.conn.commit()
+        await _commit(self.conn)
 
     async def get_member(self, group_id: str, leg_key: int) -> FanInMember | None:
         async with self.conn.execute(
@@ -1932,7 +1939,6 @@ class SqliteFanInRepository:
         status: str,
         *,
         guard: str | None = None,
-        in_txn: bool = False,
     ) -> bool:
         """Transition a group's status. With ``guard`` set, only flips when
         the current status equals it — the single-winner idiom (claim_lease
@@ -1950,8 +1956,7 @@ class SqliteFanInRepository:
             params,
         ) as cur:
             row = await cur.fetchone()
-        if not in_txn:
-            await self.conn.commit()
+        await _commit(self.conn)
         return row is not None
 
     @staticmethod
@@ -2037,26 +2042,34 @@ class SqliteRepositories:
     async def transaction(self) -> AsyncIterator[None]:
         """Batch several DAO writes into ONE atomic commit.
 
-        Lyre runs SQLite with sqlite3's default deferred isolation level, so
-        the first DML inside this block implicitly opens a transaction and
-        every later write joins it — the driver never auto-commits between
-        statements. Composed DAO mutators take ``in_txn=True`` to SUPPRESS
-        their own trailing ``commit()`` so the whole block commits exactly
-        once here, or rolls back entirely if the body raises.
+        Any DAO mutator called inside this block auto-suppresses its own
+        commit (it commits via ``_commit()``, a no-op while ``_IN_TRANSACTION``
+        is set), so every write joins one transaction that this block commits
+        once — or rolls back entirely if the body raises. There is no per-call
+        flag to pass and none to forget, so a mutator can't silently
+        half-commit a multi-row write.
 
         This is the "advance state AND emit signal" seam the workflow
         scheduler needs (resolve a barrier + park/resume a task + enqueue a
-        signal as one unit). Without it each DAO call self-commits, so a
-        SIGKILL mid-sequence could leave a half-applied multi-row write — the
-        exact gap that makes a naive scheduler-driven join un-kill-safe.
+        signal as one unit). Lyre runs SQLite at the default deferred
+        isolation level, so the first DML implicitly opens the transaction and
+        the suppressed inner commits let it span the whole block.
 
-        Note: this composes only writes routed through ``in_txn=True``. A
-        nested call that still self-commits would prematurely end the block;
-        callers must thread ``in_txn`` through every mutator inside.
+        Nested ``transaction()`` calls just join the outer one (the outermost
+        block owns the single commit/rollback). The flag is a ContextVar, so
+        it is scoped to this async task and never leaks into a concurrent flow
+        that shares the same connection.
         """
+        if _IN_TRANSACTION.get():
+            # Already inside a transaction — join it; the outer block commits.
+            yield
+            return
+        token = _IN_TRANSACTION.set(True)
         try:
             yield
             await self.conn.commit()
         except BaseException:
             await self.conn.rollback()
             raise
+        finally:
+            _IN_TRANSACTION.reset(token)

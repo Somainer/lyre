@@ -137,17 +137,17 @@ async def _dispatch_task(ctx: ToolContext, args: dict[str, Any]) -> dict[str, An
         git_context=git_ctx,
     )
     if fan_in_slot is not None:
-        # Atomic: the child task and its roster slot land together.
+        # Atomic: the child task and its roster slot land together. Both
+        # writes auto-suppress their own commit inside the transaction block.
         async with ctx.repos.transaction():
-            new_task_id = await ctx.repos.tasks.create(spec, in_txn=True)
+            new_task_id = await ctx.repos.tasks.create(spec)
             await ctx.repos.fan_in.add_member(
                 FanInMember(
                     group_id=fan_in_slot[0],
                     leg_key=fan_in_slot[1],
                     child_task_id=new_task_id,
                     child_agent_id=resolved_agent_id,
-                ),
-                in_txn=True,
+                )
             )
     else:
         new_task_id = await ctx.repos.tasks.create(spec)
