@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from . import ToolRegistry
-from .fan_in import FAN_IN_CANCEL, FAN_IN_OPEN, FAN_IN_STATUS
+from .fan_in import FAN_IN_CANCEL, FAN_IN_OPEN, FAN_IN_RESULTS, FAN_IN_STATUS
 from .introspect import (
     ARCHIVE_AGENT,
     CREATE_AGENT,
@@ -45,6 +45,7 @@ def build_default_registry() -> ToolRegistry:
         QUERY_TASK_STATUS,
         FAN_IN_OPEN,
         FAN_IN_STATUS,
+        FAN_IN_RESULTS,
         FAN_IN_CANCEL,
         READ_MEMORY,
         UPDATE_SCRATCHPAD,

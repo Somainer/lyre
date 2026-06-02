@@ -29,6 +29,7 @@ from .models import (
     Blob,
     FanInGroup,
     FanInMember,
+    FanInResult,
     GitContext,
     MailboxMessage,
     MailReaction,
@@ -1339,6 +1340,45 @@ class SqliteMailboxRepository:
         ) as cur:
             row = await cur.fetchone()
         return int(row["n"]) if row and row["n"] is not None else 0
+
+    async def read_fan_in_results(
+        self, recipient: str, group_id: str
+    ) -> list[FanInResult]:
+        """One result per distinct ``leg_key`` (latest mail wins on redelivery),
+        ordered by leg_key. ``MAX(id) … GROUP BY leg_key`` uses SQLite's
+        bare-column-tracks-the-max rule so the ``result``/``sender`` come from
+        that same newest row — mirroring count_fan_in_results' dedup."""
+        async with self.conn.execute(
+            """
+            SELECT json_extract(metadata, '$.fan_in.leg_key') AS leg_key,
+                   json_extract(metadata, '$.fan_in.result')  AS result,
+                   sender,
+                   MAX(id) AS id
+            FROM mailbox_messages
+            WHERE recipient = ?
+              AND json_extract(metadata, '$.fan_in.group_id') = ?
+              AND json_extract(metadata, '$.fan_in.leg_key') IS NOT NULL
+            GROUP BY json_extract(metadata, '$.fan_in.leg_key')
+            ORDER BY leg_key
+            """,
+            (recipient, group_id),
+        ) as cur:
+            rows = await cur.fetchall()
+        out: list[FanInResult] = []
+        for r in rows:
+            result = _parse_json(r["result"])
+            # Send-time validation guarantees a result is a JSON object, so a
+            # non-dict here is genuine corruption (e.g. a hand-forged row). Skip
+            # it rather than wrap garbage into a fake dict — the leg then shows
+            # up honestly in the tool's `missing_legs`, not as a bogus result.
+            if not isinstance(result, dict):
+                continue
+            out.append(
+                FanInResult(
+                    leg_key=int(r["leg_key"]), result=result, sender=r["sender"]
+                )
+            )
+        return out
 
     async def get_message(self, msg_id: int) -> MailboxMessage | None:
         async with self.conn.execute(
