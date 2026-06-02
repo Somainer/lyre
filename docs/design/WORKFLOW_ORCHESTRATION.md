@@ -25,7 +25,7 @@
 13. [分 PR 路线图](#13-分-pr-路线图)
 14. [明确非目标](#14-明确非目标)
 
-> **状态**：设计已定稿；**PR1（`needs_input` park/resume + `repos.transaction()`）+ PR2（mailbox 驱动 barrier）已落地**（见 §13）。其余 PR3–PR6 待实现。
+> **状态**：设计已定稿；**PR1（`needs_input` park/resume + `repos.transaction()`）+ PR2（mailbox 驱动 barrier）+ PR3（`task_terminated` 邮件 / OTP monitor）已落地**（见 §13）。其余 PR4–PR6 待实现。
 >
 > **实现修正（PR2 落地，修复 v2 文稿的内部矛盾）**：barrier 解析后**通过一封高优先级 `system:fan-in` "ready" 邮件 + 既有 Phase 0 auto-wake 唤醒协调器**；协调器的开启-wakeup **正常 `completed`、绝不 park 进 `needs_input`**。原因正是 §10 铁律一(b)：把 dispatcher-as-coordinator park 进 `needs_input` 会令其对 Phase 0 不可见,从而**重蹈 `await_subagents` 的阻塞老路、违反 owner 准入判据**。结果邮件以 **low urgency** 静默累积(`read_unread(min_urgency='normal')` 忽略 low),只有 barrier 的 ready 邮件(high)触发唤醒,避免 partial-inbox 提前唤醒。**Mail-before-flip** 顺序(先投 ready 邮件、再 guarded 翻状态)使其 kill-safe 自愈,无需把 `insert_message` 纳入事务。
 > PR1 的 `needs_input` park/resume(Phase 0.7)作为通用原语**保留**,但 barrier **刻意不用它**。下文 §3 / §7 / §11 中"`fan_in_open` park 协调器 → Phase 0.7 resume"之处,以此修正为"协调器 `completed` → fan-in-ready 邮件 → Phase 0 auto-wake"。
@@ -341,7 +341,7 @@ async def _resume_parked_tasks(self):
 |---|---|---|
 | **PR1** ✅ **已落地** | `needs_input` park/resume（`tasks.resume_ready` 列 + `park`/`request_resume`/`find_resumable`/`resume` + Phase 0.7）+ `repos.transaction()` | `test_park_hides_task_from_find_pending_and_expired_leases` / `test_resume_is_guarded_and_idempotent_across_sigkill` / `test_parked_task_suppresses_auto_wake_for_its_agent` / `test_transaction_rolls_back_partial_supervisory_write` 等 9 个，全绿 |
 | **PR2** | R1 mailbox barrier：`fan_in_groups`+名册+`mailbox_send` 校验/血缘钩子+`fan_in_open/status/cancel`+Phase 0.5+表达式索引 | 数已投递非完成 / outbox 未投递时不早触发 / 发送时校验 fail-closed / 伪造 CLI 结果被血缘拒 / `EXPLAIN` 用上索引 / deadline 过期恢复协调器 |
-| **PR3** | **合并 `origin/claude/task-terminated-mail`（ce27a39）** 的 DOWN 邮件（已带 462 行测试） | DOWN 幂等重投 / parent 归档时回退 owner |
+| **PR3** ✅ **已落地** | `task_terminated` 邮件(OTP monitor 类比):终态任务在 end-of-wakeup → 通知 supervisor(`parent_task` 的 agent → `owner` 回退),`metadata.kind` 供模式匹配,幂等 `external_id=task_terminated:<id>`。**重新实现而非合并 `ce27a39`** —— 后者依赖未合并的 #29(结构化 `failure_reason`/`awaiting`/`_resolve_end_statuses`)且基于 pre-PR1 main,直接合并会拖入额外未合并 PR 并冲突。**两条抑制规则**:fan-in 成员(PR2 barrier 已聚合,否则会用 normal urgency 提前唤醒协调器)+ `auto_dispatched`(内部 inbox 任务)跳过;top-level 任务仅**失败**时通知 owner(成功由 agent 自己回信,系统 ping 是噪音) | child 完成→parent / child 失败→high+reason / top-level 失败→owner / top-level 完成→静默 / fan-in 成员→静默 / auto_dispatched→静默 / parent 归档→回退 owner / 幂等 external_id / 非终态+None→静默 / `_tick` 集成,共 10 个，全绿 |
 | **PR4** | R2 supervisor+reaper：`supervision_state`、Phase 0.6、`create_agent`/`dispatch_task` supervision 参数、`close_orphans_for_task` 入 liveness 谓词、预留单例槽 | reaper 跳过活 wakeup / 先关孤儿 wakeup / 风暴上限+升级 / 超限子被回收 / Phase2 恢复也计强度 / 预留槽使 dispatcher 饱和下仍可运行 / 跨层 kill |
 | **PR5** | 升级处理 + persona 文档（dispatcher/leader 聚合结果邮件 + 处理升级） | 升级邮件 high 且每窗一发 / 协调器 resume 时聚合 |
 | **PR6** | TTL 强关 + 可观测性（`list_agents`/dashboard 显示 reaped/storm_halted） | TTL 关闭泄漏 open 组 / dashboard 显示 reaped/storm_halted |
