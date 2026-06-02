@@ -251,6 +251,24 @@ class IntegrationsConfig:
     # Future: slack: SlackConfig, discord: DiscordConfig, etc.
 
 
+@dataclass(frozen=True)
+class CodingBackend:
+    """An owner-declared external coding-agent credential bundle (see
+    docs/design/CAPABILITY_DISCOVERY.md).
+
+    `shell_exec(credentials="<name>")` injects ``os.environ[auth_env]`` into the
+    one subprocess that drives this coding CLI — the agent never sees the value.
+    The SECRET stays in the env (`~/.lyre/.env`), same convention as model API
+    keys; config holds only the env-var NAME. ``allowed_personas`` optionally
+    restricts which personas may invoke this bundle (None = any persona that
+    already has shell_exec). The agent discovers HOW to drive the CLI; the owner
+    provisions the credential here.
+    """
+
+    auth_env: str
+    allowed_personas: tuple[str, ...] | None = None
+
+
 def _default_home() -> Path:
     return lyre_home()
 
@@ -324,6 +342,12 @@ class Config:
     # risk. 0 (default) DISABLES the hint entirely — fitting Lyre's "agents
     # persist across restarts" default; opt in per deployment.
     idle_reclaim_age_s: int = 0
+    # Owner-declared external coding-agent credential bundles, keyed by name
+    # (e.g. "codex", "claude"). See CodingBackend + CAPABILITY_DISCOVERY.md.
+    # shell_exec(credentials=<name>) injects the named secret into one
+    # subprocess. Empty by default — no coding backend is reachable until the
+    # owner declares one in config.toml [coding_backends].
+    coding_backends: dict[str, CodingBackend] = field(default_factory=dict)
     # Global fan-in barrier TTL (seconds). A backstop ABOVE each group's own
     # `deadline`: when > 0, Phase 0.5 force-expires any `open` fan_in_group
     # older than this, regardless of the per-group deadline (which a coordinator
@@ -521,6 +545,25 @@ class Config:
         if fanin_max_age_s < 0:
             fanin_max_age_s = 0
 
+        # ---- coding-agent credential bundles ----
+        # [coding_backends.<name>] auth_env = "..." [allowed_personas = [...]].
+        # Each entry needs an auth_env; entries missing it are skipped with a
+        # warning rather than crashing startup.
+        coding_backends: dict[str, CodingBackend] = {}
+        for name, spec in (raw.get("coding_backends") or {}).items():
+            if not isinstance(spec, dict) or not spec.get("auth_env"):
+                import logging as _logging
+                _logging.getLogger(__name__).warning(
+                    "config.toml [coding_backends.%s] missing 'auth_env'; skipped",
+                    name,
+                )
+                continue
+            ap = spec.get("allowed_personas")
+            coding_backends[name] = CodingBackend(
+                auth_env=str(spec["auth_env"]),
+                allowed_personas=tuple(ap) if ap else None,
+            )
+
         # ---- legacy [bootstrap] deprecation warning ----
         # The old [bootstrap] section let the owner pin dispatcher_id /
         # analyst_id / reviewer_id. Those moved to persona identity.md
@@ -571,6 +614,7 @@ class Config:
             max_concurrent_tasks=max_concurrent,
             idle_reclaim_age_s=idle_reclaim_age_s,
             fanin_max_age_s=fanin_max_age_s,
+            coding_backends=coding_backends,
         )
 
     @property
