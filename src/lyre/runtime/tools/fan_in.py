@@ -15,7 +15,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from ...persistence.models import FanInGroup
+from ...persistence.models import FanInGroup, FanInResult
 from . import Tool, ToolContext, ToolError
 
 # A group must always be reapable, so a dead coordinator can't leak an open
@@ -85,6 +85,35 @@ async def _fan_in_status(ctx: ToolContext, args: dict[str, Any]) -> dict[str, An
         "quorum": g.quorum,
         "delivered": delivered,
         "deadline": g.deadline.isoformat() if g.deadline else None,
+    }
+
+
+async def _fan_in_results(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
+    group_id = args.get("group_id")
+    if not group_id or not isinstance(group_id, str):
+        raise ToolError("group_id required")
+    g = await ctx.repos.fan_in.get(group_id)
+    if g is None:
+        raise ToolError(f"fan-in group {group_id!r} not found")
+    results: list[FanInResult] = await ctx.repos.mailbox.read_fan_in_results(
+        g.coordinator_agent_id, g.id
+    )
+    delivered_legs = {r.leg_key for r in results}
+    missing = [k for k in range(g.expect_replies) if k not in delivered_legs]
+    return {
+        "group_id": g.id,
+        "status": g.status,
+        "expect_replies": g.expect_replies,
+        "quorum": g.quorum,
+        "delivered": len(results),
+        # The typed payloads, one per leg — aggregate these into your synthesis.
+        "results": [
+            {"leg_key": r.leg_key, "from": r.sender, "result": r.result}
+            for r in results
+        ],
+        # Legs that never delivered (lagged past deadline / failed). With a
+        # quorum < expect_replies this is expected; synthesize from what arrived.
+        "missing_legs": missing,
     }
 
 
@@ -167,6 +196,25 @@ FAN_IN_STATUS = Tool(
         "required": ["group_id"],
     },
     handler=_fan_in_status,
+)
+
+FAN_IN_RESULTS = Tool(
+    name="fan_in_results",
+    description=(
+        "Aggregate a fan-in barrier: returns every delivered leg's typed result "
+        "in one call (one entry per leg_key, latest wins), plus which legs are "
+        "still missing. Call this when the 'fan-in ready' mail (sender "
+        "system:fan-in, urgency high) wakes you — it reads the low-urgency "
+        "result-mails accumulated in your inbox (each carrying "
+        "metadata.fan_in={group_id, leg_key, result}) so you don't have to scan "
+        "and re-parse them by hand. Then synthesize and report."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {"group_id": {"type": "string"}},
+        "required": ["group_id"],
+    },
+    handler=_fan_in_results,
 )
 
 FAN_IN_CANCEL = Tool(

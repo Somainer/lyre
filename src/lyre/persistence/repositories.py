@@ -22,6 +22,7 @@ from .models import (
     Blob,
     FanInGroup,
     FanInMember,
+    FanInResult,
     MailboxMessage,
     MailReaction,
     OutboxRow,
@@ -381,6 +382,16 @@ class MailboxRepository(Protocol):
         """COUNT(DISTINCT leg_key) of fan-in result-mails delivered to
         ``recipient`` for ``group_id``. The barrier predicate input — counts
         the delivery event, not child-task completion."""
+        ...
+
+    async def read_fan_in_results(
+        self, recipient: str, group_id: str
+    ) -> list[FanInResult]:
+        """The delivered fan-in leg results for ``group_id`` — one
+        ``FanInResult`` per distinct ``leg_key`` (latest mail wins on
+        redelivery), ordered by ``leg_key``. The aggregation primitive the
+        coordinator's ``fan_in_results`` tool reads on resume, so it doesn't
+        have to scan its inbox and re-parse low-urgency result-mails by hand."""
         ...
 
     async def get_message(self, msg_id: int) -> MailboxMessage | None:

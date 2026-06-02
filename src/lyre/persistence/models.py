@@ -97,6 +97,19 @@ class AgentIdle(NamedTuple):
     stale: bool
 
 
+class FanInResult(NamedTuple):
+    """One delivered fan-in leg result (see
+    ``MailboxRepository.read_fan_in_results``). ``result`` is the typed payload
+    the child submitted via ``mailbox_send(result_for=…, leg_key=…, result=…)``,
+    already validated against the group's ``result_schema`` at send time.
+    Deduplicated to the latest mail per ``leg_key`` (an idempotent redelivery
+    collapses to one)."""
+
+    leg_key: int
+    result: dict[str, Any]
+    sender: str
+
+
 PersonaKind = Literal["singleton", "seeded", "spawn_only"]
 
 
