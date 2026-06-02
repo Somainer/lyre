@@ -241,6 +241,43 @@ class SqliteAgentRepository:
         await _commit(self.conn)
         return bool(changed)
 
+    async def find_reapable_ephemerals(self, limit: int = 20) -> list[Agent]:
+        """Ephemeral agents whose work is fully discharged — the reaper's
+        reclaim candidates.
+
+        An agent is reapable iff it is marked ephemeral
+        (``metadata.supervision.ephemeral``), not already archived, was
+        actually spawned (``parent_agent_id`` not NULL — bootstrap singletons
+        are never ephemeral), has run at least one task, and has NO in-flight
+        task (pending/in_progress/needs_input).
+
+        Requiring ``EXISTS(any task)`` closes the create→first-dispatch race: a
+        freshly created ephemeral agent (zero tasks) is NOT reaped before the
+        coordinator dispatches its first task. Keying liveness on in-flight
+        TASK status (not raw wakeup rows) means an orphan open-wakeup row left
+        by a crashed child — whose task is already terminal — does not mask the
+        agent as live (mirrors has_active_for_agent's JOIN defense).
+        """
+        async with self.conn.execute(
+            """
+            SELECT a.* FROM agents a
+            WHERE a.status != 'archived'
+              AND a.parent_agent_id IS NOT NULL
+              AND json_extract(a.metadata, '$.supervision.ephemeral') = 1
+              AND EXISTS (SELECT 1 FROM tasks t WHERE t.agent_id = a.id)
+              AND NOT EXISTS (
+                SELECT 1 FROM tasks t
+                WHERE t.agent_id = a.id
+                  AND t.status IN ('pending', 'in_progress', 'needs_input')
+              )
+            ORDER BY a.created_at
+            LIMIT ?
+            """,
+            (limit,),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [self._row_to_agent(r) for r in rows]
+
     async def exists(self, agent_id: str) -> bool:
         async with self.conn.execute(
             "SELECT 1 FROM agents WHERE id = ?", (agent_id,)
