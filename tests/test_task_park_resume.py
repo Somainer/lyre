@@ -207,8 +207,8 @@ async def test_transaction_commits_both_writes(
     t1 = await _new_task(repos)
     t2 = await _new_task(repos)
     async with repos.transaction():
-        await repos.tasks.update_status(t1, "completed", in_txn=True)
-        await repos.tasks.update_status(t2, "failed", in_txn=True)
+        await repos.tasks.update_status(t1, "completed")
+        await repos.tasks.update_status(t2, "failed")
     assert (await repos.tasks.get(t1)).status == "completed"  # type: ignore[union-attr]
     assert (await repos.tasks.get(t2)).status == "failed"  # type: ignore[union-attr]
 
@@ -221,8 +221,8 @@ async def test_transaction_rolls_back_partial_supervisory_write(
     t2 = await _new_task(repos)
     with pytest.raises(RuntimeError, match="boom"):
         async with repos.transaction():
-            await repos.tasks.update_status(t1, "completed", in_txn=True)
-            await repos.tasks.update_status(t2, "failed", in_txn=True)
+            await repos.tasks.update_status(t1, "completed")
+            await repos.tasks.update_status(t2, "failed")
             raise RuntimeError("boom")
     # Neither write survives — the half-applied state a SIGKILL would
     # otherwise leave is rolled back as one unit.

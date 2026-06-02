@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ...persistence.models import GitContext, TaskSpec
+from ...persistence.models import FanInMember, GitContext, TaskSpec
 from . import Tool, ToolContext, ToolError
 
 
@@ -70,6 +70,38 @@ async def _dispatch_task(ctx: ToolContext, args: dict[str, Any]) -> dict[str, An
     if metadata is not None and not isinstance(metadata, dict):
         raise ToolError("metadata must be an object")
 
+    # Fan-in: dispatch this child INTO a barrier group. We validate the group
+    # is open + the slot is free here, then (below) write the child task and
+    # its roster row in ONE transaction so a crash can't leave a child that
+    # owns no leg (its result-mail would then fail the lineage check forever).
+    fan_in_arg = args.get("fan_in")
+    fan_in_slot: tuple[str, int] | None = None
+    if fan_in_arg is not None:
+        if not isinstance(fan_in_arg, dict):
+            raise ToolError("fan_in must be an object {group_id, leg_key}")
+        fg = fan_in_arg.get("group_id")
+        lk = fan_in_arg.get("leg_key")
+        if not isinstance(fg, str) or not fg:
+            raise ToolError("fan_in.group_id required (string)")
+        if not isinstance(lk, int) or lk < 0:
+            raise ToolError("fan_in.leg_key required (non-negative integer)")
+        group = await ctx.repos.fan_in.get(fg)
+        if group is None or group.status != "open":
+            raise ToolError(
+                f"fan-in group {fg!r} is not open; cannot dispatch into it"
+            )
+        if await ctx.repos.fan_in.get_member(fg, lk) is not None:
+            raise ToolError(f"leg_key={lk} already taken in fan-in group {fg!r}")
+        # Stamp the child so it knows which barrier/leg it serves and what
+        # shape its result must take.
+        metadata = {
+            **(metadata or {}),
+            "fan_in_group": fg,
+            "leg_key": lk,
+            "result_schema": group.result_schema,
+        }
+        fan_in_slot = (fg, lk)
+
     git_ctx_arg = args.get("git_context")
     git_ctx: GitContext | None = None
     if git_ctx_arg is not None:
@@ -104,12 +136,27 @@ async def _dispatch_task(ctx: ToolContext, args: dict[str, Any]) -> dict[str, An
         metadata=metadata,
         git_context=git_ctx,
     )
-    new_task_id = await ctx.repos.tasks.create(spec)
+    if fan_in_slot is not None:
+        # Atomic: the child task and its roster slot land together. Both
+        # writes auto-suppress their own commit inside the transaction block.
+        async with ctx.repos.transaction():
+            new_task_id = await ctx.repos.tasks.create(spec)
+            await ctx.repos.fan_in.add_member(
+                FanInMember(
+                    group_id=fan_in_slot[0],
+                    leg_key=fan_in_slot[1],
+                    child_task_id=new_task_id,
+                    child_agent_id=resolved_agent_id,
+                )
+            )
+    else:
+        new_task_id = await ctx.repos.tasks.create(spec)
     return {
         "task_id": new_task_id,
         "agent": resolved_agent_id,
         "persona": resolved_persona,
         "status": "pending",
+        "fan_in_group": fan_in_slot[0] if fan_in_slot else None,
     }
 
 
@@ -171,6 +218,23 @@ DISPATCH_TASK = Tool(
             },
             "lease_duration_s": {"type": "integer", "default": 1800},
             "metadata": {"type": "object"},
+            "fan_in": {
+                "type": "object",
+                "description": (
+                    "Dispatch this child into a fan-in barrier opened with "
+                    "fan_in_open(). The child must return its result via "
+                    "mailbox_send(result_for=group_id, leg_key=…, result=…). "
+                    "Each leg_key must be unique within the group."
+                ),
+                "properties": {
+                    "group_id": {"type": "string"},
+                    "leg_key": {
+                        "type": "integer",
+                        "description": "This child's slot, 0..expect_replies-1.",
+                    },
+                },
+                "required": ["group_id", "leg_key"],
+            },
             "git_context": {
                 "type": "object",
                 "description": (

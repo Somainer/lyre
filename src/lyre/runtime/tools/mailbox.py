@@ -13,6 +13,8 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
+import jsonschema
+
 from ...persistence.models import OutboxRow, ScheduledMail
 from ..future_mail import (
     PastDeliveryError,
@@ -26,10 +28,69 @@ from ..future_mail import (
 from . import Tool, ToolContext, ToolError
 
 
+async def _validate_fan_in_result(
+    ctx: ToolContext, args: dict[str, Any]
+) -> dict[str, Any]:
+    """Validate a fan-in result-mail BEFORE it enters the outbox (fail-closed).
+
+    Checks, in order: leg_key/result present; group exists and is open;
+    sender owns (group_id, leg_key) in the roster (lineage — stops a forged
+    or misrouted result, incl. one fabricated by the owner/CLI); result
+    matches the group's result_schema. Returns the forced coordinator
+    recipient + the metadata.fan_in envelope to stamp.
+    """
+    group_id = args["result_for"]
+    if not isinstance(group_id, str):
+        raise ToolError("result_for must be a string group_id")
+    leg_key = args.get("leg_key")
+    if not isinstance(leg_key, int):
+        raise ToolError("leg_key (integer) is required when result_for is set")
+    result = args.get("result")
+    if not isinstance(result, dict):
+        raise ToolError("result (object) is required when result_for is set")
+    if _has_scheduling_args(args):
+        raise ToolError("result_for cannot be combined with scheduled delivery")
+
+    group = await ctx.repos.fan_in.get(group_id)
+    if group is None:
+        raise ToolError(f"fan-in group {group_id!r} not found")
+    if group.status != "open":
+        raise ToolError(
+            f"fan-in group {group_id!r} is {group.status}, not open — result rejected"
+        )
+    member = await ctx.repos.fan_in.get_member(group_id, leg_key)
+    if member is None:
+        raise ToolError(f"no leg_key={leg_key} in fan-in group {group_id!r}")
+    if member.child_agent_id != ctx.self_mailbox:
+        raise ToolError(
+            f"you ({ctx.self_mailbox}) do not own leg_key={leg_key} of group "
+            f"{group_id!r} (owner: {member.child_agent_id}); cannot submit its result"
+        )
+    try:
+        jsonschema.validate(result, group.result_schema)
+    except jsonschema.ValidationError as e:
+        raise ToolError(
+            f"result does not match the group's result_schema: {e.message}"
+        ) from e
+    return {
+        "coordinator": group.coordinator_agent_id,
+        "envelope": {"group_id": group_id, "leg_key": leg_key, "result": result},
+    }
+
+
 async def _mailbox_send(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
-    raw_to = args.get("to")
+    # Fan-in result path: a child returning a typed result for a barrier. We
+    # resolve + validate up front so a malformed/forged result never reaches
+    # the outbox, then FORCE recipient=coordinator and urgency='low' (results
+    # accumulate silently — the scheduler's resolve mail is what wakes the
+    # coordinator, so partial results don't trigger premature auto-wakes).
+    fan_in_meta: dict[str, Any] | None = None
+    if args.get("result_for") is not None:
+        fan_in_meta = await _validate_fan_in_result(ctx, args)
+
+    raw_to = fan_in_meta["coordinator"] if fan_in_meta else args.get("to")
     body = args.get("body")
-    urgency = args.get("urgency", "normal")
+    urgency = "low" if fan_in_meta else args.get("urgency", "normal")
     raw_title = args.get("title")
 
     # `to` accepts a single string or a list of strings (broadcast).
@@ -160,10 +221,14 @@ async def _mailbox_send(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any
     if not isinstance(user_meta, dict):
         raise ToolError("metadata must be an object")
     metadata: dict[str, Any] | None = None
-    if forward_msg_id is not None or user_meta:
+    if forward_msg_id is not None or user_meta or fan_in_meta is not None:
         metadata = {**user_meta}
         if forward_msg_id is not None:
             metadata["forwarded_from_msg_id"] = forward_msg_id
+        if fan_in_meta is not None:
+            # The envelope the barrier predicate keys on:
+            # metadata.fan_in.{group_id, leg_key, result}.
+            metadata["fan_in"] = fan_in_meta["envelope"]
 
     rows: list[OutboxRow] = []
     external_ids: list[str] = []
@@ -735,6 +800,28 @@ MAILBOX_SEND = Tool(
             "metadata": {
                 "type": "object",
                 "description": "Optional structured metadata to attach.",
+            },
+            "result_for": {
+                "type": "string",
+                "description": (
+                    "Fan-in result mode: the group_id you are returning a "
+                    "result for. When set, you MUST also pass `leg_key` and "
+                    "`result`; the runtime validates `result` against the "
+                    "group's result_schema, forces the recipient to the "
+                    "coordinator, and sends low-urgency (it accumulates "
+                    "silently — the barrier wakes the coordinator)."
+                ),
+            },
+            "leg_key": {
+                "type": "integer",
+                "description": "Your slot in the fan-in group (set with result_for).",
+            },
+            "result": {
+                "type": "object",
+                "description": (
+                    "The typed result object (set with result_for). Validated "
+                    "against the group's result_schema at send time."
+                ),
             },
             "deliver_at": {
                 "type": "string",

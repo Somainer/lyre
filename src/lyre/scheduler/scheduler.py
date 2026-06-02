@@ -248,6 +248,12 @@ class Scheduler:
         # otherwise agents would wait a full poll interval for follow-up.
         await self._deliver_scheduled_mail()
 
+        # Phase 0.5 (fan-in barrier): resolve any workflow barrier whose
+        # delivered result-mails reached quorum (or whose deadline passed)
+        # and deliver the coordinator a 'ready' mail. Runs BEFORE Phase 0 so
+        # that wake mail is picked up by auto-wake on the SAME tick.
+        await self._resolve_fan_in_barriers()
+
         # Phase 0 (mail-triggered wakeup): if any agent has unread mail and
         # has no in-flight task, create an auto-"check inbox" task so the
         # message gets read.
@@ -443,6 +449,74 @@ class Scheduler:
                 triggered_by_mail_id=top.id,
                 new_task_id=task_id,
             )
+
+    async def _resolve_fan_in_barriers(self) -> None:
+        """Phase 0.5: resolve mailbox-driven fan-in barriers.
+
+        Counts DELIVERED result-mails (not completed child tasks — that would
+        race the outbox: a child can be 'completed' before its result-mail is
+        dispatched). When a group reaches ``quorum`` (or its deadline passes),
+        deliver a high-urgency 'ready' mail to the coordinator, then flip the
+        group to a terminal status with a guarded single-winner UPDATE.
+
+        Mail-BEFORE-flip is deliberate and self-healing: a SIGKILL between the
+        two re-delivers the idempotent mail (UNIQUE recipient+external_id) and
+        retries the flip next tick, so a resolved group can never end up with
+        no wake (the flip-first ordering could strand the coordinator). The
+        coordinator is idle (its open-barrier task COMPLETED — never parked),
+        so the existing Phase 0 auto-wake picks up the ready mail. No lease, no
+        wakeup, no LLM here — this phase only reads + enqueues.
+        """
+        if not await self.repos.fan_in.any_open():
+            return
+        from ..persistence.models import MailboxMessage as _Msg
+        from ..runtime.future_mail import now_utc
+
+        now = now_utc()
+        for g in await self.repos.fan_in.find_open(limit=20):
+            delivered = await self.repos.mailbox.count_fan_in_results(
+                g.coordinator_agent_id, g.id
+            )
+            ready = delivered >= g.quorum
+            timed_out = g.deadline is not None and now >= g.deadline
+            if not (ready or timed_out):
+                continue
+            new_status = "quorum_met" if ready else "expired"
+            await self.repos.mailbox.ensure_mailbox(g.coordinator_agent_id)
+            await self.repos.mailbox.insert_message(
+                _Msg(
+                    recipient=g.coordinator_agent_id,
+                    external_id=f"fanin:{g.id}:resolved",
+                    sender="system:fan-in",
+                    urgency="high",
+                    title=f"fan-in {g.id} ready ({new_status})",
+                    body=(
+                        f"Fan-in barrier {g.id} is ready to aggregate: "
+                        f"{delivered}/{g.expect_replies} legs delivered "
+                        f"(quorum {g.quorum}, status {new_status}). Read your "
+                        f"result-mails (they carry metadata.fan_in.group_id="
+                        f"{g.id}) and synthesize."
+                    ),
+                    task_id=g.parent_task_id,
+                    metadata={
+                        "fan_in_resolved": g.id,
+                        "delivered": delivered,
+                        "resolved_status": new_status,
+                    },
+                )
+            )
+            flipped = await self.repos.fan_in.set_status(
+                g.id, new_status, guard="open"
+            )
+            if flipped:
+                log.info(
+                    "fan_in_resolved",
+                    group_id=g.id,
+                    status=new_status,
+                    delivered=delivered,
+                    quorum=g.quorum,
+                    coordinator=g.coordinator_agent_id,
+                )
 
     async def _resume_parked_tasks(self) -> None:
         """Phase 0.7: resume tasks parked in 'needs_input' once their resume
