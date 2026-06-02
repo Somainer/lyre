@@ -34,6 +34,7 @@ from .models import (
     OutboxRow,
     ScheduledMail,
     Skill,
+    SupervisionState,
     Task,
     TaskSpec,
     Wakeup,
@@ -49,6 +50,7 @@ from .repositories import (
     PersonaRepository,
     ScheduledMailRepository,
     SkillRepository,
+    SupervisionRepository,
     TaskRepository,
     WakeupRepository,
 )
@@ -557,6 +559,21 @@ class SqliteTaskRepository:
         ) as cur:
             rows = await cur.fetchall()
         return [self._row_to_task(r) for r in rows]
+
+    async def find_latest_task_for_agent(self, agent_id: str) -> Task | None:
+        """The most-recently-created task for this agent. Used by the
+        supervisor reaper to read an ephemeral child's last outcome (and
+        re-dispatch its goal one-for-one on restart)."""
+        # rowid is the strictly-monotonic insertion order — the unambiguous
+        # "latest" even when two tasks share a millisecond created_at (uuid7
+        # ids are NOT monotonic within a millisecond, so they can't break the
+        # tie reliably).
+        async with self.conn.execute(
+            "SELECT * FROM tasks WHERE agent_id = ? ORDER BY rowid DESC LIMIT 1",
+            (agent_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        return self._row_to_task(row) if row else None
 
     async def find_children(self, parent_task_id: str) -> list[Task]:
         """Return all direct child tasks (status doesn't matter)."""
@@ -2012,6 +2029,88 @@ class SqliteFanInRepository:
         )
 
 
+# -----------------------------------------------------------------------
+# Supervision state (restart-intensity window)
+# -----------------------------------------------------------------------
+class SqliteSupervisionRepository:
+    """Per-agent restart-intensity window for the supervisor reaper."""
+
+    def __init__(self, conn: aiosqlite.Connection):
+        self.conn = conn
+
+    async def get(self, agent_id: str) -> SupervisionState | None:
+        async with self.conn.execute(
+            "SELECT * FROM supervision_state WHERE agent_id = ?", (agent_id,)
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        return SupervisionState(
+            agent_id=row["agent_id"],
+            restart_count=row["restart_count"],
+            window_start_at=row["window_start_at"],
+            last_restart_at=row["last_restart_at"],
+            last_reason=row["last_reason"],
+            escalated_at=row["escalated_at"],
+        )
+
+    async def bump_and_check_intensity(
+        self,
+        agent_id: str,
+        max_restarts: int,
+        max_seconds: int,
+        now: datetime,
+        reason: str | None = None,
+    ) -> bool:
+        """Record one restart and return True iff it's within budget — at most
+        ``max_restarts`` restarts within a sliding ``max_seconds`` window. The
+        window resets when ``max_seconds`` has elapsed since it opened. An
+        over-count from a redelivered signal is fail-safe: it pushes toward
+        EARLIER escalation, never a missed bound."""
+        state = await self.get(agent_id)
+        if state is None or (
+            (now - state.window_start_at).total_seconds() > max_seconds
+        ):
+            # No window yet, or the window has elapsed — open a fresh one.
+            count = 1
+            window_start = now
+        else:
+            count = state.restart_count + 1
+            window_start = state.window_start_at
+        await self.conn.execute(
+            """
+            INSERT INTO supervision_state
+              (agent_id, restart_count, window_start_at, last_restart_at, last_reason)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(agent_id) DO UPDATE SET
+              restart_count   = excluded.restart_count,
+              window_start_at = excluded.window_start_at,
+              last_restart_at = excluded.last_restart_at,
+              last_reason     = excluded.last_reason
+            """,
+            (
+                agent_id,
+                count,
+                window_start.isoformat(),
+                now.isoformat(),
+                reason,
+            ),
+        )
+        await _commit(self.conn)
+        return count <= max_restarts
+
+    async def mark_escalated(self, agent_id: str, now: datetime) -> None:
+        await self.conn.execute(
+            """
+            INSERT INTO supervision_state (agent_id, window_start_at, escalated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(agent_id) DO UPDATE SET escalated_at = excluded.escalated_at
+            """,
+            (agent_id, now.isoformat(), now.isoformat()),
+        )
+        await _commit(self.conn)
+
+
 class SqliteRepositories:
     """Bundle all SQLite repositories sharing one aiosqlite connection.
 
@@ -2034,6 +2133,7 @@ class SqliteRepositories:
     local_hot: LocalHotRepository
     blobs: BlobRepository
     fan_in: FanInRepository
+    supervision: SupervisionRepository
 
     def __init__(
         self,
@@ -2074,6 +2174,7 @@ class SqliteRepositories:
         self.local_hot = SqliteLocalHotRepository(conn)
         self.blobs = SqliteBlobRepository(conn)
         self.fan_in = SqliteFanInRepository(conn)
+        self.supervision = SqliteSupervisionRepository(conn)
 
     @asynccontextmanager
     async def transaction(self) -> AsyncIterator[None]:

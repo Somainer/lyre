@@ -393,6 +393,24 @@ CREATE TABLE IF NOT EXISTS fan_in_members (
 CREATE INDEX IF NOT EXISTS fan_in_members_group ON fan_in_members(group_id);
 
 ------------------------------------------------------------
+-- Supervision state (Erlang/OTP restart-intensity window).
+-- The supervisor reaper restarts a failed ephemeral agent's leg one-for-one,
+-- bounded by max_restarts within a sliding max_seconds window; on exceed it
+-- escalates (a mail to the parent) instead of looping. A TYPED table — not a
+-- key in agents.metadata — because update_metadata is a full-column overwrite
+-- and a torn read-modify-write of a JSON counter could silently reset the
+-- window; an atomically-updatable row cannot.
+------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS supervision_state (
+  agent_id        TEXT PRIMARY KEY REFERENCES agents(id),
+  restart_count   INTEGER NOT NULL DEFAULT 0,   -- restarts inside the current window
+  window_start_at TEXT NOT NULL,                -- ISO 8601 UTC; window resets past max_seconds
+  last_restart_at TEXT,
+  last_reason     TEXT,                          -- coarse outcome of the restarted task
+  escalated_at    TEXT                           -- set when intensity was exceeded
+);
+
+------------------------------------------------------------
 -- Schema version
 ------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS schema_migrations (

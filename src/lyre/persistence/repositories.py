@@ -9,6 +9,7 @@ See PERSISTENCE_SCHEMA.md §4 for design rationale.
 from __future__ import annotations
 
 from contextlib import AbstractAsyncContextManager
+from datetime import datetime
 from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
@@ -26,6 +27,7 @@ from .models import (
     Persona,
     ScheduledMail,
     Skill,
+    SupervisionState,
     Task,
     TaskSpec,
     Wakeup,
@@ -132,6 +134,9 @@ class TaskRepository(Protocol):
     async def find_pending(self, limit: int = 10) -> list[Task]: ...
     async def find_expired_leases(self, limit: int = 10) -> list[Task]: ...
     async def find_children(self, parent_task_id: str) -> list[Task]: ...
+    async def find_latest_task_for_agent(self, agent_id: str) -> Task | None:
+        """The most-recently-created task for this agent (supervisor reaper)."""
+        ...
 
     # --- Park / resume (scheduler-driven barrier seam) -------------------
     async def park(self, task_id: str) -> bool:
@@ -571,6 +576,25 @@ class FanInRepository(Protocol):
         ...
 
 
+class SupervisionRepository(Protocol):
+    """Per-agent restart-intensity window (Erlang/OTP MaxR/MaxT)."""
+
+    async def get(self, agent_id: str) -> SupervisionState | None: ...
+    async def bump_and_check_intensity(
+        self,
+        agent_id: str,
+        max_restarts: int,
+        max_seconds: int,
+        now: datetime,
+        reason: str | None = None,
+    ) -> bool:
+        """Record one restart; return True iff within ``max_restarts`` per a
+        sliding ``max_seconds`` window. Over-count is fail-safe (earlier
+        escalation, never a missed bound)."""
+        ...
+    async def mark_escalated(self, agent_id: str, now: datetime) -> None: ...
+
+
 class LocalHotRepository(Protocol):
     async def put(self, task_id: str, key: str, value: Any) -> None: ...
     async def get(self, task_id: str, key: str) -> Any | None: ...
@@ -611,6 +635,7 @@ class Repositories(Protocol):
     local_hot: LocalHotRepository
     blobs: BlobRepository
     fan_in: FanInRepository
+    supervision: SupervisionRepository
     # Raw connection for queries that span multiple tables or need SQL
     # features beyond a single repo's API surface (cross-table joins,
     # JSON1 path filters, dashboard snapshot aggregates). SQLite-typed by

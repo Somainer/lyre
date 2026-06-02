@@ -32,7 +32,16 @@ import structlog
 
 from ..adapter.llm_adapter import LLMAdapter
 from ..config import Config
-from ..persistence.models import OutboxRow, Persona, ScheduledMail, Task, TaskSpec
+from ..persistence.models import (
+    Agent,
+    MailboxMessage,
+    OutboxRow,
+    Persona,
+    ScheduledMail,
+    Task,
+    TaskSpec,
+    Urgency,
+)
 from ..persistence.repositories import Repositories
 from ..runtime.adapter_factory import AdapterFactory, model_name_for_provider
 from ..runtime.agent_loop import AgentLoop
@@ -100,6 +109,17 @@ _TASK_OUTCOME_URGENCY: dict[str, str] = {
     "failed": "high",
     "cancelled": "normal",
 }
+
+
+def _should_restart(policy: str, outcome: str) -> bool:
+    """OTP restart-type semantics for an ephemeral child's latest outcome.
+    ``permanent`` restarts on any terminal outcome; ``transient`` only on an
+    abnormal one (failed); ``temporary`` (the default) never restarts."""
+    if policy == "permanent":
+        return True
+    if policy == "transient":
+        return outcome == "failed"
+    return False
 
 
 class Scheduler:
@@ -555,28 +575,155 @@ class Scheduler:
                 log.info("scheduler_resumed_parked_task", task_id=t.id)
 
     async def _reap_ephemeral_agents(self) -> None:
-        """Phase 0.8: reclaim ephemeral agents whose work is discharged.
+        """Phase 0.8: supervise + reclaim ephemeral agents whose work is done.
 
-        Erlang-style GC for the supervision tree: an agent created with
-        ``supervision.ephemeral=true`` is archived once it has run at least one
-        task and has none in flight (the find query's race/orphan handling is
-        documented on ``find_reapable_ephemerals``). Done/failure signals
-        already flow via PR3's ``task_terminated`` mail, so reclaim emits no
-        mail — it only frees the addressable slot.
+        For each ephemeral agent with no in-flight task (race/orphan handling
+        documented on ``find_reapable_ephemerals``), apply its restart policy
+        to the latest task's outcome:
 
-        Kill-safe + idempotent: ``archive()`` is guarded (``WHERE status !=
-        'archived'``) and the reapable set is recomputed from durable rows
-        each tick, so a SIGKILL mid-loop just re-reaps the stragglers next tick.
-        An agent whose task is running in a subprocess holds an in_progress
-        task, which the find query already excludes — no in-memory check needed.
+          * should-restart (transient on failure / permanent on any) AND within
+            restart intensity → re-dispatch the leg one-for-one (same agent,
+            same goal + metadata, so a fan-in member retries its leg). Silent —
+            a deterministic routine restart.
+          * should-restart but intensity exceeded → escalate (a high-urgency
+            mail to the supervisor — the one LLM entry point) and reclaim.
+          * no restart, latest FAILED → a failure notice to the supervisor
+            (PR3's task_terminated is suppressed for ephemeral agents — the
+            reaper owns their lifecycle — so this is where that failure
+            surfaces), then reclaim.
+          * no restart, clean → reclaim silently.
+
+        Each agent's decision is one transaction (bump+restart, or
+        archive+mail), so a SIGKILL leaves either the old state or the new,
+        never half. Reclaim is idempotent; a re-dispatched task is in-flight
+        and removes the agent from the candidate set until it terminates again,
+        which serialises restart vs. re-reap.
+
+        KNOWN GAP (PR4c): a child killed by a raw SIGKILL (no end-of-wakeup
+        write) is recovered by Phase 2 lease-expiry, which re-runs it without
+        bumping intensity — so a repeated-SIGKILL crash-loop is not yet bounded
+        here. Exception/normal failures DO terminate the task and ARE bounded
+        by this reaper.
         """
+        from ..runtime.future_mail import now_utc
+
+        now = now_utc()
         for agent in await self.repos.agents.find_reapable_ephemerals(limit=20):
-            if await self.repos.agents.archive(agent.id):
+            sup = (agent.metadata or {}).get("supervision", {})
+            latest = await self.repos.tasks.find_latest_task_for_agent(agent.id)
+            outcome = latest.status if latest is not None else "completed"
+            policy = sup.get("restart", "temporary")
+
+            if latest is not None and _should_restart(policy, outcome):
+                max_r = int(sup.get("max_restarts", 3))
+                max_s = int(sup.get("max_seconds", 60))
+                restarted = False
+                async with self.repos.transaction():
+                    within = await self.repos.supervision.bump_and_check_intensity(
+                        agent.id, max_r, max_s, now, reason=outcome
+                    )
+                    if within:
+                        await self.repos.tasks.create(
+                            TaskSpec(
+                                agent_id=agent.id,
+                                goal=latest.goal,
+                                acceptance=latest.acceptance,
+                                parent_task_id=latest.parent_task_id,
+                                metadata=latest.metadata,
+                            )
+                        )
+                        restarted = True
+                    else:
+                        await self.repos.supervision.mark_escalated(agent.id, now)
+                        await self.repos.agents.archive(agent.id)
+                        await self._insert_supervision_mail(
+                            agent, latest, kind="escalation", urgency="high"
+                        )
+                log.info(
+                    "scheduler_supervised_ephemeral",
+                    agent_id=agent.id,
+                    action="restarted" if restarted else "escalated",
+                    outcome=outcome,
+                )
+            else:
+                async with self.repos.transaction():
+                    if latest is not None and latest.status == "failed":
+                        await self._insert_supervision_mail(
+                            agent, latest, kind="failure", urgency="high"
+                        )
+                    await self.repos.agents.archive(agent.id)
                 log.info(
                     "scheduler_reaped_ephemeral_agent",
                     agent_id=agent.id,
                     persona=agent.persona_name,
+                    outcome=outcome,
                 )
+
+    async def _resolve_supervisor_for_agent(self, agent: Agent) -> str | None:
+        """The supervisor of an ephemeral ``agent``: its spawner
+        (``parent_agent_id``) if live and not archived, else ``owner``."""
+        parent = agent.parent_agent_id
+        if parent:
+            pa = await self.repos.agents.get(parent)
+            if pa is not None and pa.status != "archived":
+                return parent
+        owner = await self.repos.agents.get("owner")
+        if owner is not None and owner.status != "archived":
+            return "owner"
+        return None
+
+    async def _insert_supervision_mail(
+        self, agent: Agent, latest: Task | None, *, kind: str, urgency: Urgency
+    ) -> None:
+        """Direct mailbox insert (the scheduler isn't in a wakeup, so it can't
+        use the wakeup-keyed outbox — mirrors Phase -1/0.5). Idempotent via a
+        deterministic external_id. Joins the caller's transaction."""
+        recipient = await self._resolve_supervisor_for_agent(agent)
+        if recipient is None:
+            log.warning("supervision_mail_no_recipient", agent_id=agent.id, kind=kind)
+            return
+        sup = (agent.metadata or {}).get("supervision", {})
+        last_status = latest.status if latest is not None else "unknown"
+        if kind == "escalation":
+            external_id = f"supervision:{agent.id}:escalation"
+            tag = f"[escalation] ephemeral {agent.id} exceeded restart intensity"
+            detail = (
+                f"Agent {agent.id} (persona {agent.persona_name}) hit its restart "
+                f"limit (max_restarts={sup.get('max_restarts', 3)} within "
+                f"{sup.get('max_seconds', 60)}s); reclaimed without further restart. "
+                f"Last outcome: {last_status}. Decide: re-plan, re-spec, or drop "
+                f"this leg."
+            )
+        else:  # failure
+            external_id = (
+                f"supervision:{agent.id}:failed:"
+                f"{latest.id if latest is not None else 'na'}"
+            )
+            tag = f"[failed] ephemeral {agent.id} did not succeed"
+            detail = (
+                f"Agent {agent.id} (persona {agent.persona_name}) task "
+                f"{latest.id if latest is not None else '?'} ended {last_status!r}; "
+                f"its restart policy ({sup.get('restart', 'temporary')}) does not "
+                f"retry it. The agent has been reclaimed."
+            )
+        await self.repos.mailbox.ensure_mailbox(recipient)
+        await self.repos.mailbox.insert_message(
+            MailboxMessage(
+                recipient=recipient,
+                external_id=external_id,
+                sender="system:supervisor",
+                urgency=urgency,
+                body=f"{tag}\n\n{detail}",
+                metadata={
+                    "kind": f"supervision_{kind}",
+                    "agent_id": agent.id,
+                    "outcome": last_status,
+                    "parent_task_id": (
+                        latest.parent_task_id if latest is not None else None
+                    ),
+                },
+            )
+        )
 
     async def _resolve_terminated_task_supervisor(self, task: Task) -> str | None:
         """The agent that should receive a ``task_terminated`` mail for
@@ -640,6 +787,16 @@ class Scheduler:
             return
         if task.parent_task_id is None and task_status != "failed":
             return
+        # Ephemeral agents' lifecycle is owned by the reaper (Phase 0.8): it
+        # restarts, escalates, or surfaces their failure itself. A second
+        # notice here would double-signal and could prod the supervisor into
+        # re-handling a failure the reaper is already restarting.
+        if task.agent_id is not None:
+            agent = await self.repos.agents.get(task.agent_id)
+            if agent is not None and (agent.metadata or {}).get(
+                "supervision", {}
+            ).get("ephemeral"):
+                return
 
         recipient = await self._resolve_terminated_task_supervisor(task)
         if recipient is None:
