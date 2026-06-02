@@ -243,6 +243,18 @@ class SqliteAgentRepository:
         await _commit(self.conn)
         return bool(changed)
 
+    async def list_bootstrap_singleton_ids(self) -> set[str]:
+        """Ids of live bootstrap singletons (``parent_agent_id IS NULL`` — owner,
+        dispatcher, the seeded team). Phase 3 prioritises their tasks and keeps
+        a slot in reserve for them so a burst of spawned ephemeral children
+        can't starve the owner-facing dispatcher."""
+        async with self.conn.execute(
+            "SELECT id FROM agents WHERE parent_agent_id IS NULL "
+            "AND status != 'archived'"
+        ) as cur:
+            rows = await cur.fetchall()
+        return {r["id"] for r in rows}
+
     async def find_reapable_ephemerals(self, limit: int = 20) -> list[Agent]:
         """Ephemeral agents whose work is fully discharged — the reaper's
         reclaim candidates.

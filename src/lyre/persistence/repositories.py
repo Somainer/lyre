@@ -90,6 +90,11 @@ class AgentRepository(Protocol):
         implementation for the race/orphan handling."""
         ...
 
+    async def list_bootstrap_singleton_ids(self) -> set[str]:
+        """Ids of live bootstrap singletons (parent_agent_id IS NULL). Phase 3
+        prioritises their tasks and reserves a slot for them."""
+        ...
+
     async def update_metadata(
         self, agent_id: str, metadata: dict[str, Any]
     ) -> None: ...
