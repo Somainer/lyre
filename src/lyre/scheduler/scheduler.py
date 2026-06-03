@@ -504,6 +504,11 @@ class Scheduler:
                         "auto_dispatched": True,
                         "triggered_by_mail_id": top.id,
                         "triggered_by_urgency": top.urgency,
+                        # Carry the 主线 from the triggering mail onto the task,
+                        # so the woken wakeup knows its thread (T2 → T3/T4).
+                        "thread_id": (
+                            top.metadata.get("thread_id") if top.metadata else None
+                        ),
                     },
                 )
             )
@@ -1402,6 +1407,8 @@ class Scheduler:
                 wakeup_id=wakeup_id,
                 persona_name=persona.name,
                 agent_id=agent_id,
+                # The 主线 this wakeup is on; tools propagate it to sends/dispatches.
+                thread_id=(task.metadata.get("thread_id") if task.metadata else None),
                 extras=extras,
             )
             agent_loop = AgentLoop(

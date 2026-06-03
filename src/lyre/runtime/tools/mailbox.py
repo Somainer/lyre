@@ -162,6 +162,19 @@ async def _mailbox_send(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any
     if forward_msg_id is not None and not isinstance(forward_msg_id, int):
         raise ToolError("forward_msg_id must be an integer msg_id")
 
+    # Thread (主线) propagation: explicit arg > the thread of the message being
+    # replied to > the thread of THIS wakeup. Mechanical — the agent never has
+    # to remember it; whatever main-line woke it carries through to its sends.
+    thread_id = args.get("thread_id")
+    if thread_id is not None and not isinstance(thread_id, str):
+        raise ToolError("thread_id must be a string")
+    if thread_id is None and reply_to is not None:
+        parent = await ctx.repos.mailbox.get_message(reply_to)
+        if parent is not None and parent.metadata:
+            thread_id = parent.metadata.get("thread_id")
+    if thread_id is None:
+        thread_id = ctx.thread_id
+
     # Attachments: list of existing blob_ids the agent has seen (via
     # mail it received). Forwarding-only by construction — the model
     # can't fabricate a sha256 it hasn't been shown, so an existence
@@ -203,12 +216,17 @@ async def _mailbox_send(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any
     # scheduler's Phase -1 will deliver when due.
     # ------------------------------------------------------------------
     if _has_scheduling_args(args):
+        sched_meta = dict(args.get("metadata") or {})
+        if thread_id is not None and "thread_id" not in sched_meta:
+            # The recurring self-mail of a loop carries its thread so each
+            # re-woken iteration (and its token budget) stays on-thread.
+            sched_meta["thread_id"] = thread_id
         return await _schedule_future_mail(
             ctx, args, recipients, body, urgency,
             title=title,
             reply_to=reply_to,
             forward_msg_id=forward_msg_id,
-            user_meta=args.get("metadata") or {},
+            user_meta=sched_meta,
         )
 
     # When fanout > 1, mint a broadcast_id and stamp every copy.
@@ -221,7 +239,10 @@ async def _mailbox_send(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any
     if not isinstance(user_meta, dict):
         raise ToolError("metadata must be an object")
     metadata: dict[str, Any] | None = None
-    if forward_msg_id is not None or user_meta or fan_in_meta is not None:
+    if (
+        forward_msg_id is not None or user_meta
+        or fan_in_meta is not None or thread_id is not None
+    ):
         metadata = {**user_meta}
         if forward_msg_id is not None:
             metadata["forwarded_from_msg_id"] = forward_msg_id
@@ -229,6 +250,8 @@ async def _mailbox_send(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any
             # The envelope the barrier predicate keys on:
             # metadata.fan_in.{group_id, leg_key, result}.
             metadata["fan_in"] = fan_in_meta["envelope"]
+        if thread_id is not None and "thread_id" not in metadata:
+            metadata["thread_id"] = thread_id
 
     rows: list[OutboxRow] = []
     external_ids: list[str] = []
