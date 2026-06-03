@@ -31,6 +31,7 @@ class _AgentView:
     created_at: Any
     parent_agent_id: str | None
     archived_at: Any = None
+    archive_reason: str | None = None
 
     @classmethod
     def of(cls, agent: Agent, derived_status: str) -> _AgentView:
@@ -43,6 +44,7 @@ class _AgentView:
             created_at=agent.created_at,
             parent_agent_id=agent.parent_agent_id,
             archived_at=agent.archived_at,
+            archive_reason=agent.archive_reason,
         )
 
 

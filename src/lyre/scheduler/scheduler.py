@@ -540,19 +540,37 @@ class Scheduler:
         """
         if not await self.repos.fan_in.any_open():
             return
+        from datetime import timedelta
+
         from ..persistence.models import MailboxMessage as _Msg
         from ..runtime.future_mail import now_utc
 
         now = now_utc()
-        for g in await self.repos.fan_in.find_open(limit=20):
+        # Global TTL backstop (PR6): force-expire any open group older than
+        # LYRE_FANIN_MAX_AGE regardless of its own (coordinator-set, up to 24h)
+        # deadline. 0 disables — the per-group deadline is the always-on
+        # liveness; this is an operator ceiling. The cutoff is handed to
+        # find_open so age-expired groups are pulled into this tick even when
+        # >20 younger groups with earlier deadlines fill the deadline-sorted
+        # page; otherwise an old group with a far-future deadline sorts to the
+        # back and leaks past the ceiling under load.
+        max_age = self.config.fanin_max_age_s
+        ttl_cutoff = now - timedelta(seconds=max_age) if max_age > 0 else None
+        for g in await self.repos.fan_in.find_open(limit=20, ttl_cutoff=ttl_cutoff):
             delivered = await self.repos.mailbox.count_fan_in_results(
                 g.coordinator_agent_id, g.id
             )
             ready = delivered >= g.quorum
             timed_out = g.deadline is not None and now >= g.deadline
-            if not (ready or timed_out):
+            ttl_expired = (
+                max_age > 0
+                and g.created_at is not None
+                and (now - g.created_at).total_seconds() > max_age
+            )
+            if not (ready or timed_out or ttl_expired):
                 continue
             new_status = "quorum_met" if ready else "expired"
+            trigger = "quorum" if ready else ("ttl" if ttl_expired else "deadline")
             await self.repos.mailbox.ensure_mailbox(g.coordinator_agent_id)
             await self.repos.mailbox.insert_message(
                 _Msg(
@@ -564,15 +582,16 @@ class Scheduler:
                     body=(
                         f"Fan-in barrier {g.id} is ready to aggregate: "
                         f"{delivered}/{g.expect_replies} legs delivered "
-                        f"(quorum {g.quorum}, status {new_status}). Read your "
-                        f"result-mails (they carry metadata.fan_in.group_id="
-                        f"{g.id}) and synthesize."
+                        f"(quorum {g.quorum}, status {new_status}, "
+                        f"trigger {trigger}). Read your result-mails (they carry "
+                        f"metadata.fan_in.group_id={g.id}) and synthesize."
                     ),
                     task_id=g.parent_task_id,
                     metadata={
                         "fan_in_resolved": g.id,
                         "delivered": delivered,
                         "resolved_status": new_status,
+                        "trigger": trigger,
                     },
                 )
             )
@@ -584,6 +603,7 @@ class Scheduler:
                     "fan_in_resolved",
                     group_id=g.id,
                     status=new_status,
+                    trigger=trigger,
                     delivered=delivered,
                     quorum=g.quorum,
                     coordinator=g.coordinator_agent_id,
@@ -667,7 +687,9 @@ class Scheduler:
                         restarted = True
                     else:
                         await self.repos.supervision.mark_escalated(agent.id, now)
-                        await self.repos.agents.archive(agent.id)
+                        await self.repos.agents.archive(
+                            agent.id, reason="storm_halted"
+                        )
                         await self._insert_supervision_mail(
                             agent, latest, kind="escalation", urgency="high"
                         )
@@ -683,7 +705,7 @@ class Scheduler:
                         await self._insert_supervision_mail(
                             agent, latest, kind="failure", urgency="high"
                         )
-                    await self.repos.agents.archive(agent.id)
+                    await self.repos.agents.archive(agent.id, reason="reaped")
                 log.info(
                     "scheduler_reaped_ephemeral_agent",
                     agent_id=agent.id,
@@ -730,7 +752,7 @@ class Scheduler:
         async with self.repos.transaction():
             await self.repos.supervision.mark_escalated(task.agent_id, now)
             await self.repos.tasks.update_status(task.id, "failed")
-            await self.repos.agents.archive(task.agent_id)
+            await self.repos.agents.archive(task.agent_id, reason="storm_halted")
             await self._insert_supervision_mail(
                 agent, task, kind="escalation", urgency="high"
             )

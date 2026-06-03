@@ -1418,7 +1418,7 @@ def agent_archive_cmd(agent_id: str) -> None:
                 personas_dir=cfg.user_personas_dir,
                 persona_overrides=cfg.persona_overrides,
             )
-            ok = await repos.agents.archive(agent_id)
+            ok = await repos.agents.archive(agent_id, reason="manual")
             if not ok:
                 click.echo(f"no active agent {agent_id!r} to archive", err=True)
                 sys.exit(1)

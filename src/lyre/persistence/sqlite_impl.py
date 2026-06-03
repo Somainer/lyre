@@ -217,15 +217,19 @@ class SqliteAgentRepository:
             rows = await cur.fetchall()
         return [self._row_to_agent(r) for r in rows]
 
-    async def archive(self, agent_id: str) -> bool:
+    async def archive(self, agent_id: str, reason: str | None = None) -> bool:
+        """Soft-delete. ``reason`` (reaped / storm_halted / idle_reclaimed /
+        manual) is recorded for observability in the SAME write, so the
+        archival decision and its rationale are one atomic fact."""
         async with self.conn.execute(
             """
             UPDATE agents
             SET status = 'archived',
-                archived_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                archived_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                archive_reason = ?
             WHERE id = ? AND status != 'archived'
             """,
-            (agent_id,),
+            (reason, agent_id),
         ) as cur:
             changed = cur.rowcount
         await _commit(self.conn)
@@ -236,7 +240,8 @@ class SqliteAgentRepository:
             """
             UPDATE agents
             SET status = 'idle',
-                archived_at = NULL
+                archived_at = NULL,
+                archive_reason = NULL
             WHERE id = ? AND status = 'archived'
             """,
             (agent_id,),
@@ -398,6 +403,7 @@ class SqliteAgentRepository:
             parent_agent_id=row["parent_agent_id"],
             created_at=row["created_at"],
             archived_at=row["archived_at"],
+            archive_reason=row["archive_reason"],
             metadata=_parse_json(row["metadata"]),
         )
 
@@ -2112,12 +2118,44 @@ class SqliteFanInRepository:
         ) as cur:
             return (await cur.fetchone()) is not None
 
-    async def find_open(self, limit: int = 20) -> list[FanInGroup]:
-        async with self.conn.execute(
-            "SELECT * FROM fan_in_groups WHERE status = 'open' ORDER BY deadline LIMIT ?",
-            (limit,),
-        ) as cur:
-            rows = await cur.fetchall()
+    async def find_open(
+        self, limit: int = 20, ttl_cutoff: datetime | None = None
+    ) -> list[FanInGroup]:
+        """Open groups for Phase 0.5 to resolve this tick.
+
+        Without ``ttl_cutoff``: the ``limit`` soonest-deadline groups — enough
+        to catch quorum-ready and deadline-timed-out ones (both surface at the
+        front of the deadline order).
+
+        With ``ttl_cutoff`` (the global LYRE_FANIN_MAX_AGE horizon): ALSO pull
+        in every open group created before it, regardless of deadline. A group
+        older than the ceiling but with a far-future, coordinator-set deadline
+        sorts to the BACK of the deadline order; under load (>``limit`` open
+        groups) it would never reach the first page and would leak past the
+        global TTL. Unioning the age-expired set in closes that gap.
+        """
+        if ttl_cutoff is None:
+            async with self.conn.execute(
+                "SELECT * FROM fan_in_groups WHERE status = 'open' ORDER BY deadline LIMIT ?",
+                (limit,),
+            ) as cur:
+                rows = await cur.fetchall()
+        else:
+            async with self.conn.execute(
+                """
+                SELECT * FROM fan_in_groups
+                WHERE status = 'open' AND (
+                  id IN (
+                    SELECT id FROM fan_in_groups WHERE status = 'open'
+                    ORDER BY deadline LIMIT ?
+                  )
+                  OR created_at < ?
+                )
+                ORDER BY deadline
+                """,
+                (limit, _iso(ttl_cutoff)),
+            ) as cur:
+                rows = await cur.fetchall()
         return [self._row_to_group(r) for r in rows]
 
     async def set_status(
@@ -2159,6 +2197,7 @@ class SqliteFanInRepository:
             dry_round=row["dry_round"],
             deadline=row["deadline"],  # pydantic coerces the ISO string
             status=row["status"],
+            created_at=row["created_at"],  # needed by the global fan-in TTL
         )
 
 

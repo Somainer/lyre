@@ -324,6 +324,13 @@ class Config:
     # risk. 0 (default) DISABLES the hint entirely — fitting Lyre's "agents
     # persist across restarts" default; opt in per deployment.
     idle_reclaim_age_s: int = 0
+    # Global fan-in barrier TTL (seconds). A backstop ABOVE each group's own
+    # `deadline`: when > 0, Phase 0.5 force-expires any `open` fan_in_group
+    # older than this, regardless of the per-group deadline (which a coordinator
+    # can set up to 24h). 0 (default) DISABLES it — the per-group deadline is
+    # the always-on liveness; this is an opt-in global ceiling for operators who
+    # want "no barrier lives past N".
+    fanin_max_age_s: int = 0
 
     @classmethod
     def from_env(cls) -> Config:
@@ -498,6 +505,22 @@ class Config:
         if idle_reclaim_age_s < 0:
             idle_reclaim_age_s = 0
 
+        # ---- global fan-in TTL ----
+        # [scheduler] fanin_max_age_s = N; env `LYRE_FANIN_MAX_AGE` wins.
+        # 0 / absent / garbage / negative → disabled (per-group deadline rules).
+        fanin_env = os.environ.get("LYRE_FANIN_MAX_AGE")
+        fanin_toml = scheduler_raw.get("fanin_max_age_s")
+        fanin_chosen = fanin_env if fanin_env is not None else fanin_toml
+        if fanin_chosen is None:
+            fanin_max_age_s = 0
+        else:
+            try:
+                fanin_max_age_s = int(fanin_chosen)
+            except (ValueError, TypeError):
+                fanin_max_age_s = 0
+        if fanin_max_age_s < 0:
+            fanin_max_age_s = 0
+
         # ---- legacy [bootstrap] deprecation warning ----
         # The old [bootstrap] section let the owner pin dispatcher_id /
         # analyst_id / reviewer_id. Those moved to persona identity.md
@@ -547,6 +570,7 @@ class Config:
             auto_wake_on_mail=bool(auto_wake),
             max_concurrent_tasks=max_concurrent,
             idle_reclaim_age_s=idle_reclaim_age_s,
+            fanin_max_age_s=fanin_max_age_s,
         )
 
     @property

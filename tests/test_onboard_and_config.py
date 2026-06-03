@@ -78,6 +78,32 @@ def test_config_idle_reclaim_age_garbage_and_negative_clamp(
     assert Config.from_env().idle_reclaim_age_s == 0  # negative → clamped to 0
 
 
+def test_config_fanin_max_age_defaults_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LYRE_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("LYRE_FANIN_MAX_AGE", raising=False)
+    assert Config.from_env().fanin_max_age_s == 0
+
+
+def test_config_fanin_max_age_env_beats_toml_and_clamps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LYRE_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "config.toml").write_text(
+        "[scheduler]\nfanin_max_age_s = 7200\n", encoding="utf-8"
+    )
+    assert Config.from_env().fanin_max_age_s == 7200  # from toml
+    monkeypatch.setenv("LYRE_FANIN_MAX_AGE", "3600")
+    assert Config.from_env().fanin_max_age_s == 3600  # env wins
+    monkeypatch.setenv("LYRE_FANIN_MAX_AGE", "garbage")
+    assert Config.from_env().fanin_max_age_s == 0  # garbage → disabled
+    monkeypatch.setenv("LYRE_FANIN_MAX_AGE", "-5")
+    assert Config.from_env().fanin_max_age_s == 0  # negative → clamped
+
+
 def test_config_reads_owner_from_toml(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

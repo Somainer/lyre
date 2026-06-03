@@ -40,6 +40,13 @@ CREATE TABLE IF NOT EXISTS agents (
   parent_agent_id   TEXT,
   created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   archived_at       TEXT,
+  -- Why this agent was archived, for observability (list_agents / dashboard).
+  -- Free text (soft label, not a state-machine value): 'reaped' (ephemeral GC
+  -- by the Phase 0.8 reaper), 'storm_halted' (restart-intensity exceeded →
+  -- escalated + reclaimed), 'idle_reclaimed' (Dispatcher archived a stale
+  -- non-ephemeral child), 'manual' (archive_agent tool / CLI). NULL on live
+  -- agents and on rows archived before this column existed.
+  archive_reason    TEXT,
   metadata          TEXT     -- JSON: {model_id?, description?, ...}
 );
 
