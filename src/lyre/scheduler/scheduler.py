@@ -1360,6 +1360,9 @@ class Scheduler:
             initial_user_msg = await assemble_initial_user_message(
                 task,
                 tasks_repo=self.repos.tasks,
+                mailbox_repo=self.repos.mailbox,
+                agent_id=agent_id,
+                memory_root=self.config.memory_path,
             )
 
             extras: dict[str, Any] = {
