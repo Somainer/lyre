@@ -600,4 +600,23 @@ async def assemble_initial_user_message(
                 body += f"- → {m.recipient} [{ts}] {m.title or '(无标题)'}\n"
             body += "完整正文用 mailbox_read(box=\"sent\") / mailbox_get_message。\n"
 
+    # T3: if this wakeup is on a 主线, surface that thread's recent back-and-forth
+    # (both directions, this agent's view). A stateless model juggling several
+    # main-lines won't reliably pull the RIGHT thread's mail itself.
+    thread_id = (task.metadata or {}).get("thread_id")
+    if thread_id and mailbox_repo is not None:
+        thread_mail = await mailbox_repo.list_by_thread(
+            thread_id, participant=agent_id, limit=12
+        )
+        if thread_mail:
+            body += f"\n\n【本主线（thread {thread_id}）近期往来——你在跟进这条线】\n"
+            for m in thread_mail:
+                ts = m.delivered_at.strftime("%m-%d %H:%M") if m.delivered_at else "?"
+                if agent_id is not None and m.sender == agent_id:
+                    arrow, who = "→", m.recipient
+                else:
+                    arrow, who = "←", m.sender
+                body += f"- {arrow} {who} [{ts}] {m.title or '(无标题)'}\n"
+            body += "完整正文用 mailbox_get_message(msg_id)。\n"
+
     return LyreMessage(role="user", content=[LyreContentBlock(type="text", text=body)])

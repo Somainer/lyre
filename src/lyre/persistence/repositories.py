@@ -365,6 +365,19 @@ class MailboxRepository(Protocol):
         rely on this to remember what they said)."""
         ...
 
+    async def list_by_thread(
+        self,
+        thread_id: str,
+        *,
+        participant: str | None = None,
+        limit: int = 20,
+    ) -> list[MailboxMessage]:
+        """Mail on one 主线 (metadata.thread_id), newest-first. Optional
+        `participant` narrows to mail this agent sent or received. Powers
+        thread-scoped context injection (T3): a wakeup sees its main-line's
+        back-and-forth without the (stateless) agent hunting for it."""
+        ...
+
     # --- Internal listing helpers (system-side, not agent-facing) --------
     async def read_messages(
         self, recipient: str, since_id: int = 0, limit: int = 100

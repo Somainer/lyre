@@ -1186,6 +1186,31 @@ class SqliteMailboxRepository:
             rows = await cur.fetchall()
         return [self._row_to_msg(r) for r in rows]
 
+    async def list_by_thread(
+        self,
+        thread_id: str,
+        *,
+        participant: str | None = None,
+        limit: int = 20,
+    ) -> list[MailboxMessage]:
+        # Bounded and per-wakeup (not per-tick), so no dedicated index yet; if
+        # mail volume makes this scan hurt, add an expression index on
+        # json_extract(metadata,'$.thread_id') mirroring mailbox_messages_fan_in.
+        clauses = ["json_extract(metadata, '$.thread_id') = ?"]
+        params: list[Any] = [thread_id]
+        if participant is not None:
+            clauses.append("(sender = ? OR recipient = ?)")
+            params.extend([participant, participant])
+        params.append(limit)
+        sql = (
+            f"SELECT * FROM mailbox_messages "
+            f"WHERE {' AND '.join(clauses)} "
+            f"ORDER BY id DESC LIMIT ?"
+        )
+        async with self.conn.execute(sql, tuple(params)) as cur:
+            rows = await cur.fetchall()
+        return [self._row_to_msg(r) for r in rows]
+
     async def count_unread(
         self, recipient: str, *, min_urgency: str | None = None
     ) -> int:
