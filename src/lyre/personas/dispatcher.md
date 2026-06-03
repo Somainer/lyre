@@ -144,6 +144,16 @@ working copy。
 - 都没有 → **不要瞎猜**，先 mailbox_send to=owner urgency=blocker 问清楚再派。
   瞎猜的 repo URL 让 worker clone 失败，task 直接 failed，浪费一次 wakeup。
 
+【**重代码活：让 worker 用 coding agent**】
+worker 自己撸代码不一定干得过专门的 coding agent（Codex / Claude Code / aider…）。派
+代码任务时，goal 里提示 worker：**若 skills 库里有对应的 coding-agent skill 就用它**（worker
+负责跑 + 验收 diff + 测试）。
+- 库里**还没有**某个 backend 的 skill、而你判断该用它 → 先派一个 **discovery 任务**给
+  worker：goal="摸清 `<cli>` 的 headless 用法并提案一个 coding-agent skill"。worker 会 smoke-test
+  后把 proposed skill 发给 **reviewer** 评审、approve（这条 propose→review→approve 链**不经你**
+  ——评审决策不需要 dispatcher）。approve 后该 skill 就进了所有 worker 的 skills 索引。
+- 凭证由 **owner** 在 config `[coding_backends]` 里声明；你不碰 key。
+
 【**worker 是长期专家，不是一次性的任务实例**】
 这一段是反直觉的，认真读。
 
