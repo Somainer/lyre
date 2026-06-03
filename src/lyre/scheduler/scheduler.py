@@ -455,11 +455,14 @@ class Scheduler:
           - low              → pure archive: never auto-triggers
         """
         agents = await self.repos.agents.list_all()
+        # One bulk query for "which agents already own an active task" instead
+        # of a per-agent find_active_for_persona inside the loop (N+1). Reflects
+        # task ownership at scan start, matching the prior per-agent semantics.
+        busy_agent_ids = await self.repos.tasks.active_owner_agent_ids()
         for agent in agents:
             if agent.id == "owner":
                 continue  # owner has no LLM, never wakeable
-            if agent.status == "archived":
-                continue
+            # (list_all() already excludes archived agents — no guard needed.)
 
             # Anti-loop cursor: pick the highest-id unread that's strictly
             # above what we already dispatched for. Avoids re-firing for a
@@ -481,11 +484,10 @@ class Scheduler:
             # urgency one (read_unread already sorted urgency-desc).
             top = unread_new[0]
 
-            # Skip if this agent already has an in-flight task.
-            active = await self.repos.tasks.find_active_for_persona(
-                agent.persona_name
-            )
-            if any(t.agent_id == agent.id for t in active):
+            # Skip if this agent already has an in-flight task (predicate
+            # unchanged: own an active task by exact agent_id; NULL-owner rows
+            # never matched and are excluded from the set).
+            if agent.id in busy_agent_ids:
                 continue
 
             # Volatile hint kept at the TAIL of the goal so the cached
@@ -1293,58 +1295,69 @@ class Scheduler:
             return
 
         transcript = TranscriptWriter(self.config.object_store_path, wakeup_id)
-        # Every wakeup gets a worktree (empty tmpdir). Whether it's
-        # a git working copy depends on TaskSpec.git_context — see
-        # the git_context provisioning below. The worktree itself is
-        # cheap (one mkdir) and uniformly available simplifies
-        # downstream tool / prompt logic (no "do I have a sandbox"
-        # branching anywhere).
-        worktree_handle: WorktreeHandle = (
-            await self.worktree_manager.prepare(task_id)
-        )
+        # The transcript fd is open from here. The setup below (worktree mkdir,
+        # git provisioning, mailbox baseline) can raise BEFORE the main
+        # try/finally takes ownership of cleanup — guard it so a setup failure
+        # releases the fd instead of leaking it. The lease + wakeup row stay
+        # dangling on purpose: the next tick recovers them via
+        # find_expired_leases (kill-test semantics).
+        try:
+            # Every wakeup gets a worktree (empty tmpdir). Whether it's
+            # a git working copy depends on TaskSpec.git_context — see
+            # the git_context provisioning below. The worktree itself is
+            # cheap (one mkdir) and uniformly available simplifies
+            # downstream tool / prompt logic (no "do I have a sandbox"
+            # branching anywhere).
+            worktree_handle: WorktreeHandle = (
+                await self.worktree_manager.prepare(task_id)
+            )
 
-        # Optional git_context overlay: if the task was dispatched
-        # with a repo + branch spec, provision an ephemeral SSH key
-        # + ssh-agent and clone+checkout into the worktree before
-        # the worker arrives. Non-git tasks (skill migration,
-        # research, data shaping) skip this entirely.
-        git_handle: GitContextHandle | None = None
-        if task_for_setup := await self.repos.tasks.get(task_id):
-            if task_for_setup.git_context is not None:
-                try:
-                    git_handle = await self.git_context_provisioner.prepare(
-                        task_id=task_id,
-                        worktree_dir=worktree_handle.dir,
-                        git_context=task_for_setup.git_context,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    # Provisioning failed (bad repo URL, network, etc.).
-                    # Release lease, mark task failed, surface error.
-                    log.warning(
-                        "git_context_provision_failed",
-                        task_id=task_id,
-                        error=str(exc),
-                    )
-                    await self.repos.tasks.release_lease(task_id, wakeup_id)
-                    await self.repos.tasks.update_status(task_id, "failed")
-                    transcript.close()
-                    await self.worktree_manager.cleanup(
-                        worktree_handle, remove_dir=False,
-                    )
-                    return
+            # Optional git_context overlay: if the task was dispatched
+            # with a repo + branch spec, provision an ephemeral SSH key
+            # + ssh-agent and clone+checkout into the worktree before
+            # the worker arrives. Non-git tasks (skill migration,
+            # research, data shaping) skip this entirely.
+            git_handle: GitContextHandle | None = None
+            if task_for_setup := await self.repos.tasks.get(task_id):
+                if task_for_setup.git_context is not None:
+                    try:
+                        git_handle = await self.git_context_provisioner.prepare(
+                            task_id=task_id,
+                            worktree_dir=worktree_handle.dir,
+                            git_context=task_for_setup.git_context,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        # Provisioning failed (bad repo URL, network, etc.).
+                        # Release lease, mark task failed, surface error.
+                        log.warning(
+                            "git_context_provision_failed",
+                            task_id=task_id,
+                            error=str(exc),
+                        )
+                        await self.repos.tasks.release_lease(task_id, wakeup_id)
+                        await self.repos.tasks.update_status(task_id, "failed")
+                        transcript.close()
+                        await self.worktree_manager.cleanup(
+                            worktree_handle, remove_dir=False,
+                        )
+                        return
 
-        # Start blocker watcher. Baseline = whatever's already been processed
-        # by this persona at wakeup-start time, so the agent sees ALL blockers
-        # that haven't been handled yet (not just ones that arrive during this
-        # wakeup).
-        # Mailbox is keyed by agent_id (not persona name) post-A3. For
-        # workers like "worker-maintainer-1", agent_id != persona name.
-        await self.repos.mailbox.ensure_mailbox(agent_id)
-        # Baseline = highest existing mail id at wakeup start. MailWatcher
-        # only signals for mail that arrives AFTER that — so the agent
-        # gets the pre-existing inbox via the normal Phase 0 task goal,
-        # and mid-wakeup interrupts are reserved for genuinely new mail.
-        baseline = await self.repos.mailbox.get_max_msg_id(agent_id)
+            # Start blocker watcher. Baseline = whatever's already been processed
+            # by this persona at wakeup-start time, so the agent sees ALL blockers
+            # that haven't been handled yet (not just ones that arrive during this
+            # wakeup).
+            # Mailbox is keyed by agent_id (not persona name) post-A3. For
+            # workers like "worker-maintainer-1", agent_id != persona name.
+            await self.repos.mailbox.ensure_mailbox(agent_id)
+            # Baseline = highest existing mail id at wakeup start. MailWatcher
+            # only signals for mail that arrives AFTER that — so the agent
+            # gets the pre-existing inbox via the normal Phase 0 task goal,
+            # and mid-wakeup interrupts are reserved for genuinely new mail.
+            baseline = await self.repos.mailbox.get_max_msg_id(agent_id)
+        except Exception:
+            transcript.close()
+            raise
+
         blocker_watcher = MailWatcher(
             repos=self.repos,
             recipient=agent_id,
@@ -1352,7 +1365,14 @@ class Scheduler:
             min_urgency="high",  # high also surfaces, but only at turn boundaries
             poll_interval_s=self.poll_interval_s,
         )
-        await blocker_watcher.start()
+        try:
+            await blocker_watcher.start()
+        except Exception:
+            # Watcher started a background poll task before failing (or failed
+            # to): stop it and release the transcript fd so neither leaks.
+            await blocker_watcher.stop()
+            transcript.close()
+            raise
 
         succeeded = False
         try:
@@ -1466,22 +1486,42 @@ class Scheduler:
             chosen_entry = (
                 self.registry.by_id(result.model_id) if result.model_id else None
             )
-            await self.repos.wakeups.end(
-                wakeup_id,
-                end_status=result.status,  # may be "silent_close" — wakeup-only signal
-                metering={
-                    "token_input": result.usage.get("input_tokens"),
-                    "token_output": result.usage.get("output_tokens"),
-                    "wall_clock_ms": result.wall_clock_ms,
-                    "tool_call_count": len(result.tool_calls),
-                    "provider": chosen_entry.provider if chosen_entry else None,
-                    "model": result.model_id,
-                    "context_peak_tokens": result.context_peak_tokens,
-                    "compaction_count": result.compaction_count,
-                },
-            )
             task_status = _wakeup_status_to_task_status(result.status)
-            await self.repos.tasks.update_status(task_id, task_status)
+            # Step 9 COMMIT POINT: the wakeup-end metering, the task-status
+            # advance, and the supervisor task_terminated outbox row must land
+            # as ONE commit. A SIGKILL between update_status (terminal) and the
+            # outbox enqueue would otherwise leave a terminal task with no
+            # task_terminated mail — and find_expired_leases (in_progress-only)
+            # never re-runs it, reopening the "sudden failed 没人知道" gap.
+            async with self.repos.transaction():
+                await self.repos.wakeups.end(
+                    wakeup_id,
+                    end_status=result.status,  # may be "silent_close" — wakeup-only signal
+                    metering={
+                        "token_input": result.usage.get("input_tokens"),
+                        "token_output": result.usage.get("output_tokens"),
+                        "wall_clock_ms": result.wall_clock_ms,
+                        "tool_call_count": len(result.tool_calls),
+                        "provider": chosen_entry.provider if chosen_entry else None,
+                        "model": result.model_id,
+                        "context_peak_tokens": result.context_peak_tokens,
+                        "compaction_count": result.compaction_count,
+                    },
+                )
+                await self.repos.tasks.update_status(task_id, task_status)
+                # Notify the supervisor that this task terminated (OTP monitor).
+                # needs_continuation→failed carries the wakeup status as a coarse
+                # reason until the structured end-contract lands.
+                await self._emit_task_terminated_mail(
+                    task,
+                    wakeup_id,
+                    task_status,
+                    summary=(result.text or "").strip()[:500] or None,
+                    failure_reason=(
+                        result.status if task_status == "failed" else None
+                    ),
+                    transcript_uri=transcript.uri,
+                )
             succeeded = task_status == "completed"
             log.info(
                 "task_done",
@@ -1493,17 +1533,6 @@ class Scheduler:
                 model_id=result.model_id,
                 fallbacks=len(result.fallback_events),
                 interrupts=len(result.interrupt_events),
-            )
-            # Notify the supervisor that this task terminated (OTP monitor).
-            # needs_continuation→failed carries the wakeup status as a coarse
-            # reason until the structured end-contract lands.
-            await self._emit_task_terminated_mail(
-                task,
-                wakeup_id,
-                task_status,
-                summary=(result.text or "").strip()[:500] or None,
-                failure_reason=(result.status if task_status == "failed" else None),
-                transcript_uri=transcript.uri,
             )
 
             # Best-effort post-wakeup summary. Replaces the old summary-agent
@@ -1525,24 +1554,28 @@ class Scheduler:
                 )
         except Exception as e:  # noqa: BLE001
             log.exception("task_failed", task_id=task_id, error=str(e))
-            await self.repos.wakeups.end(
-                wakeup_id,
-                end_status="failed",
-                failure_report={"error": str(e), "type": type(e).__name__},
-            )
-            await self.repos.tasks.update_status(task_id, "failed")
-            # The original "sudden failed 没人知道" path: a mid-wakeup crash
-            # never produced an end-of-wakeup declaration, so the supervisor
-            # must still be told. ``task`` may be stale (pre-wakeup) but its
-            # parent/metadata — all this needs — don't change mid-wakeup.
-            await self._emit_task_terminated_mail(
-                task,
-                wakeup_id,
-                "failed",
-                summary=f"{type(e).__name__}: {e}"[:500],
-                failure_reason=type(e).__name__,
-                transcript_uri=getattr(transcript, "uri", None),
-            )
+            # Same Step 9 COMMIT POINT as the success path: the failed wakeup-end,
+            # the task->failed advance, and the supervisor notice are one commit
+            # so a crash can't strand a failed task with no task_terminated mail.
+            async with self.repos.transaction():
+                await self.repos.wakeups.end(
+                    wakeup_id,
+                    end_status="failed",
+                    failure_report={"error": str(e), "type": type(e).__name__},
+                )
+                await self.repos.tasks.update_status(task_id, "failed")
+                # The original "sudden failed 没人知道" path: a mid-wakeup crash
+                # never produced an end-of-wakeup declaration, so the supervisor
+                # must still be told. ``task`` may be stale (pre-wakeup) but its
+                # parent/metadata — all this needs — don't change mid-wakeup.
+                await self._emit_task_terminated_mail(
+                    task,
+                    wakeup_id,
+                    "failed",
+                    summary=f"{type(e).__name__}: {e}"[:500],
+                    failure_reason=type(e).__name__,
+                    transcript_uri=getattr(transcript, "uri", None),
+                )
         finally:
             # Simulated process death (Q5 chaos test): if a SimulatedKill is
             # propagating, real process would already be dead and no `finally`

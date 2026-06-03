@@ -36,7 +36,11 @@ async def _python_exec(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]
     if not code or not isinstance(code, str):
         raise ToolError("provide 'code' (a Python source string)")
 
-    timeout_s = float(args.get("timeout_s", _DEFAULT_TIMEOUT_S))
+    raw_timeout = args.get("timeout_s", _DEFAULT_TIMEOUT_S)
+    try:
+        timeout_s = float(raw_timeout)
+    except (TypeError, ValueError):
+        raise ToolError(f"timeout_s must be a number (got {raw_timeout!r})") from None
     user_env = args.get("env")
     if user_env is not None and not isinstance(user_env, dict):
         raise ToolError("env must be an object of string→string")

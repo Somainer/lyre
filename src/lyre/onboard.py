@@ -317,12 +317,24 @@ def append_env_line(env_path: Path, var_name: str, value: str) -> None:
     if not replaced:
         rewritten.append(new_line)
 
-    env_path.write_text("\n".join(rewritten) + "\n", encoding="utf-8")
+    # Swap through a sibling temp file (same dir -> same filesystem, so
+    # os.replace is atomic) instead of truncate-then-write in place: a crash
+    # mid-write must never leave an empty/partial .env that loses every stored
+    # secret. chmod the temp before the rename so secrets are never briefly
+    # visible at default perms. Mirrors blob_store.py's durable-write pattern.
+    new_content = "\n".join(rewritten) + "\n"
+    tmp_path = env_path.with_name(env_path.name + ".tmp")
+    tmp_path.write_text(new_content, encoding="utf-8")
     try:
-        env_path.chmod(0o600)
+        tmp_path.chmod(0o600)
     except OSError:
         # Best-effort on non-Unix or read-only mounts.
         pass
+    try:
+        os.replace(tmp_path, env_path)  # atomic swap; never leaves a partial .env
+    except OSError:
+        tmp_path.unlink(missing_ok=True)
+        raise
 
 
 # ---------------------------------------------------------------------------

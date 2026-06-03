@@ -13,7 +13,9 @@ extra state, no broadcaster needed for this view.
 
 from __future__ import annotations
 
+import asyncio
 import json
+from collections import deque
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -329,10 +331,12 @@ def _tail_transcript_events(
     if not path.exists():
         return []
     try:
-        text = path.read_text(encoding="utf-8")
+        with path.open(encoding="utf-8") as f:
+            # deque(maxlen) keeps only the last max_lines while streaming the
+            # file, bounding peak memory regardless of transcript length.
+            raw_lines = list(deque(f, maxlen=max_lines))
     except OSError:
         return []
-    raw_lines = text.splitlines()[-max_lines:]
 
     events: list[ActivityEvent] = []
     # Two parallel rolling accumulators: plain text deltas (the
@@ -577,7 +581,11 @@ async def build_activity(
                 else (w.started_at or "")
             )
             events.extend(
-                _tail_transcript_events(
+                # Offload the blocking whole-file read + JSON parse to a
+                # worker thread — build_activity runs on the shared serve
+                # event loop alongside the scheduler/dispatcher.
+                await asyncio.to_thread(
+                    _tail_transcript_events,
                     transcript_uri=w.transcript_uri,
                     wakeup_id=w.id,
                     persona=w.persona_name,
@@ -605,7 +613,8 @@ async def build_activity(
                 else (w.started_at or "")
             )
             events.extend(
-                _tail_transcript_events(
+                await asyncio.to_thread(
+                    _tail_transcript_events,
                     transcript_uri=w.transcript_uri,
                     wakeup_id=w.id,
                     persona=w.persona_name,

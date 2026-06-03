@@ -96,6 +96,12 @@ CREATE TABLE IF NOT EXISTS tasks (
 CREATE INDEX IF NOT EXISTS tasks_status_lease ON tasks(status, lease_until);
 CREATE INDEX IF NOT EXISTS tasks_parent ON tasks(parent_task_id);
 CREATE INDEX IF NOT EXISTS tasks_agent_status ON tasks(agent_id, status);
+-- Phase 0 (_auto_wake_on_mail) calls find_active_for_persona per-agent each
+-- tick: WHERE persona_name=? AND status IN ('pending','in_progress',
+-- 'needs_input'). Index-seek on persona_name + status keeps it O(active)
+-- instead of scanning all status-matched rows across personas as the
+-- (retained) completed-task population grows.
+CREATE INDEX IF NOT EXISTS tasks_persona_status ON tasks(persona_name, status);
 -- Phase 0.7 (_resume_parked_tasks) scans only parked tasks each tick;
 -- the partial index keeps that O(parked) instead of O(all tasks).
 CREATE INDEX IF NOT EXISTS tasks_resumable

@@ -16,6 +16,7 @@ from anthropic.types import (
     ContentBlockStartEvent,
     ContentBlockStopEvent,
     MessageDeltaEvent,
+    MessageStartEvent,
     MessageStopEvent,
 )
 
@@ -116,11 +117,20 @@ class AnthropicAdapter:
         # whole thing echoed back on the next turn).
         tool_use_buffers: dict[int, dict[str, Any]] = {}
         thinking_buffers: dict[int, dict[str, str]] = {}
+        # The prompt (input) token count lives on the message_start event's
+        # message.usage.input_tokens (a required int); the per-message_delta
+        # usage's input_tokens is Optional[int]=None on the wire. Stash the
+        # start value here so the MessageDeltaEvent branch can emit a real
+        # input count — without it every turn reports input_tokens=0, which
+        # silently disables auto-compaction and pins context_peak_tokens at 0.
+        # Default 0 preserves today's behavior for compat endpoints that omit
+        # a usable message_start usage.
+        usage_holder: dict[str, int] = {"input_tokens": 0}
 
         async with self.client.messages.stream(**kwargs) as stream:
             async for event in stream:
                 lyre_event = self._anthropic_to_lyre(
-                    event, tool_use_buffers, thinking_buffers
+                    event, tool_use_buffers, thinking_buffers, usage_holder
                 )
                 if lyre_event is not None:
                     yield lyre_event
@@ -222,9 +232,12 @@ class AnthropicAdapter:
         evt: Any,
         tool_use_buffers: dict[int, dict[str, Any]],
         thinking_buffers: dict[int, dict[str, str]] | None = None,
+        usage_holder: dict[str, int] | None = None,
     ) -> StreamEvent | None:
         if thinking_buffers is None:
             thinking_buffers = {}
+        if usage_holder is None:
+            usage_holder = {"input_tokens": 0}
         # ContentBlockStartEvent: text / tool_use / thinking begins
         if isinstance(evt, ContentBlockStartEvent):
             blk = evt.content_block
@@ -299,6 +312,18 @@ class AnthropicAdapter:
                 )
             return None
 
+        # MessageStartEvent: carries the prompt (input) token count on
+        # message.usage.input_tokens (a required int). The per-message_delta
+        # usage's input_tokens is Optional[int]=None, so this is the only place
+        # the real context size is available — stash it; emit nothing.
+        if isinstance(evt, MessageStartEvent):
+            msg = getattr(evt, "message", None)
+            mu = getattr(msg, "usage", None) if msg is not None else None
+            start_input = getattr(mu, "input_tokens", None) if mu is not None else None
+            if start_input:
+                usage_holder["input_tokens"] = start_input
+            return None
+
         # MessageDeltaEvent: contains stop_reason in .delta + usage tally in .usage
         if isinstance(evt, MessageDeltaEvent):
             # Anthropic emits stop_reason here, not in MessageStopEvent.
@@ -307,9 +332,13 @@ class AnthropicAdapter:
             usage = getattr(evt, "usage", None)
             # Prefer emitting Usage first; TurnComplete is emitted by MessageStopEvent.
             if usage is not None:
-                # Note: Anthropic streams usage progressively; this captures the latest snapshot.
+                # input_tokens comes from the stashed message_start count (the
+                # delta usage's input_tokens is None on the wire); fall back to
+                # any delta-supplied value for compat endpoints that populate it
+                # there but skip message_start — strictly no regression.
                 return Usage(
-                    input_tokens=getattr(usage, "input_tokens", 0) or 0,
+                    input_tokens=usage_holder.get("input_tokens", 0)
+                    or (getattr(usage, "input_tokens", 0) or 0),
                     output_tokens=getattr(usage, "output_tokens", 0) or 0,
                 )
             if stop_reason:

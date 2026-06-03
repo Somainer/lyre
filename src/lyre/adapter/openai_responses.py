@@ -136,125 +136,130 @@ class OpenAIResponsesAdapter:
         last_finish: StopReason | None = None
         usage_payload: tuple[int, int] | None = None
 
-        stream = await self.client.responses.create(**kwargs)
-        async for evt in stream:
-            etype = getattr(evt, "type", None)
-            if etype is None:
-                continue
-
-            # ----- text streaming ---------------------------------------
-            if etype == "response.output_text.delta":
-                delta = getattr(evt, "delta", None) or ""
-                if delta:
-                    yield ContentDelta(text=delta)
-                continue
-
-            # Some SDK versions name this slightly differently; tolerate.
-            if etype == "response.text.delta":
-                delta = getattr(evt, "delta", None) or ""
-                if delta:
-                    yield ContentDelta(text=delta)
-                continue
-
-            # ----- reasoning / thinking content -------------------------
-            if etype in (
-                "response.reasoning_text.delta",
-                "response.reasoning.delta",
-            ):
-                delta = getattr(evt, "delta", None) or ""
-                if delta:
-                    reasoning_chunks.append(delta)
-                    yield ThinkingDelta(text=delta)
-                continue
-
-            # ----- tool-call streaming ----------------------------------
-            if etype == "response.output_item.added":
-                item = getattr(evt, "item", None)
-                if item is None:
+        # Enter the SDK stream's own async context manager so a
+        # break/GeneratorExit out of the iteration (e.g. the agent loop
+        # bailing on a blocker interrupt) deterministically closes the
+        # underlying HTTP response rather than leaking it until GC.
+        # Matches anthropic.py's `async with self.client.messages.stream`.
+        async with await self.client.responses.create(**kwargs) as stream:
+            async for evt in stream:
+                etype = getattr(evt, "type", None)
+                if etype is None:
                     continue
-                item_type = getattr(item, "type", None)
-                if item_type == "function_call":
-                    item_id = getattr(item, "id", None) or ""
-                    call_id = getattr(item, "call_id", None) or item_id
-                    name = getattr(item, "name", None) or ""
-                    tool_buffers[item_id] = {
-                        "call_id": call_id,
-                        "name": name,
-                        "args_chunks": [],
-                    }
-                    yield ToolUseStart(id=call_id, name=name)
-                    emitted_tool_starts.add(call_id)
-                continue
 
-            if etype == "response.function_call_arguments.delta":
-                item_id = getattr(evt, "item_id", None) or ""
-                delta = getattr(evt, "delta", None) or ""
-                buf = tool_buffers.get(item_id)
-                if buf is not None and delta:
-                    buf["args_chunks"].append(delta)
-                    yield ToolUseDelta(
-                        id=buf["call_id"], input_partial=delta,
+                # ----- text streaming ---------------------------------------
+                if etype == "response.output_text.delta":
+                    delta = getattr(evt, "delta", None) or ""
+                    if delta:
+                        yield ContentDelta(text=delta)
+                    continue
+
+                # Some SDK versions name this slightly differently; tolerate.
+                if etype == "response.text.delta":
+                    delta = getattr(evt, "delta", None) or ""
+                    if delta:
+                        yield ContentDelta(text=delta)
+                    continue
+
+                # ----- reasoning / thinking content -------------------------
+                if etype in (
+                    "response.reasoning_text.delta",
+                    "response.reasoning.delta",
+                ):
+                    delta = getattr(evt, "delta", None) or ""
+                    if delta:
+                        reasoning_chunks.append(delta)
+                        yield ThinkingDelta(text=delta)
+                    continue
+
+                # ----- tool-call streaming ----------------------------------
+                if etype == "response.output_item.added":
+                    item = getattr(evt, "item", None)
+                    if item is None:
+                        continue
+                    item_type = getattr(item, "type", None)
+                    if item_type == "function_call":
+                        item_id = getattr(item, "id", None) or ""
+                        call_id = getattr(item, "call_id", None) or item_id
+                        name = getattr(item, "name", None) or ""
+                        tool_buffers[item_id] = {
+                            "call_id": call_id,
+                            "name": name,
+                            "args_chunks": [],
+                        }
+                        yield ToolUseStart(id=call_id, name=name)
+                        emitted_tool_starts.add(call_id)
+                    continue
+
+                if etype == "response.function_call_arguments.delta":
+                    item_id = getattr(evt, "item_id", None) or ""
+                    delta = getattr(evt, "delta", None) or ""
+                    buf = tool_buffers.get(item_id)
+                    if buf is not None and delta:
+                        buf["args_chunks"].append(delta)
+                        yield ToolUseDelta(
+                            id=buf["call_id"], input_partial=delta,
+                        )
+                    continue
+
+                if etype == "response.function_call_arguments.done":
+                    item_id = getattr(evt, "item_id", None) or ""
+                    buf = tool_buffers.pop(item_id, None)
+                    if buf is None:
+                        continue
+                    raw = (
+                        getattr(evt, "arguments", None)
+                        or "".join(buf["args_chunks"])
                     )
-                continue
-
-            if etype == "response.function_call_arguments.done":
-                item_id = getattr(evt, "item_id", None) or ""
-                buf = tool_buffers.pop(item_id, None)
-                if buf is None:
+                    try:
+                        parsed = _json.loads(raw) if raw else {}
+                    except _json.JSONDecodeError:
+                        parsed = {"_raw": raw}
+                    if not isinstance(parsed, dict):
+                        parsed = {"_raw": raw}
+                    yield ToolUseComplete(
+                        id=buf["call_id"],
+                        name=buf["name"],
+                        input=parsed,
+                    )
+                    last_finish = "tool_use"
                     continue
-                raw = (
-                    getattr(evt, "arguments", None)
-                    or "".join(buf["args_chunks"])
-                )
-                try:
-                    parsed = _json.loads(raw) if raw else {}
-                except _json.JSONDecodeError:
-                    parsed = {"_raw": raw}
-                if not isinstance(parsed, dict):
-                    parsed = {"_raw": raw}
-                yield ToolUseComplete(
-                    id=buf["call_id"],
-                    name=buf["name"],
-                    input=parsed,
-                )
-                last_finish = "tool_use"
-                continue
 
-            # ----- terminal events --------------------------------------
-            if etype == "response.completed":
-                response = getattr(evt, "response", None)
-                usage = getattr(response, "usage", None) if response else None
-                if usage is not None:
-                    # Responses API uses `input_tokens` / `output_tokens`.
-                    in_t = getattr(usage, "input_tokens", 0) or 0
-                    out_t = getattr(usage, "output_tokens", 0) or 0
-                    usage_payload = (int(in_t), int(out_t))
-                # If we didn't see a tool_use along the way, this was a
-                # plain end-of-turn text response.
-                if last_finish is None:
-                    last_finish = "end_turn"
-                continue
+                # ----- terminal events --------------------------------------
+                if etype == "response.completed":
+                    response = getattr(evt, "response", None)
+                    usage = getattr(response, "usage", None) if response else None
+                    if usage is not None:
+                        # Responses API uses `input_tokens` / `output_tokens`.
+                        in_t = getattr(usage, "input_tokens", 0) or 0
+                        out_t = getattr(usage, "output_tokens", 0) or 0
+                        usage_payload = (int(in_t), int(out_t))
+                    # If we didn't see a tool_use along the way, this was a
+                    # plain end-of-turn text response.
+                    if last_finish is None:
+                        last_finish = "end_turn"
+                    continue
 
-            if etype == "response.incomplete":
-                response = getattr(evt, "response", None)
-                # Reason can be `max_output_tokens` or `content_filter`.
-                reason = None
-                if response is not None:
-                    incomplete = getattr(response, "incomplete_details", None)
-                    if incomplete is not None:
-                        reason = getattr(incomplete, "reason", None)
-                last_finish = (
-                    "max_tokens" if reason == "max_output_tokens" else "error"
-                )
-                continue
+                if etype == "response.incomplete":
+                    response = getattr(evt, "response", None)
+                    # Reason can be `max_output_tokens` or `content_filter`.
+                    reason = None
+                    if response is not None:
+                        incomplete = getattr(response, "incomplete_details", None)
+                        if incomplete is not None:
+                            reason = getattr(incomplete, "reason", None)
+                    last_finish = (
+                        "max_tokens" if reason == "max_output_tokens" else "error"
+                    )
+                    continue
 
-            if etype == "response.failed":
-                last_finish = "error"
-                continue
+                if etype == "response.failed":
+                    last_finish = "error"
+                    continue
 
-            # Everything else (e.g. response.created, response.in_progress,
-            # response.output_item.done for messages, audio events, etc.)
-            # — no Lyre event to emit. Drop silently.
+                # Everything else (e.g. response.created, response.in_progress,
+                # response.output_item.done for messages, audio events, etc.)
+                # — no Lyre event to emit. Drop silently.
 
         # Flush reasoning as a single ThinkingBlockComplete (the
         # transcript / dashboard care about the full block, not the

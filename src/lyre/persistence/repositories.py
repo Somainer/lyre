@@ -214,6 +214,13 @@ class TaskRepository(Protocol):
         persona is already busy."""
         ...
 
+    async def active_owner_agent_ids(self) -> set[str]:
+        """agent_ids that currently own a non-terminal (pending/in_progress/
+        needs_input) task. NULL agent_id rows are excluded. Used by Phase-0
+        auto-wake to skip agents already busy without an N+1 per-agent
+        query."""
+        ...
+
 
 class WakeupRepository(Protocol):
     async def start(

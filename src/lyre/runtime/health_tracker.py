@@ -91,11 +91,16 @@ class HealthTracker:
 
     def snapshot(self) -> dict[str, dict[str, Any]]:
         """For logging / debugging."""
+        now = self._now()
+        cutoff = now - self.window_s
         out: dict[str, dict[str, Any]] = {}
         for mid, st in self._state.items():
             out[mid] = {
                 "state": self.state(mid),
-                "recent_failures": len(st.failures),
+                # Count only in-window failures without mutating state — pruning
+                # happens lazily in mark_failure, so a model that failed then
+                # went quiet would otherwise report stale failures as "recent".
+                "recent_failures": sum(1 for f in st.failures if f >= cutoff),
                 "opened_at": st.opened_at,
                 "last_ok_at": st.last_ok_at,
             }

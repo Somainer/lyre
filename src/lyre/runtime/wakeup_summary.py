@@ -16,9 +16,10 @@ loads its memory index — no race, no scheduling decision.
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 
 import structlog
 
@@ -27,6 +28,7 @@ from ..adapter.llm_adapter import (
     LLMAdapter,
     LyreContentBlock,
     LyreMessage,
+    StreamEvent,
     TurnComplete,
 )
 from .adapter_factory import model_name_for_provider
@@ -193,14 +195,20 @@ async def _call_for_summary(
         content=[LyreContentBlock(type="text", text=prompt)],
     )
     pieces: list[str] = []
-    try:
-        stream = adapter.stream_turn(
+    # The protocol types stream_turn as AsyncIterator, but every concrete
+    # adapter implements it as an async generator, so .aclose() is part of
+    # the documented contract; cast so the finally below type-checks.
+    stream = cast(
+        "AsyncGenerator[StreamEvent, None]",
+        adapter.stream_turn(
             messages=[user_msg],
             tools=[],
             model=model,
             max_tokens=max_tokens,
             system=None,
-        )
+        ),
+    )
+    try:
         async for evt in stream:
             if isinstance(evt, ContentDelta):
                 pieces.append(evt.text)
@@ -208,6 +216,16 @@ async def _call_for_summary(
                 break
     except Exception:  # noqa: BLE001 — caller decides what to do
         return ""
+    finally:
+        # Breaking on TurnComplete leaves stream_turn suspended mid-stream;
+        # the adapter's `async with messages.stream(...)` __aexit__ (HTTP
+        # release) only runs when the generator is closed. aclose() makes
+        # cleanup deterministic instead of GC-deferred. Guard it so a
+        # close-time error can't mask the summary result.
+        try:
+            await stream.aclose()
+        except Exception:  # noqa: BLE001
+            pass
     return "".join(pieces).strip()
 
 
@@ -248,7 +266,14 @@ def _append_to_notes(
         sep = "" if not existing or existing.endswith("\n") else "\n"
         new_content = existing + sep + f"\n{SUMMARY_SECTION_HEADER}\n" + entry
 
-    notes.write_text(new_content, encoding="utf-8")
+    # Write through a sibling temp file + atomic rename so a SIGKILL
+    # mid-write can't truncate the durable long-term notes file. An
+    # interrupted write leaves the prior complete file intact and only
+    # orphans a .tmp. (Kill-test: any process can die at any moment;
+    # same pattern as runtime/blob_store.py.)
+    tmp = notes.with_name(notes.name + ".tmp")
+    tmp.write_text(new_content, encoding="utf-8")
+    tmp.replace(notes)
 
 
 # Provided for callers (and tests) that want to construct a synchronous

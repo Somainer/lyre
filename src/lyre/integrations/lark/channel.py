@@ -178,17 +178,29 @@ class LarkChannel:
             # also eliminates the "Task was destroyed but it is
             # pending" warning chain from the sweeper task being
             # scheduled on the wrong loop.
-            new_loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(new_loop)
-            from lark_oapi.ws import client as _ws_mod  # type: ignore[import-untyped]
-            _ws_mod.loop = new_loop
+            try:
+                new_loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(new_loop)
+                from lark_oapi.ws import client as _ws_mod  # type: ignore[import-untyped]
+                _ws_mod.loop = new_loop
 
-            ws = self._lark.ws.Client(
-                self.cfg.app_id,
-                self.cfg.app_secret,
-                event_handler=handler,
-            )
-            ws.start()
+                ws = self._lark.ws.Client(
+                    self.cfg.app_id,
+                    self.cfg.app_secret,
+                    event_handler=handler,
+                )
+                ws.start()
+            except Exception as exc:  # noqa: BLE001
+                # ws.start() normally blocks for the channel's lifetime.
+                # If it raises (construction error, or the SDK exhausts
+                # its internal reconnects on auth/network failure), this
+                # daemon thread dies and the channel goes silently deaf —
+                # run() keeps awaiting stop_event forever. Surface the
+                # death as a structured log instead of a bare stderr
+                # traceback so it's observable. No reconnect/restart here
+                # (that would change behavior); recovery is a serve
+                # restart, per the channel's documented daemon-thread model.
+                log.exception("lark_ws_thread_died", error=str(exc))
 
         thread = threading.Thread(
             target=_run_ws, name="lark-ws", daemon=True,
@@ -330,6 +342,24 @@ class LarkChannel:
                 )
                 return
 
+            # Idempotency short-circuit: the WS connection redelivers
+            # events on reconnect (see docstring). insert_message's
+            # ON CONFLICT is still the authority, but on a redelivery
+            # we can skip the wasted image fetch + blob upsert by
+            # checking the same (recipient, external_id) key first.
+            external_id = f"lark:{msg_id}"
+            if (
+                await self.repos.mailbox.find_id_by_external_id(
+                    addr.recipient, external_id,
+                )
+                is not None
+            ):
+                log.debug(
+                    "lark_inbound_duplicate_skipped",
+                    msg_id=msg_id, recipient=addr.recipient,
+                )
+                return
+
             # Download any image attachments.
             attachments = await self._download_images(
                 msg_id, image_keys,
@@ -346,7 +376,7 @@ class LarkChannel:
             inserted_id = await self.repos.mailbox.insert_message(
                 MailboxMessage(
                     recipient=addr.recipient,
-                    external_id=f"lark:{msg_id}",
+                    external_id=external_id,
                     sender="owner",
                     urgency=urgency,  # type: ignore[arg-type]
                     body=stored_body,
@@ -433,7 +463,7 @@ class LarkChannel:
             # from the magic bytes — png/jpg/gif/webp cover the
             # vast majority of screenshots and phone-camera images.
             media_type = _sniff_image_mime(data) or "image/png"
-            blob_id = self.blob_store.write(data, media_type)
+            blob_id = await asyncio.to_thread(self.blob_store.write, data, media_type)
             from ...persistence.models import Blob
             await self.repos.blobs.upsert(Blob(
                 id=blob_id,
@@ -538,7 +568,7 @@ class LarkChannel:
                     )
                     continue
                 try:
-                    raw = self.blob_store.read(blob.id, blob.media_type)
+                    raw = await asyncio.to_thread(self.blob_store.read, blob.id, blob.media_type)
                 except FileNotFoundError:
                     log.warning(
                         "lark_outbound_blob_file_missing",

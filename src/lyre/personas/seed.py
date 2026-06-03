@@ -69,6 +69,15 @@ def load_persona_from_file(path: Path) -> Persona:
         # persona unconditionally gets an empty-tmpdir worktree now,
         # and git provisioning is per-task (TaskSpec.git_context).
         status=front.get("status", "approved"),
+        # Round-trip the review-provenance keys the write path emits
+        # (_frontmatter_for / approve); without these reads they'd be
+        # write-only on the SSOT path and persona.reviewer would always
+        # read None despite the file recording it. reviewed_at has no
+        # write site yet (stays None), kept here so the read set is
+        # symmetric for when one is added.
+        proposed_by_task_id=front.get("proposed_by_task_id"),
+        reviewer=front.get("reviewer"),
+        reviewed_at=front.get("reviewed_at"),
         metadata=front.get("metadata"),
     )
 

@@ -308,6 +308,14 @@ class _FakeStream:
         for c in self._chunks:
             yield c
 
+    # Mirror the real openai AsyncStream, which is an async context
+    # manager (the adapter now consumes it via `async with`).
+    async def __aenter__(self) -> _FakeStream:
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None:
+        return None
+
 
 def _attach_fake_stream(adapter: OpenAIAdapter, chunks: list[Any]) -> None:
     """Replace the SDK client with one that returns `_FakeStream(chunks)`."""

@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import os
 import shlex
+import signal
 import time
 from pathlib import Path
 from typing import Any
@@ -31,6 +32,9 @@ log = structlog.get_logger()
 _MAX_BYTES_PER_STREAM = 100 * 1024  # 100 KB
 _DEFAULT_TIMEOUT_S = 60.0
 _MAX_TIMEOUT_S = 600.0
+# Cap the post-kill pipe drain so a grandchild that inherited the
+# stdout/stderr write-end can never hang the wakeup.
+_POST_KILL_DRAIN_S = 5.0
 
 # Whitelist of env vars we forward into the subprocess. Anything else is dropped.
 _ENV_ALLOWLIST = frozenset(
@@ -52,9 +56,31 @@ def _filter_env(extra: dict[str, str] | None) -> dict[str, str]:
         for k, v in extra.items():
             if not isinstance(k, str) or not isinstance(v, str):
                 continue
-            # Block credentials sneaking in via extra_env unless prefixed GIT_/GH_/SSH_
+            # Caller-supplied extra_env is trusted and overlaid as-is. The secret
+            # barrier is the _ENV_ALLOWLIST filter on os.environ above (which drops
+            # ANTHROPIC_*/LYRE_* etc.), not this branch — extra_env intentionally
+            # has no key restriction.
             base[k] = v
     return base
+
+
+def _kill_process_tree(proc: asyncio.subprocess.Process) -> None:
+    if proc.pid is None:
+        return
+    # POSIX: signal the session/process group created by start_new_session.
+    killpg = getattr(os, "killpg", None)
+    getpgid = getattr(os, "getpgid", None)
+    if killpg is not None and getpgid is not None:
+        try:
+            os.killpg(getpgid(proc.pid), signal.SIGKILL)
+            return
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    # Fallback (non-POSIX or killpg failed): kill just the leader.
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        pass
 
 
 def _truncate(b: bytes) -> tuple[str, bool]:
@@ -91,6 +117,7 @@ async def run_command(
             env=env,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,  # own process group -> killpg on timeout reaps grandchildren
         )
     except FileNotFoundError as exc:
         return {
@@ -111,11 +138,18 @@ async def run_command(
         )
     except TimeoutError:
         timed_out = True
+        # Kill the whole process group, not just the leader: a grandchild that
+        # inherited the stdout/stderr pipe write-end would otherwise keep the
+        # second communicate() blocked indefinitely (e.g. ssh spawned by git push).
+        _kill_process_tree(proc)
         try:
-            proc.kill()
-        except ProcessLookupError:
-            pass
-        out_bytes, err_bytes = await proc.communicate()
+            out_bytes, err_bytes = await asyncio.wait_for(
+                proc.communicate(), timeout=_POST_KILL_DRAIN_S
+            )
+        except TimeoutError:
+            # A descendant still holds the pipe open past the drain budget.
+            # Give up on output rather than pin the single-threaded scheduler.
+            out_bytes, err_bytes = b"", b""
 
     exit_code = proc.returncode if proc.returncode is not None else -1
     wall_ms = int((time.time() - started) * 1000)

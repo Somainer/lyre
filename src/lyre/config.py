@@ -455,9 +455,16 @@ class Config:
         model_override = os.environ.get("LYRE_MODEL_OVERRIDE") or runtime_raw.get(
             "model_override"
         ) or None
+        try:
+            _compact_default = float(runtime_raw.get("compact_threshold", 0.7))
+        except (ValueError, TypeError):
+            # Garbage [runtime] compact_threshold -> default 0.7 rather than
+            # crash every CLI command inside Config.from_env(). Matches the
+            # defensive parsing of max_tokens/dashboard_port/max_concurrent below.
+            _compact_default = 0.7
         compact_threshold = _parse_compact_threshold(
             os.environ.get("LYRE_COMPACT_THRESHOLD"),
-            default=float(runtime_raw.get("compact_threshold", 0.7)),
+            default=_compact_default,
         )
         # max_tokens: env > [runtime] > default. Floor at 256 so a
         # misconfigured 0 / negative doesn't immediately starve every

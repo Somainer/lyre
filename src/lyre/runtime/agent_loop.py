@@ -15,9 +15,9 @@ from __future__ import annotations
 
 import json as _json
 import time
-from collections.abc import Callable
+from collections.abc import AsyncGenerator, Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 
 import structlog
 
@@ -27,6 +27,7 @@ from ..adapter.llm_adapter import (
     LyreContentBlock,
     LyreMessage,
     LyreToolSpec,
+    StreamEvent,
     ThinkingBlockComplete,
     ThinkingDelta,
     ToolUseComplete,
@@ -408,11 +409,10 @@ class AgentLoop:
                     # always be followed by user tool_result).
                     tool_result_blocks: list[LyreContentBlock] = []
                     for tu in tool_uses_this_turn:
-                        result, is_error = await self._dispatch_tool(
+                        result, is_error, view_blocks = await self._dispatch_tool(
                             tu["name"], tu["id"], tu["input"]
                         )
                         tool_outcomes.append(is_error)
-                        view_blocks = _take_view_blocks(result)
                         tool_result_blocks.append(
                             LyreContentBlock(
                                 type="tool_result",
@@ -427,6 +427,13 @@ class AgentLoop:
                             silent_close_askers.update(
                                 _askers_from_mailbox_read(result)
                             )
+                        # Mirror the main path: a user-facing tool dispatched in
+                        # the interrupt drain path is still a genuine action.
+                        # Otherwise the silent_close fallback can later misfire
+                        # (apologetic "couldn't reply" mail) even though a real
+                        # reply was sent this turn.
+                        if tu["name"] in _USER_FACING_TOOLS:
+                            made_user_facing_action = True
                     messages.append(
                         LyreMessage(role="user", content=tool_result_blocks)
                     )
@@ -511,18 +518,15 @@ class AgentLoop:
             # Execute tools and feed results back.
             tool_result_blocks = []
             for tu in tool_uses_this_turn:
-                result, is_error = await self._dispatch_tool(
+                # _dispatch_tool drains any multimodal `_lyre_view_blocks` off
+                # the result dict (mailbox_get_message with attachments) and
+                # returns them as the third element — already stripped from the
+                # JSON the model reads. We append them as their own
+                # LyreContentBlock entries on the same user message.
+                result, is_error, view_blocks = await self._dispatch_tool(
                     tu["name"], tu["id"], tu["input"]
                 )
                 tool_outcomes.append(is_error)
-                # Tools that produce multimodal output (today only
-                # mailbox_get_message with attachments) tuck a
-                # `_lyre_view_blocks` list onto the result dict — the
-                # loop extracts those, appends them as their own
-                # LyreContentBlock entries on the same user message,
-                # and strips the magic key from what gets shown to
-                # the model so the JSON tool_result stays clean.
-                view_blocks = _take_view_blocks(result)
                 tool_result_blocks.append(
                     LyreContentBlock(
                         type="tool_result",
@@ -888,59 +892,74 @@ class AgentLoop:
             )
 
             try:
-                stream = adapter.stream_turn(
-                    messages=dispatch_messages,
-                    tools=tool_specs,
-                    model=model_name,
-                    max_tokens=self.max_tokens,
-                    system=system_prompt,
+                # Cast to AsyncGenerator: stream_turn is declared
+                # AsyncIterator[StreamEvent] for provider-neutrality, but every
+                # adapter implements it as an async generator, so .aclose() in
+                # the finally below is real (and documented on the interface).
+                stream = cast(
+                    AsyncGenerator[StreamEvent, None],
+                    adapter.stream_turn(
+                        messages=dispatch_messages,
+                        tools=tool_specs,
+                        model=model_name,
+                        max_tokens=self.max_tokens,
+                        system=system_prompt,
+                    ),
                 )
-                async for evt in stream:
-                    yielded_any = True
-                    if isinstance(evt, ContentDelta):
-                        text_parts.append(evt.text)
-                        self.transcript.write_delta(evt.text)
-                    elif isinstance(evt, ThinkingDelta):
-                        # Streamed to transcript only — the assembled
-                        # block is captured via ThinkingBlockComplete
-                        # below for replay into the assistant message.
-                        self.transcript.write_thinking_delta(evt.text)
-                    elif isinstance(evt, ThinkingBlockComplete):
-                        # The full reasoning block. MUST be echoed back
-                        # in the next API call (Anthropic + DeepSeek
-                        # both require this, with empty signature
-                        # tolerated only by DeepSeek). Stash for
-                        # _append_assistant_message.
-                        thinking_blocks.append(
-                            LyreContentBlock(
-                                type="thinking",
-                                text=evt.text,
-                                signature=evt.signature,
+                # try/finally so aclose() always runs: the mid-stream blocker
+                # `break` leaves the adapter's generator suspended at its yield
+                # inside `async with ...stream(...)`, so the provider HTTP
+                # connection is only released on aclose() (otherwise it lingers
+                # until GC finalization and leaks from the pool).
+                try:
+                    async for evt in stream:
+                        yielded_any = True
+                        if isinstance(evt, ContentDelta):
+                            text_parts.append(evt.text)
+                            self.transcript.write_delta(evt.text)
+                        elif isinstance(evt, ThinkingDelta):
+                            # Streamed to transcript only — the assembled
+                            # block is captured via ThinkingBlockComplete
+                            # below for replay into the assistant message.
+                            self.transcript.write_thinking_delta(evt.text)
+                        elif isinstance(evt, ThinkingBlockComplete):
+                            # The full reasoning block. MUST be echoed back
+                            # in the next API call (Anthropic + DeepSeek
+                            # both require this, with empty signature
+                            # tolerated only by DeepSeek). Stash for
+                            # _append_assistant_message.
+                            thinking_blocks.append(
+                                LyreContentBlock(
+                                    type="thinking",
+                                    text=evt.text,
+                                    signature=evt.signature,
+                                )
                             )
-                        )
-                    elif isinstance(evt, ToolUseComplete):
-                        tu = {"id": evt.id, "name": evt.name, "input": evt.input}
-                        tool_uses.append(tu)
-                        self.transcript.write_tool_use(evt.id, evt.name, evt.input)
-                    elif isinstance(evt, Usage):
-                        turn_input = evt.input_tokens
-                        turn_output = evt.output_tokens
-                    elif isinstance(evt, TurnComplete):
-                        stop_reason = evt.stop_reason
-                    # Mid-stream interrupt is reserved for urgency=blocker
-                    # ("system is waiting"). high-urgency mail also signals
-                    # the watcher, but it should NOT yank the agent off
-                    # mid-thought — wait for the turn boundary instead.
-                    if (
-                        self.blocker_watcher is not None
-                        and self.blocker_watcher.signal.is_set()
-                        and self.blocker_watcher.has_blocker_pending
-                    ):
-                        interrupted_mid_stream = True
-                        self.transcript.note(
-                            f"interrupt: blocker signal raised mid-stream on {candidate.id}"
-                        )
-                        break
+                        elif isinstance(evt, ToolUseComplete):
+                            tu = {"id": evt.id, "name": evt.name, "input": evt.input}
+                            tool_uses.append(tu)
+                            self.transcript.write_tool_use(evt.id, evt.name, evt.input)
+                        elif isinstance(evt, Usage):
+                            turn_input = evt.input_tokens
+                            turn_output = evt.output_tokens
+                        elif isinstance(evt, TurnComplete):
+                            stop_reason = evt.stop_reason
+                        # Mid-stream interrupt is reserved for urgency=blocker
+                        # ("system is waiting"). high-urgency mail also signals
+                        # the watcher, but it should NOT yank the agent off
+                        # mid-thought — wait for the turn boundary instead.
+                        if (
+                            self.blocker_watcher is not None
+                            and self.blocker_watcher.signal.is_set()
+                            and self.blocker_watcher.has_blocker_pending
+                        ):
+                            interrupted_mid_stream = True
+                            self.transcript.note(
+                                f"interrupt: blocker signal raised mid-stream on {candidate.id}"
+                            )
+                            break
+                finally:
+                    await stream.aclose()
             except Exception as exc:  # noqa: BLE001
                 if self.health:
                     self.health.mark_failure(candidate.id)
@@ -1004,17 +1023,23 @@ class AgentLoop:
 
     async def _dispatch_tool(
         self, name: str, tool_use_id: str, tool_input: dict[str, Any]
-    ) -> tuple[str, bool]:
+    ) -> tuple[str, bool, list[LyreContentBlock]]:
+        # Third element: multimodal view blocks drained from a dict result.
+        # They MUST be popped off the result dict BEFORE it is serialized,
+        # otherwise the internal `_lyre_view_blocks` plumbing key leaks into
+        # the JSON the model reads and the image/document blocks are never
+        # hydrated onto the user message. Every early/error return yields [].
         if not self.tool_registry or not self.tool_context:
-            return ("Tool dispatch not configured for this agent loop.", True)
+            return ("Tool dispatch not configured for this agent loop.", True, [])
         if name not in self.allowed_tools:
             return (
                 f"Tool '{name}' is not in this persona's allowlist: {self.allowed_tools}.",
                 True,
+                [],
             )
         tool = self.tool_registry.get(name)
         if tool is None:
-            return (f"Unknown tool '{name}'.", True)
+            return (f"Unknown tool '{name}'.", True, [])
         # Adapters that couldn't parse the model's tool-call arguments
         # JSON (e.g. truncated by max_tokens mid-emit) fall back to
         # ``{"_raw": <partial-json-string>}``. The per-tool handler then
@@ -1041,25 +1066,30 @@ class AgentLoop:
                 f"continue the task differently. "
                 f"Raw bytes received ({len(raw)} chars): {raw[:200]!r}…",
                 True,
+                [],
             )
         try:
             args = dict(tool_input)
             args.setdefault("_tool_use_id", tool_use_id)
             result = await tool.handler(self.tool_context, args)
         except ToolError as exc:
-            return (str(exc), True)
+            return (str(exc), True, [])
         except Exception as exc:  # noqa: BLE001
             log.exception("tool_dispatch_unhandled", tool=name, error=str(exc))
             return (
                 f"Internal error executing tool '{name}': {exc.__class__.__name__}: {exc}",
                 True,
+                [],
             )
         if isinstance(result, str):
-            return (result, False)
+            return (result, False, [])
+        # Drain the multimodal view blocks (and strip the magic key) BEFORE
+        # serializing so the JSON the model sees stays clean.
+        view = _take_view_blocks(result)
         try:
-            return (_json.dumps(result, ensure_ascii=False, default=str), False)
+            return (_json.dumps(result, ensure_ascii=False, default=str), False, view)
         except Exception:
-            return (str(result), False)
+            return (str(result), False, view)
 
     async def _emit_silent_close_fallback(
         self,

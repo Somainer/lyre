@@ -57,7 +57,11 @@ async def _shell_exec(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
     if any(not isinstance(a, str) for a in argv):
         raise ToolError("argv items must all be strings")
 
-    timeout_s = float(args.get("timeout_s", 60.0))
+    raw_timeout = args.get("timeout_s", 60.0)
+    try:
+        timeout_s = float(raw_timeout)
+    except (TypeError, ValueError):
+        raise ToolError(f"timeout_s must be a number (got {raw_timeout!r})") from None
     user_env = args.get("env")
     if user_env is not None and not isinstance(user_env, dict):
         raise ToolError("env must be an object of string→string")
