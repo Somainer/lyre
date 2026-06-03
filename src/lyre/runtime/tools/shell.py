@@ -11,11 +11,40 @@ Read-only PATH inheritance, no shell expansion.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
 from .. import shell
 from . import Tool, ToolContext, ToolError
+
+
+def _resolve_credentials(ctx: ToolContext, name: str) -> dict[str, str]:
+    """Resolve a configured coding-backend bundle to ``{auth_env: secret}`` for
+    injection into the subprocess. The secret is read SERVER-SIDE from the
+    runtime's env — the agent only names the bundle, never sees the value. See
+    docs/design/CAPABILITY_DISCOVERY.md.
+    """
+    backends = ctx.extras.get("coding_backends") or {}
+    bundle = backends.get(name)
+    if bundle is None:
+        raise ToolError(
+            f"unknown credentials bundle {name!r}. Declare it under "
+            f"[coding_backends.{name}] in config.toml (auth_env = <ENV VAR>)."
+        )
+    allowed = bundle.allowed_personas
+    if allowed and ctx.persona_name not in allowed:
+        raise ToolError(
+            f"persona {ctx.persona_name!r} is not allowed to use the {name!r} "
+            f"credentials bundle (allowed: {list(allowed)})."
+        )
+    secret = os.environ.get(bundle.auth_env)
+    if not secret:
+        raise ToolError(
+            f"credentials bundle {name!r} maps to env {bundle.auth_env!r}, "
+            f"which is not set — provision it in ~/.lyre/.env."
+        )
+    return {bundle.auth_env: secret}
 
 
 async def _shell_exec(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
@@ -40,6 +69,16 @@ async def _shell_exec(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(overlay, dict):
         overlay = {}
     extra_env: dict[str, str] = {**overlay, **(user_env or {})}
+
+    # Coding-backend credential opt-in: inject one owner-declared secret into
+    # this subprocess so a discovered coding-agent skill can authenticate. The
+    # value is read server-side and never returned to the agent. Layered last
+    # so a configured bundle wins over any same-named user_env key.
+    credentials = args.get("credentials")
+    if credentials is not None:
+        if not isinstance(credentials, str):
+            raise ToolError("credentials must be a string (a coding-backend name)")
+        extra_env = {**extra_env, **_resolve_credentials(ctx, credentials)}
 
     requested_cwd = args.get("cwd")
     if requested_cwd is not None and not isinstance(requested_cwd, str):
@@ -70,7 +109,10 @@ SHELL_EXEC = Tool(
         "Execute a host command (git, gh, sbt, ls, cat, etc.) and capture its "
         "stdout/stderr/exit_code. Runs inside the task's worktree directory by "
         "default. No shell expansion — pass argv as a list, or 'command' as a "
-        "single string and Lyre will shlex-split it. Output truncated at 100 KB."
+        "single string and Lyre will shlex-split it. Output truncated at 100 KB. "
+        "Pass `credentials=<backend-name>` to inject an owner-declared external "
+        "coding-agent key (e.g. to run `codex`/`claude` headless) into just this "
+        "call — see a coding-agent skill for the exact recipe."
     ),
     input_schema={
         "type": "object",
@@ -97,6 +139,15 @@ SHELL_EXEC = Tool(
             "env": {
                 "type": "object",
                 "description": "Extra env vars merged onto the allowlist.",
+            },
+            "credentials": {
+                "type": "string",
+                "description": (
+                    "Name of an owner-configured coding-backend bundle "
+                    "([coding_backends.<name>] in config.toml). Injects that "
+                    "backend's API key into this one subprocess so an external "
+                    "coding agent can authenticate. Omit for ordinary commands."
+                ),
             },
         },
     },

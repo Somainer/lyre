@@ -1386,6 +1386,9 @@ class Scheduler:
             # list_agents' idle-reclaim `stale` hint reads this threshold;
             # 0 (default) disables it.
             extras["idle_reclaim_age_s"] = self.config.idle_reclaim_age_s
+            # shell_exec(credentials=<name>) resolves bundles from here to
+            # inject an external coding-agent's key into one subprocess.
+            extras["coding_backends"] = self.config.coding_backends
             # archive_agent (tool) consults the agents table at call time
             # for "is this a bootstrap-seeded singleton" via
             # parent_agent_id IS NULL. No need to pre-compute a snapshot
