@@ -1006,6 +1006,25 @@ class Scheduler:
             # Deliver: insert a regular mailbox_message. Deterministic
             # external_id covers the rare crash-between-insert-and-mark
             # case.
+            # T4: a recurring self-mail is a bounded loop. This delivery is
+            # occurrence #(occurrence_count+1); if it reaches max_occurrences it
+            # is the FINAL wake — mark it high-urgency with a wrap-up note and
+            # don't re-arm. The scheduler (not the model) enforces the ceiling,
+            # so a confused loop can't run forever.
+            loop_final = (
+                sched.max_occurrences is not None
+                and sched.occurrence_count + 1 >= sched.max_occurrences
+            )
+            urgency = "high" if loop_final else sched.urgency
+            body = sched.body
+            if loop_final:
+                body = (
+                    f"[loop budget reached: {sched.occurrence_count + 1}/"
+                    f"{sched.max_occurrences} iterations — this is your LAST "
+                    f"scheduled wake on this thread. Finish up or escalate; "
+                    f"you will NOT be auto-woken again.]\n\n" + sched.body
+                )
+
             external_id = f"sched:{sched.id}:{sched.occurrence_count}"
             await self.repos.mailbox.ensure_mailbox(recipient)
             msg_id = await self.repos.mailbox.insert_message(
@@ -1013,9 +1032,9 @@ class Scheduler:
                     recipient=recipient,
                     external_id=external_id,
                     sender=sched.sender,
-                    urgency=sched.urgency,
+                    urgency=urgency,
                     title=sched.title,
-                    body=sched.body,
+                    body=body,
                     task_id=sched.task_id,
                     parent_msg_id=sched.parent_msg_id,
                     metadata=sched.metadata,
@@ -1039,6 +1058,8 @@ class Scheduler:
                 after=now,
                 recur_until=sched.recur_until,
             )
+            if loop_final:
+                next_fire = None  # budget exhausted → stop re-arming
             # sched was loaded from a persisted row — its id is always set
             # by the time it lands in the delivery loop.
             assert sched.id is not None  # noqa: S101 — narrows for mypy

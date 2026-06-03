@@ -1631,10 +1631,10 @@ class SqliteScheduledMailRepository:
             INSERT INTO scheduled_mail (
               recipient, sender, urgency, title, body, task_id,
               parent_msg_id, metadata, scheduled_for,
-              recur_kind, recur_value, recur_until,
+              recur_kind, recur_value, recur_until, max_occurrences,
               created_by_agent, created_by_task, status
             )
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending')
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending')
             RETURNING id
             """,
             (
@@ -1650,6 +1650,7 @@ class SqliteScheduledMailRepository:
                 spec.recur_kind,
                 spec.recur_value,
                 _iso(spec.recur_until) if spec.recur_until else None,
+                spec.max_occurrences,
                 spec.created_by_agent,
                 spec.created_by_task,
             ),
@@ -1807,6 +1808,7 @@ class SqliteScheduledMailRepository:
             recur_value=row["recur_value"],
             recur_until=row["recur_until"],
             occurrence_count=row["occurrence_count"],
+            max_occurrences=row["max_occurrences"] if "max_occurrences" in keys else None,
             created_at=row["created_at"],
             created_by_agent=row["created_by_agent"],
             created_by_task=row["created_by_task"],

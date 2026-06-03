@@ -333,6 +333,11 @@ async def _schedule_future_mail(
     recur_every = args.get("recur_every")
     recur_cron = args.get("recur_cron")
     recur_until_raw = args.get("recur_until")
+    # Loop budget (T4): cap the number of recurrences. The scheduler enforces it
+    # (stops re-arming), so an opt-in loop has a ceiling the model can't blow.
+    max_occ = args.get("max_occurrences")
+    if max_occ is not None and (not isinstance(max_occ, int) or max_occ < 1):
+        raise ToolError("max_occurrences must be a positive integer if provided")
 
     if recur_every is not None and recur_cron is not None:
         raise ToolError("pass at most one of recur_every / recur_cron")
@@ -425,6 +430,7 @@ async def _schedule_future_mail(
             recur_kind=recur_kind,  # type: ignore[arg-type]
             recur_value=recur_value,
             recur_until=recur_until,
+            max_occurrences=max_occ,
             created_by_agent=ctx.self_mailbox,
             created_by_task=ctx.task_id,
         )
@@ -885,6 +891,16 @@ MAILBOX_SEND = Tool(
                 "description": (
                     "Absolute ISO 8601 UTC. Recurrence stops after this. "
                     "Default: first_fire + 1 year."
+                ),
+            },
+            "max_occurrences": {
+                "type": "integer",
+                "description": (
+                    "Loop budget: stop the recurrence after this many fires. "
+                    "Use with recur_every/recur_cron on a self-mail to run a "
+                    "bounded loop — the scheduler enforces the cap (the final "
+                    "wake arrives high-urgency: wrap up or escalate), so you "
+                    "can't re-arm forever. Omit for an open-ended recurrence."
                 ),
             },
         },
