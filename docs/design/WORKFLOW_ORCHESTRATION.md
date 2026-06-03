@@ -259,7 +259,12 @@ Phase 3    find_pending (pending)                     [已有，slot 受限，PR
 async def _resolve_fan_in_barriers(self):
     if not await self.repos.fan_in.any_open():   # 早返
         return
-    for g in await self.repos.fan_in.find_open(limit=20):
+    # ttl_cutoff = now - LYRE_FANIN_MAX_AGE (None when the TTL is disabled).
+    # Beyond the first `limit` deadline-sorted page, find_open also unions in
+    # every open group with created_at < cutoff. Otherwise an old group with a
+    # far-future deadline sits at position 21+ once >20 groups are open, never
+    # reaches the TTL check, and leaks past the global ceiling under load.
+    for g in await self.repos.fan_in.find_open(limit=20, ttl_cutoff=ttl_cutoff):
         async with self.repos.transaction():     # PR1 原子缝
             if g.deadline and now() > g.deadline:
                 await self.repos.fan_in.set_status(g.id, 'expired', guard='open')

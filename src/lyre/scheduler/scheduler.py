@@ -540,21 +540,28 @@ class Scheduler:
         """
         if not await self.repos.fan_in.any_open():
             return
+        from datetime import timedelta
+
         from ..persistence.models import MailboxMessage as _Msg
         from ..runtime.future_mail import now_utc
 
         now = now_utc()
-        for g in await self.repos.fan_in.find_open(limit=20):
+        # Global TTL backstop (PR6): force-expire any open group older than
+        # LYRE_FANIN_MAX_AGE regardless of its own (coordinator-set, up to 24h)
+        # deadline. 0 disables — the per-group deadline is the always-on
+        # liveness; this is an operator ceiling. The cutoff is handed to
+        # find_open so age-expired groups are pulled into this tick even when
+        # >20 younger groups with earlier deadlines fill the deadline-sorted
+        # page; otherwise an old group with a far-future deadline sorts to the
+        # back and leaks past the ceiling under load.
+        max_age = self.config.fanin_max_age_s
+        ttl_cutoff = now - timedelta(seconds=max_age) if max_age > 0 else None
+        for g in await self.repos.fan_in.find_open(limit=20, ttl_cutoff=ttl_cutoff):
             delivered = await self.repos.mailbox.count_fan_in_results(
                 g.coordinator_agent_id, g.id
             )
             ready = delivered >= g.quorum
             timed_out = g.deadline is not None and now >= g.deadline
-            # Global TTL backstop (PR6): force-expire any open group older than
-            # LYRE_FANIN_MAX_AGE regardless of its own (coordinator-set, up to
-            # 24h) deadline. 0 disables — the per-group deadline is the
-            # always-on liveness; this is an operator ceiling.
-            max_age = self.config.fanin_max_age_s
             ttl_expired = (
                 max_age > 0
                 and g.created_at is not None
