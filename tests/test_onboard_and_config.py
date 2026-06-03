@@ -872,7 +872,9 @@ async def test_bootstrap_copies_shipped_personas_as_directory_layout(
 
     user_personas = cfg.user_personas_dir
     # Every shipped persona has been materialized as <name>/identity.md.
-    expected_personas = {"owner", "dispatcher", "analyst", "worker-maintainer", "reviewer"}
+    expected_personas = {
+        "owner", "dispatcher", "analyst", "worker-maintainer", "reviewer", "long-runner",
+    }
     for name in expected_personas:
         assert (user_personas / name / "identity.md").is_file(), name
 
@@ -934,4 +936,6 @@ def test_discover_persona_falls_back_to_shipped_when_user_dir_empty(
     files = discover_persona_files(empty)
     # Falls back to shipped personas.
     names = {p.stem for p in files}
-    assert names == {"owner", "dispatcher", "analyst", "worker-maintainer", "reviewer"}
+    assert names == {
+        "owner", "dispatcher", "analyst", "worker-maintainer", "reviewer", "long-runner",
+    }

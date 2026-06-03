@@ -297,21 +297,37 @@ async def _list_tasks(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
     tasks = await ctx.repos.tasks.search(
         persona_name=persona, status=status, limit=limit
     )
-    return {
-        "tasks": [
-            {
-                "id": t.id,
-                "persona": t.persona_name,
-                "status": t.status,
-                "goal": (t.goal or "")[:160],
-                "parent_task_id": t.parent_task_id,
-                "created_at": t.created_at.isoformat() if t.created_at else None,
-            }
-            for t in tasks
-        ],
-        "count": len(tasks),
+    # The task carrying THIS wakeup is itself an in_progress row and shows up
+    # here like any other. Flag it: during your own wakeup the only in_progress
+    # task is usually this one, and reporting it as "a task that's running"
+    # (instead of the children you dispatched) is exactly how a coordinator ends
+    # up giving the owner a self-referential, wrong status — the 019e8d7d case.
+    self_task_id = ctx.task_id or None
+    out = [
+        {
+            "id": t.id,
+            "persona": t.persona_name,
+            "status": t.status,
+            "goal": (t.goal or "")[:160],
+            "parent_task_id": t.parent_task_id,
+            "created_at": t.created_at.isoformat() if t.created_at else None,
+            "is_current_wakeup": t.id == self_task_id,
+        }
+        for t in tasks
+    ]
+    result: dict[str, Any] = {
+        "tasks": out,
+        "count": len(out),
         "filters": {"persona": persona, "status": status, "limit": limit},
     }
+    if any(t["is_current_wakeup"] for t in out):
+        result["note"] = (
+            "A task with is_current_wakeup=true is THIS wakeup you're running "
+            "in — not delegated/background work. Don't report it as a task "
+            "that's 'currently running'; report the children you dispatched "
+            "(query_task_status by id) instead."
+        )
+    return result
 
 
 LIST_TASKS = Tool(
@@ -320,7 +336,9 @@ LIST_TASKS = Tool(
         "Search tasks across the whole system, optionally filtered by "
         "persona and/or status. Returns the most recent matches (default "
         "limit 20). Use this to see queue depth, in-flight work, or recent "
-        "failures across any persona."
+        "failures across any persona. Each task carries is_current_wakeup — "
+        "true ONLY for the task running this very wakeup (your own session); "
+        "that is not delegated work, so never report it as a running task."
     ),
     input_schema={
         "type": "object",
@@ -754,6 +772,10 @@ async def _list_agents(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]
             "persona": a.persona_name,
             "status": a.status,
             "occupancy": _occupancy(a),
+            # You, the caller. Your own entry shows occupancy=busy with
+            # active_task_id = the task of THIS wakeup; that is not delegated
+            # work, so don't mistake yourself for a running sub-agent.
+            "is_you": a.id == ctx.self_mailbox,
             "parent_agent_id": a.parent_agent_id,
             "in_flight_count": len(in_flight),
             "active_task_id": in_flight[0].id if in_flight else None,
@@ -784,6 +806,13 @@ async def _list_agents(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]
             "reclaim threshold with no work in flight — archive_agent them to "
             "free the population, UNLESS you expect to reuse one shortly."
         )
+    you = next((e for e in enriched if e["is_you"]), None)
+    if you is not None and you["occupancy"] == "busy":
+        note += (
+            " The agent with is_you=true is you; its active_task_id is THIS "
+            "wakeup you're running, not delegated work — don't report it as a "
+            "running task."
+        )
     return {
         "agents": enriched,
         "count": len(enriched),
@@ -797,8 +826,10 @@ LIST_AGENTS = Tool(
         "List currently-active agent instances (id, persona, status, model, "
         "occupancy, idle_seconds, stale). `stale=true` marks a spawned, "
         "non-ephemeral agent idle past the reclaim threshold with no work in "
-        "flight — a hint you may archive_agent it. Pass include_archived=true "
-        "to also see soft-deleted ones. For role definitions (templates) use "
+        "flight — a hint you may archive_agent it. `is_you=true` marks the "
+        "calling agent itself (its active_task_id is your own current wakeup, "
+        "not delegated work). Pass include_archived=true to also see "
+        "soft-deleted ones. For role definitions (templates) use "
         "list_personas instead."
     ),
     input_schema={
