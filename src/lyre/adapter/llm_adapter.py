@@ -54,6 +54,14 @@ class LyreContentBlock:
 class LyreMessage:
     role: Literal["system", "user", "assistant", "tool"]
     content: list[LyreContentBlock]
+    # Set on messages PRODUCED BY compaction (the synthetic mail-in/out
+    # messages + the work-summary seam). Lets `runtime/compact.py` recognize
+    # its own prior output on a SECOND compaction and carry it forward
+    # verbatim instead of re-eliding it — without this flag a recompaction
+    # drops the previously-preserved mail (those synthetic messages have no
+    # tool_use blocks to re-synthesize from). Adapters ignore this field
+    # entirely; it never reaches the provider.
+    compaction_artifact: bool = False
 
 
 @dataclass

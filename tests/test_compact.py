@@ -375,6 +375,163 @@ async def test_compact_bails_when_too_short_to_be_useful() -> None:
 
 
 @pytest.mark.asyncio
+async def test_compaction_marks_its_own_output_as_artifact() -> None:
+    """Synthetic mail messages + the work-summary seam must be flagged
+    `compaction_artifact=True` so a later compaction recognizes its own
+    output. The kept head/tail (real turns) must NOT be flagged."""
+    mail_result = json.dumps({
+        "id": 5, "sender": "owner", "urgency": "high", "body": "keep me",
+    })
+    msgs = [
+        _user("task"),
+        _assistant_with_tools(
+            {"id": "g1", "name": "mailbox_get_message", "input": {"msg_id": 5}}
+        ),
+        _tool_results({"id": "g1", "result": mail_result}),
+        _assistant_with_tools(
+            {"id": "a1", "name": "shell_exec", "input": {"argv": ["ls"]}}
+        ),
+        _tool_results({"id": "a1", "result": "x"}),
+        _assistant_with_tools(
+            {"id": "a2", "name": "shell_exec", "input": {"argv": ["pwd"]}}
+        ),
+        _tool_results({"id": "a2", "result": "/"}),
+        _assistant_with_tools(
+            {"id": "a3", "name": "shell_exec", "input": {"argv": ["id"]}}
+        ),
+        _tool_results({"id": "a3", "result": "u"}),
+    ]
+    out = await compact_messages(
+        msgs, adapter=StubAdapter(), model="x", keep_last_k=2,
+    )
+    artifacts = [m for m in out if m.compaction_artifact]
+    # The synthetic mail (user) + the summary seam (user) are artifacts.
+    assert len(artifacts) >= 2
+    assert all(m.compaction_artifact for m in artifacts)
+    # The initial task msg and the kept-tail real turns are NOT artifacts.
+    assert out[0].compaction_artifact is False
+    assert out[-1].compaction_artifact is False
+    assert out[-2].compaction_artifact is False
+
+
+@pytest.mark.asyncio
+async def test_recompaction_preserves_mail_verbatim() -> None:
+    """REGRESSION: a SECOND compaction must not destroy mail that the
+    FIRST compaction preserved. The synthetic mail message carries no
+    tool_use block, so the naive elision walk produces nothing for it and
+    silently drops the owner's words — exactly the kill-test / 铁律五
+    violation this guards against."""
+    mail_result = json.dumps({
+        "id": 7, "sender": "owner", "urgency": "blocker",
+        "body": "DO NOT LOSE THIS owner instruction.",
+    })
+    msgs = [
+        _user("start"),
+        _assistant_with_tools(
+            {"id": "g1", "name": "mailbox_get_message", "input": {"msg_id": 7}}
+        ),
+        _tool_results({"id": "g1", "result": mail_result}),
+        _assistant_with_tools(
+            {"id": "a1", "name": "shell_exec", "input": {"argv": ["ls"]}}
+        ),
+        _tool_results({"id": "a1", "result": "x"}),
+        _assistant_with_tools(
+            {"id": "a2", "name": "shell_exec", "input": {"argv": ["pwd"]}}
+        ),
+        _tool_results({"id": "a2", "result": "/"}),
+        _assistant_with_tools(
+            {"id": "a3", "name": "shell_exec", "input": {"argv": ["id"]}}
+        ),
+        _tool_results({"id": "a3", "result": "u"}),
+    ]
+    first = await compact_messages(
+        msgs, adapter=StubAdapter(), model="x", keep_last_k=2,
+    )
+    flat1 = " ".join(
+        b.text or "" for m in first for b in m.content if b.type == "text"
+    )
+    assert "DO NOT LOSE THIS owner instruction." in flat1  # sanity
+
+    # Simulate more turns accruing after the first compaction, then a
+    # second compaction (the case `_MAX_COMPACTIONS` used to paper over).
+    extended = first + [
+        _assistant_with_tools(
+            {"id": "b1", "name": "shell_exec", "input": {"argv": ["echo", "1"]}}
+        ),
+        _tool_results({"id": "b1", "result": "1"}),
+        _assistant_with_tools(
+            {"id": "b2", "name": "shell_exec", "input": {"argv": ["echo", "2"]}}
+        ),
+        _tool_results({"id": "b2", "result": "2"}),
+    ]
+    second = await compact_messages(
+        extended, adapter=StubAdapter(), model="x", keep_last_k=2,
+    )
+    flat2 = " ".join(
+        b.text or "" for m in second for b in m.content if b.type == "text"
+    )
+    assert "DO NOT LOSE THIS owner instruction." in flat2, (
+        "recompaction destroyed mail preserved by the first compaction"
+    )
+
+
+@pytest.mark.asyncio
+async def test_recompaction_does_not_accrete_empty_summary_seams() -> None:
+    """A recompaction whose only fresh content is mail (no tool work to
+    fold) should carry the prior seam forward, NOT append a fresh empty
+    'no substantive tool work' marker on top — otherwise every compaction
+    grows the history by one useless seam. Built from mail-only turns so
+    the fresh range has zero trace-policy tool work."""
+    def _mail_in(msg_id: int, body: str) -> tuple[LyreMessage, LyreMessage]:
+        return (
+            _assistant_with_tools(
+                {"id": f"g{msg_id}", "name": "mailbox_get_message",
+                 "input": {"msg_id": msg_id}}
+            ),
+            _tool_results({"id": f"g{msg_id}", "result": json.dumps(
+                {"id": msg_id, "sender": "owner", "urgency": "normal",
+                 "body": body}
+            )}),
+        )
+
+    def _mail_out(send_id: str, body: str) -> tuple[LyreMessage, LyreMessage]:
+        return (
+            _assistant_with_tools(
+                {"id": send_id, "name": "mailbox_send",
+                 "input": {"to": "owner", "body": body}}
+            ),
+            _tool_results({"id": send_id, "result": '{"status":"queued"}'}),
+        )
+
+    g1a, g1r = _mail_in(1, "first")
+    s1a, s1r = _mail_out("s1", "ack first")
+    g2a, g2r = _mail_in(2, "second")
+    msgs = [_user("task"), g1a, g1r, s1a, s1r, g2a, g2r]
+    first = await compact_messages(
+        msgs, adapter=StubAdapter(), model="x", keep_last_k=1,
+    )
+    seams_first = [
+        m for m in first
+        if any("[Compact summary" in (b.text or "") for b in m.content)
+    ]
+    assert len(seams_first) == 1
+
+    # Extend with ONLY new mail turns (no shell/python work), recompact.
+    s2a, s2r = _mail_out("s2", "ack second")
+    g3a, g3r = _mail_in(3, "third")
+    extended = first + [s2a, s2r, g3a, g3r]
+    second = await compact_messages(
+        extended, adapter=StubAdapter(), model="x", keep_last_k=1,
+    )
+    seams_second = [
+        m for m in second
+        if any("[Compact summary" in (b.text or "") for b in m.content)
+    ]
+    # The single prior seam is carried forward; no fresh empty seam added.
+    assert len(seams_second) == 1
+
+
+@pytest.mark.asyncio
 async def test_compact_chronological_order_preserved() -> None:
     """Synthetic mail-in / mail-out messages must appear in the SAME
     chronological order they did in the elided range. The model relies

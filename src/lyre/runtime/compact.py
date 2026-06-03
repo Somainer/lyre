@@ -124,13 +124,31 @@ async def compact_messages(
     elided = list(messages[1:pivot])
     kept_tail = list(messages[pivot:])
 
-    synthetic, work_trace = _extract_synthetic_history(elided)
-    summary_msg = await _make_work_summary_msg(
-        adapter=adapter, model=model, work_trace=work_trace,
-        wakeup_id=wakeup_id, max_tokens=max_summary_tokens,
-    )
+    # Carry forward this function's OWN prior output (synthetic mail + summary
+    # seams from an earlier compaction of the same wakeup) VERBATIM. Without
+    # this, a second compaction re-elides those messages — and because they
+    # carry no tool_use blocks, `_extract_synthetic_history` produces nothing
+    # for them, silently destroying the owner/peer mail that the five laws
+    # require kept verbatim. Only genuinely-new turns since the last compaction
+    # get summarized.
+    carried = [m for m in elided if m.compaction_artifact]
+    fresh = [m for m in elided if not m.compaction_artifact]
 
-    return kept_head + synthetic + [summary_msg] + kept_tail
+    synthetic, work_trace = _extract_synthetic_history(fresh)
+    new_msgs: list[LyreMessage] = carried + synthetic
+    # Emit a summary seam when there's fresh tool work to fold, OR on the
+    # FIRST compaction (carried empty) where the seam marks the elision even
+    # if only mail was elided. A recompaction with no fresh tool work skips
+    # the seam — the carried artifacts already represent the elided history,
+    # so a fresh empty marker would just accrete on every compaction.
+    if work_trace or not carried:
+        summary_msg = await _make_work_summary_msg(
+            adapter=adapter, model=model, work_trace=work_trace,
+            wakeup_id=wakeup_id, max_tokens=max_summary_tokens,
+        )
+        new_msgs.append(summary_msg)
+
+    return kept_head + new_msgs + kept_tail
 
 
 def _extract_synthetic_history(
@@ -221,6 +239,7 @@ def _synth_mail_in(
     return LyreMessage(
         role="user",
         content=[LyreContentBlock(type="text", text=f"{header}\n{body}")],
+        compaction_artifact=True,
     )
 
 
@@ -251,6 +270,7 @@ def _synth_mail_out(tool_input: dict[str, Any]) -> LyreMessage | None:
     return LyreMessage(
         role="assistant",
         content=[LyreContentBlock(type="text", text=f"{header}\n{body}")],
+        compaction_artifact=True,
     )
 
 
@@ -330,6 +350,7 @@ async def _make_work_summary_msg(
         return LyreMessage(
             role="user",
             content=[LyreContentBlock(type="text", text=body)],
+            compaction_artifact=True,
         )
 
     prompt = (
@@ -358,6 +379,7 @@ async def _make_work_summary_msg(
     return LyreMessage(
         role="user",
         content=[LyreContentBlock(type="text", text=body)],
+        compaction_artifact=True,
     )
 
 
