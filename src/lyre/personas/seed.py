@@ -133,6 +133,44 @@ def ensure_user_personas(
     return copied
 
 
+def shipped_persona_names() -> list[str]:
+    """Names of every persona Lyre ships (one per shipped ``<name>.md``)."""
+    return sorted(p.stem for p in _shipped_persona_files())
+
+
+def refresh_user_persona(
+    user_personas_dir: Path, name: str, *, backup: bool = True
+) -> tuple[Path, Path | None]:
+    """Re-copy the shipped ``<name>.md`` over ``<user>/<name>/identity.md``.
+
+    ``ensure_user_personas`` deliberately never overwrites identity.md (it's the
+    user SSOT), so a shipped persona EDIT never reaches an already-onboarded
+    install on its own. This pulls one in on demand, backing up the current
+    identity.md first (unless ``backup=False``) so local edits survive. Personas
+    are read straight from the filesystem, so the change is live on the next
+    wakeup. Returns ``(identity_path, backup_path_or_None)``; raises
+    ``KeyError`` if no shipped persona has that name.
+    """
+    shipped = {p.stem: p for p in _shipped_persona_files()}
+    src = shipped.get(name)
+    if src is None:
+        raise KeyError(name)
+    dest_dir = user_personas_dir / name
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    identity = dest_dir / "identity.md"
+    bak: Path | None = None
+    if identity.exists() and backup:
+        ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        bak = dest_dir / f"identity.md.bak-{ts}"
+        shutil.copy(identity, bak)
+    shutil.copy(src, identity)
+    # Heal the companion APPEND.md slot if missing (mirrors ensure_user_personas).
+    append_target = dest_dir / "APPEND.md"
+    if not append_target.exists():
+        append_target.write_text(APPEND_TEMPLATE, encoding="utf-8")
+    return identity, bak
+
+
 def discover_persona_files(user_personas_dir: Path | None = None) -> list[Path]:
     """All persona ``*.md`` files Lyre will load.
 

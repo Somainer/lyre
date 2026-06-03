@@ -888,6 +888,14 @@ class SqliteWakeupRepository:
             rows = await cur.fetchall()
         return [self._row_to_wakeup(r) for r in rows]
 
+    async def list_for_task(self, task_id: str, limit: int = 5) -> list[Wakeup]:
+        async with self.conn.execute(
+            "SELECT * FROM wakeups WHERE task_id = ? ORDER BY started_at DESC LIMIT ?",
+            (task_id, limit),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [self._row_to_wakeup(r) for r in rows]
+
     async def sum_tokens_since(self, since_iso: str) -> tuple[int, int]:
         async with self.conn.execute(
             """
