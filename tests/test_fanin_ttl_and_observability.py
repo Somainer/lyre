@@ -73,6 +73,35 @@ async def _open_group(repos: SqliteRepositories, *, age_hours: float, deadline_h
     return gid
 
 
+async def _make_group(
+    repos: SqliteRepositories,
+    gid: str,
+    coordinator: str,
+    *,
+    age_hours: float,
+    deadline_hours: float,
+) -> None:
+    """One open group under an existing `coordinator`, created `age_hours` ago
+    with its own deadline `deadline_hours` out — for building a multi-group
+    backlog (negative deadline_hours = past)."""
+    await repos.fan_in.create_group(
+        FanInGroup(
+            id=gid,
+            coordinator_agent_id=coordinator,
+            parent_task_id=None,
+            expect_replies=2,
+            quorum=2,
+            result_schema={"type": "object"},
+            deadline=now_utc() + timedelta(hours=deadline_hours),
+        )
+    )
+    backdated = (now_utc() - timedelta(hours=age_hours)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    await repos.fan_in.conn.execute(
+        "UPDATE fan_in_groups SET created_at = ? WHERE id = ?", (backdated, gid)
+    )
+    await repos.fan_in.conn.commit()
+
+
 # --------------------------------------------------------------------------
 # (1) global TTL
 # --------------------------------------------------------------------------
@@ -129,6 +158,39 @@ async def test_deadline_still_closes_when_ttl_disabled(
     msgs = await repos.mailbox.read_unread("coordinator-1", min_urgency="low", limit=10)
     ready = [m for m in msgs if (m.metadata or {}).get("fan_in_resolved") == gid]
     assert ready[0].metadata.get("trigger") == "deadline"
+
+
+@pytest.mark.asyncio
+async def test_global_ttl_expires_age_expired_group_buried_behind_full_deadline_page(
+    repos: SqliteRepositories, tmp_path: Path
+) -> None:
+    """Under load (>20 open groups) the global ceiling must STILL be enforced.
+
+    Regression: find_open(limit=20) is deadline-ordered, so an age-expired group
+    whose own deadline is far in the future sorts to position 21+ and never
+    reached the TTL check — the global cap silently stopped applying under load.
+    """
+    await repos.agents.create("coordinator-1", "dispatcher", parent_agent_id="owner")
+    # The straggler: 2h old (> 1h cap), but deadline 10h out → sorts dead last.
+    await _make_group(repos, "old", "coordinator-1", age_hours=2, deadline_hours=10)
+    # 25 fresh groups with EARLIER deadlines fill the 20-row deadline page and
+    # bury "old" at position 26 — none are age-expired, quorum-met, or overdue.
+    for i in range(25):
+        await _make_group(
+            repos, f"young-{i}", "coordinator-1", age_hours=0, deadline_hours=1 + i * 0.1
+        )
+    sched = _scheduler(repos, tmp_path, fanin_max_age_s=3600)  # 1h cap
+    await sched._resolve_fan_in_barriers()
+
+    old = await repos.fan_in.get("old")
+    assert old is not None and old.status == "expired"
+    msgs = await repos.mailbox.read_unread("coordinator-1", min_urgency="low", limit=50)
+    ready = [m for m in msgs if (m.metadata or {}).get("fan_in_resolved") == "old"]
+    assert len(ready) == 1 and ready[0].metadata.get("trigger") == "ttl"
+    # The fresh, in-deadline groups are untouched (not past their own deadline).
+    for i in range(25):
+        g = await repos.fan_in.get(f"young-{i}")
+        assert g is not None and g.status == "open"
 
 
 # --------------------------------------------------------------------------

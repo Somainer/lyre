@@ -600,7 +600,15 @@ class FanInRepository(Protocol):
     async def get_member(self, group_id: str, leg_key: int) -> FanInMember | None: ...
     async def members(self, group_id: str) -> list[FanInMember]: ...
     async def any_open(self) -> bool: ...
-    async def find_open(self, limit: int = 20) -> list[FanInGroup]: ...
+    async def find_open(
+        self, limit: int = 20, ttl_cutoff: datetime | None = None
+    ) -> list[FanInGroup]:
+        """The ``limit`` soonest-deadline open groups, PLUS — when
+        ``ttl_cutoff`` is given — every open group created before it. The
+        union guarantees groups past the global TTL surface even when more
+        than ``limit`` younger groups with earlier deadlines fill the
+        deadline-sorted page."""
+        ...
     async def set_status(
         self, group_id: str, status: str, *, guard: str | None = None
     ) -> bool:
