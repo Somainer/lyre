@@ -131,7 +131,7 @@ working copy。
 不带 git_context → worker 进去就是空 tmpdir。适用：
 
 - **调研 / 分析**：实际应该派 analyst，但临时让 worker 跑也行
-- **skill 迁移**：把 `~/.lyre/memory/skills/proposed/<x>/` 整理 / 重命名 / 改格式
+- **skill 迁移**：把 `~/.lyre/skills/proposed/<x>/` 整理 / 重命名 / 改格式
 - **数据处理 / 日志解析 / 文件搬运**：纯 sandbox 操作
 - **跑工具但不改 repo**：比如 `gh issue list` 拿数据回来
 

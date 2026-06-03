@@ -57,15 +57,15 @@ worker 自荐的 skill 草案；未来可能扩展到 spec、文档等。
     若是 Tier-2 风险 → 同时 mailbox_send 给 owner urgency=blocker
 
 【skill 类落地动作】
-- 读 `~/.lyre/memory/skills/proposed/<name>/SKILL.md` 完整内容
+- 读 `~/.lyre/skills/proposed/<name>/SKILL.md` 完整内容
 - 按 checklist 评估
 - 结论：
-  - **approve** → `shell_exec mv ~/.lyre/memory/skills/proposed/<name> ~/.lyre/memory/skills/approved/<name>`
+  - **approve** → `shell_exec mv ~/.lyre/skills/proposed/<name> ~/.lyre/skills/approved/<name>`
     → mailbox_send 给提案 worker：`body="approved skill <name>"`
-  - **reject** → `shell_exec rm -rf ~/.lyre/memory/skills/proposed/<name>`
+  - **reject** → `shell_exec rm -rf ~/.lyre/skills/proposed/<name>`
     → mailbox_send 给 worker：body 写清拒绝理由
   - **revise** → 不动文件 → mailbox_send 给 worker，body 列出具体要改的点
-- 你是仅有的能 `mv` 到 `~/.lyre/memory/skills/approved/` 的 persona
+- 你是仅有的能 `mv` 到 `~/.lyre/skills/approved/` 的 persona
 
 【寻址】
 - 请你 review 的人通常是 worker——回信对象就是 task 来源（可从 mailbox /

@@ -45,12 +45,23 @@ def _resolve_memory_path(ctx: ToolContext, rel_path: str) -> Path:
             f"rel_path must be relative and stay under memory_root; "
             f"got {rel_path!r}"
         )
-    target = (root / rel_path).resolve()
+    # Skills live at ~/.lyre/skills/ — a SIBLING of memory_root, the canonical
+    # PI Agent Skills location (runtime/skills.py + onboard). So a `skills/...`
+    # rel_path resolves under lyre_home (memory_root's parent) and is bounded to
+    # that one dir; everything else stays under memory_root. This lets any
+    # persona read a skill body via read_memory (matching the skills-XML hint),
+    # without widening the sandbox to all of ~/.lyre.
+    if Path(rel_path).parts and Path(rel_path).parts[0] == "skills":
+        allowed = root.parent / "skills"
+        target = (root.parent / rel_path).resolve()
+    else:
+        allowed = root
+        target = (root / rel_path).resolve()
     try:
-        target.relative_to(root)
+        target.relative_to(allowed)
     except ValueError as exc:
         raise ToolError(
-            f"rel_path resolves outside memory_root: {target}"
+            f"rel_path resolves outside its allowed root ({allowed}): {target}"
         ) from exc
     return target
 
@@ -83,10 +94,11 @@ async def _read_memory(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]
 READ_MEMORY = Tool(
     name="read_memory",
     description=(
-        "Read the body of one entry under ~/.lyre/memory/. Read-only, "
-        "sandboxed: rel_path must be relative and resolve under memory_root. "
-        "Use the memory index in your system prompt to discover what's "
-        "readable; then call this with the entry's rel_path."
+        "Read the body of one entry under ~/.lyre/memory/ (or a skill under "
+        "~/.lyre/skills/ via a `skills/...` rel_path). Read-only, sandboxed: "
+        "rel_path must be relative and resolve under memory_root (or the skills "
+        "dir). Use the memory index / skills list in your system prompt to "
+        "discover what's readable; then call this with the entry's rel_path."
     ),
     input_schema={
         "type": "object",

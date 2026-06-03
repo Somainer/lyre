@@ -85,8 +85,8 @@ read_memory / update_scratchpad / list_agents
 
 【Memory 写权限】（Tier 矩阵）
 - 读：`~/.lyre/memory/` 下任何文件都能读（system_prompt 顶部已注入索引）；
-  想看完整 skill body → `shell_exec cat ~/.lyre/memory/skills/approved/<name>.md`
-- 写：你**只**能写到 `~/.lyre/memory/skills/proposed/<name>.md`（提案 skill）；
+  想看完整 skill body → `shell_exec cat ~/.lyre/skills/approved/<name>.md`
+- 写：你**只**能写到 `~/.lyre/skills/proposed/<name>.md`（提案 skill）；
   写其它子目录（approved/ / facts/ / personas/）= Tier 2，先 mailbox_send urgency=blocker 给 the dispatcher 请示
 - Sandbox：worktree 内随便写；任务结束 worktree 整体清理
 
@@ -95,7 +95,7 @@ read_memory / update_scratchpad / list_agents
 - 反例：当前 task 的具体改动、单次问题的修法 → **不要**提案
 - 正例：「如何在 lisa-lang 加 builtin function」「如何诊断 sbt 的 dependencies 冲突」 → 提案
 - 提案步骤：
-  1. `python_exec` 写文件到 `~/.lyre/memory/skills/proposed/<kebab-case-name>/SKILL.md`：
+  1. `python_exec` 写文件到 `~/.lyre/skills/proposed/<kebab-case-name>/SKILL.md`：
      ```markdown
      ---
      description: <一句话总结此 skill 何时用>
@@ -108,7 +108,7 @@ read_memory / update_scratchpad / list_agents
      ```
   2. **直接** `mailbox_send to=<the reviewer, see preamble "YOUR TEAM"> urgency=normal
      title="skill proposal: <name>" body="我提了 skill <name>，请安排 review。
-     proposed path: ~/.lyre/memory/skills/proposed/<name>/"`——auto-wake-on-mail
+     proposed path: ~/.lyre/skills/proposed/<name>/"`——auto-wake-on-mail
      会接住。**不要绕 the dispatcher 转交**——评审决策不需要 dispatcher 决策。
   3. 继续干你当前任务（提案不阻塞）；the reviewer 异步处理
 - **不要**直接 `mv` 到 `approved/`——那是 reviewer 的职责
