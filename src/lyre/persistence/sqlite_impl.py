@@ -1186,6 +1186,31 @@ class SqliteMailboxRepository:
             rows = await cur.fetchall()
         return [self._row_to_msg(r) for r in rows]
 
+    async def list_by_thread(
+        self,
+        thread_id: str,
+        *,
+        participant: str | None = None,
+        limit: int = 20,
+    ) -> list[MailboxMessage]:
+        # Bounded and per-wakeup (not per-tick), so no dedicated index yet; if
+        # mail volume makes this scan hurt, add an expression index on
+        # json_extract(metadata,'$.thread_id') mirroring mailbox_messages_fan_in.
+        clauses = ["json_extract(metadata, '$.thread_id') = ?"]
+        params: list[Any] = [thread_id]
+        if participant is not None:
+            clauses.append("(sender = ? OR recipient = ?)")
+            params.extend([participant, participant])
+        params.append(limit)
+        sql = (
+            f"SELECT * FROM mailbox_messages "
+            f"WHERE {' AND '.join(clauses)} "
+            f"ORDER BY id DESC LIMIT ?"
+        )
+        async with self.conn.execute(sql, tuple(params)) as cur:
+            rows = await cur.fetchall()
+        return [self._row_to_msg(r) for r in rows]
+
     async def count_unread(
         self, recipient: str, *, min_urgency: str | None = None
     ) -> int:
@@ -1606,10 +1631,10 @@ class SqliteScheduledMailRepository:
             INSERT INTO scheduled_mail (
               recipient, sender, urgency, title, body, task_id,
               parent_msg_id, metadata, scheduled_for,
-              recur_kind, recur_value, recur_until,
+              recur_kind, recur_value, recur_until, max_occurrences,
               created_by_agent, created_by_task, status
             )
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending')
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending')
             RETURNING id
             """,
             (
@@ -1625,6 +1650,7 @@ class SqliteScheduledMailRepository:
                 spec.recur_kind,
                 spec.recur_value,
                 _iso(spec.recur_until) if spec.recur_until else None,
+                spec.max_occurrences,
                 spec.created_by_agent,
                 spec.created_by_task,
             ),
@@ -1782,6 +1808,7 @@ class SqliteScheduledMailRepository:
             recur_value=row["recur_value"],
             recur_until=row["recur_until"],
             occurrence_count=row["occurrence_count"],
+            max_occurrences=row["max_occurrences"] if "max_occurrences" in keys else None,
             created_at=row["created_at"],
             created_by_agent=row["created_by_agent"],
             created_by_task=row["created_by_task"],

@@ -383,11 +383,12 @@ async def test_mailbox_read_include_read_does_not_mark(
 
 
 @pytest.mark.asyncio
-async def test_initial_user_message_does_not_inline_recent_sends(
+async def test_initial_user_message_pushes_recent_sends(
     ctx: ToolContext,
 ) -> None:
-    """Trust-the-model: cross-wakeup recall is NOT auto-injected.
-    The agent uses mailbox_read(box="sent") or the notes file instead.
+    """T1 reverses the old trust-the-model call: recent sends ARE pushed into
+    the wakeup. RCA 019e8d7d showed a stateless model won't reliably pull them
+    via mailbox_read(box="sent"), so it forgets what it already promised.
     """
     from lyre.persistence.models import MailboxMessage
     from lyre.runtime.context import assemble_initial_user_message
@@ -410,10 +411,9 @@ async def test_initial_user_message_does_not_inline_recent_sends(
         agent_id=ctx.self_mailbox,
     )
     text = init_msg.content[0].text
-    # Prior sends must NOT appear in the bootstrap message — the agent
-    # asks for them via mailbox_read(box="sent") when it needs them.
-    assert "I'll investigate /pi" not in text
-    assert "你最近" not in text
+    # The prior send now appears so the agent doesn't re-send / forget it.
+    assert "I'll investigate /pi" in text
+    assert "你最近" in text
 
 
 @pytest.mark.asyncio

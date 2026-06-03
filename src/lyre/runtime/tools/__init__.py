@@ -30,6 +30,10 @@ class ToolContext:
     # both. Tools that absolutely need agent_id (e.g. mailbox defaults)
     # fall back to persona_name when this is None.
     agent_id: str | None = None
+    # The 主线 (thread) this wakeup belongs to, from the running task's
+    # metadata.thread_id. Tools propagate it mechanically: mail sent here and
+    # tasks dispatched here inherit it, so a stateless agent never maintains it.
+    thread_id: str | None = None
     # Extra slots added later (worktree dir, ssh sock, etc.)
     extras: dict[str, Any] = field(default_factory=dict)
 

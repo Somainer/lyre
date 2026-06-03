@@ -516,28 +516,50 @@ def _build_identity_preamble(
     )
 
 
+def _read_scratchpad(
+    memory_root: Path, agent_id: str, *, max_chars: int = 4000
+) -> str | None:
+    """The agent's scratchpad content, capped. ``None`` if absent/empty.
+
+    Path mirrors the preamble's ``memory/scratchpad/<flat-id>.md`` (``/`` → ``-``).
+    """
+    flat_id = agent_id.replace("/", "-")
+    p = memory_root / "scratchpad" / f"{flat_id}.md"
+    if not p.is_file():
+        return None
+    text = p.read_text(encoding="utf-8").strip()
+    if not text:
+        return None
+    if len(text) > max_chars:
+        text = text[:max_chars] + "\n…(truncated — read_memory for the rest)"
+    return text
+
+
 async def assemble_initial_user_message(
     task: Task,
     tasks_repo: TaskRepository | None = None,
     mailbox_repo: Any | None = None,
     agent_id: str | None = None,
+    memory_root: Path | None = None,
 ) -> LyreMessage:
     """Build the initial user-role message for a wakeup.
 
     Composition:
       - task.goal + acceptance + checkpoint (always)
       - subagent children with status (if `tasks_repo` given and any)
+      - the agent's scratchpad CONTENT (if `memory_root` + `agent_id`)
+      - a summary of the agent's recent SENT mail (if `mailbox_repo` + `agent_id`)
 
-    Cross-wakeup recall is NOT inlined here. Agents are stateless across
-    wakeups but have explicit channels for self-recall:
-      - `mailbox_read(box="sent")` to see what they sent / promised
-      - `read_memory` / `shell_exec cat ~/.lyre/memory/...` for notes
-      - report_progress checkpoint (for crash recovery, not visibility)
-    The identity preamble teaches them this. Auto-injecting recent sends
-    is fighting the model's agency.
+    Wakeups are stateless across boundaries, so the runtime PUSHES the agent's
+    own working state (scratchpad) and recent sends into the wakeup instead of
+    relying on it to pull them via read_memory / mailbox_read(box="sent"). The
+    earlier "hand pointers, trust the model's agency" approach failed in
+    practice — RCA 019e8d7d: a stateless dispatcher forgot what it had already
+    sent and gave the owner a wrong, self-referential task status. Kept bounded
+    (scratchpad capped, only the last few send headers) so it grounds without
+    drowning; the identity preamble still teaches the pull tools for going
+    deeper.
     """
-    del mailbox_repo, agent_id  # No longer auto-inlined; reserved in sig.
-
     body = f"""【任务 goal】
 {task.goal}
 
@@ -558,5 +580,43 @@ async def assemble_initial_user_message(
                 "\n用 query_task_status(<id>) 拿任意子任务的完整 checkpoint / "
                 "wakeup 记录。\n"
             )
+
+    # Push the agent's own working memory in (don't make a stateless model
+    # remember to go read it — that's the amnesia the RCA exposed).
+    if agent_id and memory_root is not None:
+        scratch = _read_scratchpad(memory_root, agent_id)
+        if scratch:
+            body += (
+                "\n\n【你的 scratchpad（上次 wakeup 留下的工作记忆，先读这个）】\n"
+                f"{scratch}\n"
+            )
+
+    if mailbox_repo is not None and agent_id:
+        sent = await mailbox_repo.list_sent_by(agent_id, limit=5)
+        if sent:
+            body += "\n\n【你最近发出的信（别重复、别忘了已许的承诺）】\n"
+            for m in sent:
+                ts = m.delivered_at.strftime("%m-%d %H:%M") if m.delivered_at else "?"
+                body += f"- → {m.recipient} [{ts}] {m.title or '(无标题)'}\n"
+            body += "完整正文用 mailbox_read(box=\"sent\") / mailbox_get_message。\n"
+
+    # T3: if this wakeup is on a 主线, surface that thread's recent back-and-forth
+    # (both directions, this agent's view). A stateless model juggling several
+    # main-lines won't reliably pull the RIGHT thread's mail itself.
+    thread_id = (task.metadata or {}).get("thread_id")
+    if thread_id and mailbox_repo is not None:
+        thread_mail = await mailbox_repo.list_by_thread(
+            thread_id, participant=agent_id, limit=12
+        )
+        if thread_mail:
+            body += f"\n\n【本主线（thread {thread_id}）近期往来——你在跟进这条线】\n"
+            for m in thread_mail:
+                ts = m.delivered_at.strftime("%m-%d %H:%M") if m.delivered_at else "?"
+                if agent_id is not None and m.sender == agent_id:
+                    arrow, who = "→", m.recipient
+                else:
+                    arrow, who = "←", m.sender
+                body += f"- {arrow} {who} [{ts}] {m.title or '(无标题)'}\n"
+            body += "完整正文用 mailbox_get_message(msg_id)。\n"
 
     return LyreMessage(role="user", content=[LyreContentBlock(type="text", text=body)])

@@ -102,6 +102,11 @@ async def _dispatch_task(ctx: ToolContext, args: dict[str, Any]) -> dict[str, An
         }
         fan_in_slot = (fg, lk)
 
+    # Inherit the dispatching wakeup's 主线 so the child task — and every wakeup
+    # it runs — stays on-thread. Mechanical; the agent never sets it by hand.
+    if ctx.thread_id is not None and (metadata is None or "thread_id" not in metadata):
+        metadata = {**(metadata or {}), "thread_id": ctx.thread_id}
+
     git_ctx_arg = args.get("git_context")
     git_ctx: GitContext | None = None
     if git_ctx_arg is not None:

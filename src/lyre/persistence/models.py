@@ -278,6 +278,8 @@ class ScheduledMail(BaseModel):
     recur_value: str | None = None
     recur_until: datetime | None = None
     occurrence_count: int = 0
+    # Loop budget (T4): max recurrences the scheduler fires (None = unbounded).
+    max_occurrences: int | None = None
 
     created_at: datetime | None = None
     created_by_agent: str | None = None

@@ -271,6 +271,11 @@ CREATE TABLE IF NOT EXISTS scheduled_mail (
   recur_value       TEXT,
   recur_until       TEXT,             -- NULL = no horizon
   occurrence_count  INTEGER NOT NULL DEFAULT 0,
+  -- Loop budget (T4): cap how many recurrences the scheduler will fire. NULL =
+  -- unbounded (recur_until still applies). Phase -1 stops re-arming once the cap
+  -- is reached and marks the final wake high-urgency, so a "loop" (a recurring
+  -- self-mail) can't re-arm forever regardless of what the model wants.
+  max_occurrences   INTEGER,
   created_at        TEXT NOT NULL
                     DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   created_by_agent  TEXT,

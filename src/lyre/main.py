@@ -659,12 +659,18 @@ def dashboard_cmd(host: str, port: int) -> None:
          "spawning the agent on the fly. Use when you want a strict "
          "'this agent must already exist' check.",
 )
+@click.option(
+    "--thread-id", "thread_id", default=None,
+    help="主线 (thread) id to attach / continue. Omitted → a new thread is "
+         "minted. The runtime then carries it through replies, dispatched "
+         "tasks, and result-mail so an agent's wakeups stay on-thread.",
+)
 def send_cmd(
     recipient: str, body: str, title: str | None,
     urgency: str, sender: str, task_id: str | None,
     deliver_at: str | None, deliver_in: str | None,
     recur_every: str | None, recur_cron: str | None, recur_until: str | None,
-    no_spawn: bool,
+    no_spawn: bool, thread_id: str | None,
 ) -> None:
     """Send a mailbox message to an agent.
 
@@ -691,6 +697,9 @@ def send_cmd(
                 personas_dir=cfg.user_personas_dir,
                 persona_overrides=cfg.persona_overrides,
             )
+            # Owner seeds a 主线: continue an explicit one, else mint a fresh
+            # thread for this concern. Propagation downstream is the runtime's.
+            thread = thread_id or f"thread-{_uuid.uuid4().hex[:16]}"
             # Resolve / auto-spawn:
             #   - "owner": always valid (human mailbox at the edge)
             #   - bare bootstrap id: must exist (no spawning bootstrap agents)
@@ -826,6 +835,7 @@ def send_cmd(
                         recur_value=recur_value,
                         recur_until=ru,
                         created_by_agent=sender,
+                        metadata={"thread_id": thread},
                     )
                 )
                 click.echo(
@@ -837,6 +847,7 @@ def send_cmd(
                         f"  recurring: {recur_kind}={recur_value}"
                         + (f" until {iso(ru)}" if ru else "")
                     )
+                click.echo(f"  thread: {thread}  (reuse with --thread-id to continue)")
                 return
 
             msg = MailboxMessage(
@@ -847,6 +858,7 @@ def send_cmd(
                 title=title,
                 body=body,
                 task_id=task_id,
+                metadata={"thread_id": thread},
             )
             msg_id = await repos.mailbox.insert_message(msg)
             if msg_id < 0:
@@ -856,6 +868,7 @@ def send_cmd(
                 f"sent [{msg_id}] {urgency} from {sender} → {recipient}: "
                 f"{body[:80]}{'…' if len(body) > 80 else ''}"
             )
+            click.echo(f"  thread: {thread}  (reuse with --thread-id to continue)")
 
             # Visibility hint: how this delivery actually reaches the agent.
             if recipient == "owner":
