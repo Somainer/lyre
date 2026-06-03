@@ -167,12 +167,43 @@ async def _query_task_status(ctx: ToolContext, args: dict[str, Any]) -> dict[str
     t = await ctx.repos.tasks.get(task_id)
     if t is None:
         raise ToolError(f"task '{task_id}' not found")
+    # "Is it running?" is answered by an OPEN wakeup row (ended_at IS NULL), not
+    # by task.status — a 'completed' task with no open wakeup is not running.
+    # Returning this (plus the children it spawned) is the 019e8d7d fix: a
+    # coordinator gets evidence instead of inferring run-state from memory.
+    wakeups = await ctx.repos.wakeups.list_for_task(task_id, limit=5)
+    active = next((w for w in wakeups if w.ended_at is None), None)
+    children = await ctx.repos.tasks.find_children(task_id)
     return {
         "id": t.id,
         "persona": t.persona_name,
+        "agent_id": t.agent_id,
         "status": t.status,
+        "is_running": active is not None,
+        "active_wakeup_id": active.id if active else None,
+        # True if this is the very wakeup you're asking from — your own running
+        # session, not delegated work. (Same guard as list_tasks.)
+        "is_current_wakeup": t.id == (ctx.task_id or None),
         "checkpoint": t.checkpoint,
         "parent_task_id": t.parent_task_id,
+        "created_at": t.created_at.isoformat() if t.created_at else None,
+        "updated_at": t.updated_at.isoformat() if t.updated_at else None,
+        "lease_holder": t.lease_holder,
+        "lease_until": t.lease_until.isoformat() if t.lease_until else None,
+        "children": [
+            {"id": c.id, "persona": c.persona_name, "agent_id": c.agent_id, "status": c.status}
+            for c in children
+        ],
+        "recent_wakeups": [
+            {
+                "id": w.id,
+                "started_at": w.started_at.isoformat() if w.started_at else None,
+                "ended_at": w.ended_at.isoformat() if w.ended_at else None,
+                "end_status": w.end_status,
+                "transcript_uri": w.transcript_uri,
+            }
+            for w in wakeups
+        ],
     }
 
 
@@ -274,7 +305,12 @@ DISPATCH_TASK = Tool(
 
 QUERY_TASK_STATUS = Tool(
     name="query_task_status",
-    description="Look up a task's current status and checkpoint.",
+    description=(
+        "Look up a task by id: status, agent_id, is_running (true ONLY if an "
+        "open wakeup exists — not merely status), the children it dispatched, "
+        "checkpoint, and recent wakeups. Verify by id here before telling "
+        "anyone a task is 'running'; status alone is not run-state."
+    ),
     input_schema={
         "type": "object",
         "properties": {"task_id": {"type": "string"}},

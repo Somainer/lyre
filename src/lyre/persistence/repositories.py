@@ -233,6 +233,11 @@ class WakeupRepository(Protocol):
 
     # Dashboard helpers (Sprint D1)
     async def list_recent(self, limit: int = 50) -> list[Wakeup]: ...
+    async def list_for_task(self, task_id: str, limit: int = 5) -> list[Wakeup]:
+        """Wakeups for one task, newest first. Powers the is_running /
+        latest-wakeup views (query_task_status, `lyre status`): an open row
+        (ended_at IS NULL) is the authoritative "this task is running now"."""
+        ...
     async def sum_tokens_since(self, since_iso: str) -> tuple[int, int]:
         """Return (input_tokens, output_tokens) summed across wakeups with
         started_at >= since_iso."""

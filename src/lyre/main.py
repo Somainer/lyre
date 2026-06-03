@@ -432,11 +432,72 @@ def status_cmd(task_id: str) -> None:
             if task is None:
                 click.echo(f"No such task: {task_id}", err=True)
                 sys.exit(1)
-            click.echo(json.dumps(task.model_dump(mode="json"), indent=2, ensure_ascii=False))
+            # The docstring promised wakeups + transcript; deliver them.
+            # Run-state is an open wakeup (ended_at IS NULL), not task.status.
+            wakeups = await repos.wakeups.list_for_task(task_id, limit=10)
+            children = await repos.tasks.find_children(task_id)
+            active = next((w for w in wakeups if w.ended_at is None), None)
+            out = {
+                "task": task.model_dump(mode="json"),
+                "is_running": active is not None,
+                "active_wakeup_id": active.id if active else None,
+                "children": [
+                    {
+                        "id": c.id, "persona": c.persona_name,
+                        "agent_id": c.agent_id, "status": c.status,
+                    }
+                    for c in children
+                ],
+                "wakeups": [w.model_dump(mode="json") for w in wakeups],
+            }
+            click.echo(json.dumps(out, indent=2, ensure_ascii=False))
         finally:
             await conn.close()
 
     asyncio.run(_run())
+
+
+# ----------------------------------------------------------------------
+# lyre persona-refresh <name> — pull a shipped persona update into ~/.lyre
+# ----------------------------------------------------------------------
+
+@cli.command("persona-refresh")
+@click.argument("name", required=False)
+@click.option("--all", "all_personas", is_flag=True, help="Refresh every shipped persona.")
+@click.option(
+    "--backup/--no-backup", default=True, show_default=True,
+    help="Back up the current identity.md before overwriting.",
+)
+def persona_refresh_cmd(name: str | None, all_personas: bool, backup: bool) -> None:
+    """Pull a shipped persona update into ~/.lyre/personas/<name>/identity.md.
+
+    Shipped persona EDITS don't reach an already-onboarded install — identity.md
+    is the user SSOT and onboarding never overwrites it. This re-copies the
+    shipped version on demand, backing up your current identity.md first.
+    Personas are read from the filesystem, so it's live on the next wakeup.
+    """
+    from .personas.seed import refresh_user_persona, shipped_persona_names
+
+    cfg = Config.from_env()
+    known = shipped_persona_names()
+    if all_personas:
+        targets = known
+    elif name:
+        if name not in known:
+            click.echo(
+                f"Unknown shipped persona: {name}. Known: {', '.join(known)}", err=True
+            )
+            sys.exit(1)
+        targets = [name]
+    else:
+        click.echo(f"Pass a persona name or --all. Known: {', '.join(known)}", err=True)
+        sys.exit(1)
+
+    for n in targets:
+        identity, bak = refresh_user_persona(cfg.user_personas_dir, n, backup=backup)
+        if bak is not None:
+            click.echo(f"  backed up: {bak}")
+        click.echo(f"refreshed persona '{n}' -> {identity}")
 
 
 # ----------------------------------------------------------------------
