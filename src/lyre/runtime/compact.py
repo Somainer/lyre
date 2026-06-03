@@ -415,5 +415,12 @@ async def _call_for_summary(
             # `async with ...stream(...)` block, holding the HTTP
             # connection open until GC. aclose() runs GeneratorExit
             # through it, exiting the context; no-op if already exhausted.
-            await stream.aclose()
+            # Guard it (like wakeup_summary._call_for_summary) so a close-time
+            # error can't mask the return value / "" — which would escape to
+            # the agent_loop's compaction_failed path instead of the intended
+            # raw-trace fallback.
+            try:
+                await stream.aclose()
+            except Exception:  # noqa: BLE001
+                pass
     return "".join(pieces).strip()

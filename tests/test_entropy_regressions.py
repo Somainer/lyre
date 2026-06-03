@@ -6,6 +6,8 @@ broken (or untested). All offline — no provider keys, no network.
 
 from __future__ import annotations
 
+import shutil
+import time
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -15,7 +17,8 @@ from anthropic.types import MessageDeltaEvent, MessageStartEvent
 
 from lyre.adapter.anthropic import AnthropicAdapter
 from lyre.adapter.llm_adapter import Usage
-from lyre.persistence.models import OutboxRow
+from lyre.outbox.dispatcher import OutboxDispatcher
+from lyre.persistence.models import OutboxRow, Persona, TaskSpec
 from lyre.persistence.sqlite_impl import SqliteRepositories
 from lyre.runtime.agent_loop import AgentLoop
 from lyre.runtime.health_tracker import HealthTracker
@@ -62,10 +65,11 @@ def test_anthropic_input_tokens_come_from_message_start() -> None:
     assert usage.output_tokens == 50
 
 
-def test_anthropic_usage_defaults_to_zero_without_message_start() -> None:
+def test_anthropic_usage_falls_back_to_delta_then_zero_without_message_start() -> None:
     """No regression for compat endpoints that omit a usable message_start:
-    a delta whose own usage carries input_tokens is still honored as a
-    fallback; otherwise it degrades to 0 (today's behavior)."""
+    a delta whose own usage carries input_tokens is honored as a fallback;
+    if neither source has a value it degrades to 0 (today's behavior)."""
+    # (a) fallback to the delta-supplied count when there was no message_start.
     holder: dict[str, int] = {"input_tokens": 0}
     delta = _fake_event(MessageDeltaEvent)
     delta.delta.stop_reason = None
@@ -75,6 +79,18 @@ def test_anthropic_usage_defaults_to_zero_without_message_start() -> None:
     assert isinstance(usage, Usage)
     assert usage.input_tokens == 99
     assert usage.output_tokens == 7
+
+    # (b) the actual zero floor: no message_start AND the delta's input_tokens
+    # is None (the real wire value) -> 0, never None.
+    holder2: dict[str, int] = {"input_tokens": 0}
+    delta2 = _fake_event(MessageDeltaEvent)
+    delta2.delta.stop_reason = None
+    delta2.usage.output_tokens = 3
+    delta2.usage.input_tokens = None
+    usage2 = AnthropicAdapter._anthropic_to_lyre(delta2, {}, {}, holder2)
+    assert isinstance(usage2, Usage)
+    assert usage2.input_tokens == 0
+    assert usage2.output_tokens == 3
 
 
 # ---------------------------------------------------------------------------
@@ -179,3 +195,92 @@ async def test_dequeue_orders_failed_rows_behind_fresh_mail(
     # sort order — otherwise the poison row starves the batch forever.
     batch = await repos.outbox.dequeue_batch(limit=1)
     assert [r.external_id for r in batch] == ["fresh-1"]
+
+
+# ---------------------------------------------------------------------------
+# git_context._run timeout: a stalled subprocess must surface as a
+#   GitContextError quickly, not pin the single-threaded event loop on an
+#   unbounded post-kill reap (cross-review follow-up to the timeout fix).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_git_context_run_times_out_without_hanging(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if shutil.which("sleep") is None:
+        pytest.skip("requires /bin/sleep")
+    from lyre.runtime import git_context
+
+    monkeypatch.setattr(git_context, "_SUBPROCESS_TIMEOUT_S", 0.2)
+    started = time.monotonic()
+    with pytest.raises(git_context.GitContextError):
+        await git_context._run(["sleep", "5"])
+    # Surfaced as a clean error well within the child's 5s sleep — i.e. the
+    # timeout + bounded reap fired instead of blocking on communicate().
+    assert time.monotonic() - started < 3.0
+
+
+# ---------------------------------------------------------------------------
+# #11: the outbox dispatcher must carry the agent-supplied mail title onto the
+#   delivered message (it used to drop it, so insert_message re-derived the
+#   title from the body — the recipient saw the wrong subject).
+# ---------------------------------------------------------------------------
+
+
+async def _seed_worker(repos: SqliteRepositories) -> tuple[str, str]:
+    await repos.personas.upsert(
+        Persona(name="worker", role_description="w", system_prompt="w")
+    )
+    task_id = await repos.tasks.create(
+        TaskSpec(persona_name="worker", goal="g", acceptance="a")
+    )
+    wakeup_id = await repos.wakeups.start(task_id, "worker")
+    await repos.mailbox.ensure_mailbox("owner")
+    return task_id, wakeup_id
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_preserves_explicit_title(
+    repos: SqliteRepositories,
+) -> None:
+    task_id, wakeup_id = await _seed_worker(repos)
+    await repos.outbox.enqueue([
+        OutboxRow(
+            task_id=task_id, wakeup_id=wakeup_id, kind="mailbox_send",
+            payload={
+                "recipient": "owner", "sender": "worker", "urgency": "normal",
+                "title": "PR #123 ready",
+                "body": "a completely different first line\nmore body",
+                "external_id": f"{wakeup_id}:tu_1",
+            },
+            external_id=f"{wakeup_id}:tu_1",
+        )
+    ])
+    assert await OutboxDispatcher(repos, poll_interval_s=0.01).tick() == 1
+    msgs = await repos.mailbox.read_messages("owner")
+    assert len(msgs) == 1
+    # Explicit title preserved — NOT re-derived from the body's first line.
+    assert msgs[0].title == "PR #123 ready"
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_derives_title_from_body_when_absent(
+    repos: SqliteRepositories,
+) -> None:
+    task_id, wakeup_id = await _seed_worker(repos)
+    await repos.outbox.enqueue([
+        OutboxRow(
+            task_id=task_id, wakeup_id=wakeup_id, kind="mailbox_send",
+            payload={
+                "recipient": "owner", "sender": "worker", "urgency": "normal",
+                "body": "first line becomes the title\nrest",
+                "external_id": f"{wakeup_id}:tu_2",
+            },
+            external_id=f"{wakeup_id}:tu_2",
+        )
+    ])
+    assert await OutboxDispatcher(repos, poll_interval_s=0.01).tick() == 1
+    msgs = await repos.mailbox.read_messages("owner")
+    # None title still derives from the body's first non-empty line (unchanged).
+    assert msgs[0].title == "first line becomes the title"

@@ -320,16 +320,19 @@ def append_env_line(env_path: Path, var_name: str, value: str) -> None:
     # Swap through a sibling temp file (same dir -> same filesystem, so
     # os.replace is atomic) instead of truncate-then-write in place: a crash
     # mid-write must never leave an empty/partial .env that loses every stored
-    # secret. chmod the temp before the rename so secrets are never briefly
-    # visible at default perms. Mirrors blob_store.py's durable-write pattern.
+    # secret. Create the temp with mode 0o600 UP FRONT (os.open O_CREAT) rather
+    # than chmod-after-write: a chmod that fails would otherwise leave the temp
+    # at umask-default perms and os.replace would then install a world-readable
+    # .env over a previously-tight one. Mirrors blob_store.py's durable write.
     new_content = "\n".join(rewritten) + "\n"
     tmp_path = env_path.with_name(env_path.name + ".tmp")
-    tmp_path.write_text(new_content, encoding="utf-8")
+    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
-        tmp_path.chmod(0o600)
-    except OSError:
-        # Best-effort on non-Unix or read-only mounts.
-        pass
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(new_content)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)  # don't leave a .tmp holding the secret
+        raise
     try:
         os.replace(tmp_path, env_path)  # atomic swap; never leaves a partial .env
     except OSError:

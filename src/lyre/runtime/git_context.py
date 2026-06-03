@@ -66,6 +66,33 @@ class GitContextError(RuntimeError):
 # progress. Mirrors shell.py's timeout-then-kill contract so a stalled clone
 # becomes a normal GitContextError instead of a runtime-wide event-loop stall.
 _SUBPROCESS_TIMEOUT_S = 300.0
+# Cap the post-kill pipe drain: `git clone` spawns `ssh` as a grandchild that
+# inherits the stdout/stderr write-end, so an unbounded reap after kill could
+# block until that ssh closes the pipe (a network hang ~ forever) and re-pin
+# the single-threaded scheduler — defeating the timeout. Same bound as shell.py.
+_POST_KILL_DRAIN_S = 5.0
+
+
+def _kill_process_tree(proc: asyncio.subprocess.Process) -> None:
+    """SIGKILL the whole session/process group, not just the leader, so a
+    grandchild (e.g. ssh under git) that inherited the pipe is reaped too.
+    Mirrors shell.py's helper; kept local to avoid a cross-module private import.
+    """
+    if proc.pid is None:
+        return
+    killpg = getattr(os, "killpg", None)
+    getpgid = getattr(os, "getpgid", None)
+    if killpg is not None and getpgid is not None:
+        try:
+            os.killpg(getpgid(proc.pid), signal.SIGKILL)
+            return
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    # Fallback (non-POSIX or killpg failed): kill just the leader.
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        pass
 
 
 async def _run(
@@ -80,18 +107,22 @@ async def _run(
         stderr=asyncio.subprocess.PIPE,
         env=env if env is not None else os.environ.copy(),
         cwd=str(cwd) if cwd is not None else None,
+        start_new_session=True,  # own process group -> killpg reaps grandchildren
     )
     try:
         out, err = await asyncio.wait_for(
             proc.communicate(), timeout=_SUBPROCESS_TIMEOUT_S
         )
     except TimeoutError:
+        # Kill the whole tree, then bound the reap so a pipe-holding grandchild
+        # can't re-block the event loop past the drain budget.
+        _kill_process_tree(proc)
         try:
-            proc.kill()
-        except ProcessLookupError:
+            await asyncio.wait_for(
+                proc.communicate(), timeout=_POST_KILL_DRAIN_S
+            )
+        except TimeoutError:
             pass
-        # Reap so we don't leak a zombie / FDs.
-        await proc.communicate()
         raise GitContextError(
             f"subprocess timed out after {_SUBPROCESS_TIMEOUT_S:.0f}s: "
             f"{' '.join(argv)}"

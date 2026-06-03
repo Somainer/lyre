@@ -959,7 +959,15 @@ class AgentLoop:
                             )
                             break
                 finally:
-                    await stream.aclose()
+                    # Guard cleanup so an aclose() error can neither surface as
+                    # a spurious wakeup failure on the clean interrupt-break path
+                    # nor shadow a real in-flight mid-stream exception.
+                    try:
+                        await stream.aclose()
+                    except Exception:  # noqa: BLE001
+                        log.debug(
+                            "stream_aclose_failed", model=candidate.id, exc_info=True
+                        )
             except Exception as exc:  # noqa: BLE001
                 if self.health:
                     self.health.mark_failure(candidate.id)
