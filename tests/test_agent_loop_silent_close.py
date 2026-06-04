@@ -12,11 +12,13 @@ exhausted + no user-facing tool) and:
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
 
 from lyre.adapter.llm_adapter import (
+    ContentDelta,
     LyreContentBlock,
     LyreMessage,
     ToolUseComplete,
@@ -349,3 +351,117 @@ async def test_loop_continues_after_tool_use_with_end_turn_stop_reason(
     assert has_tool_result, "turn 2 must show the model the tool_result"
     assert result.status == "completed"
     assert result.turns == 2
+
+
+class _FakeBlocker:
+    """Minimal blocker-watcher surface the loop touches (signal /
+    has_blocker_pending / acknowledge). Tripped deterministically from inside
+    the stream so no sleep race is needed."""
+
+    def __init__(self, mail: list[MailboxMessage]):
+        self.signal = asyncio.Event()
+        self.has_blocker_pending = False
+        self._mail = mail
+
+    def trigger(self) -> None:
+        self.has_blocker_pending = True
+        self.signal.set()
+
+    def acknowledge(self) -> list[MailboxMessage]:
+        self.signal.clear()
+        self.has_blocker_pending = False
+        return list(self._mail)
+
+
+class _DrainInterruptAdapter:
+    """Turn 1 emits mailbox_read + mailbox_send, then trips the blocker so the
+    mid-stream interrupt fires AFTER both tool_uses are received — forcing them
+    through the loop's interrupt-DRAIN path (not the main path). Turns 2-4 are
+    info-gathering mailbox_read+end_turn (the pattern that accumulates the
+    silent-turn nudge budget); turn 5 is a no-tool end_turn that breaks out into
+    the silent_close check. Pre-fix the drained send never set
+    made_user_facing_action, so the nudges exhausted and silent_close fired."""
+
+    def __init__(self, blocker: _FakeBlocker):
+        self._blocker = blocker
+        self._call = 0
+
+    async def stream_turn(
+        self, messages, tools, model, max_tokens=4096, temperature=None, system=None
+    ):
+        self._call += 1
+        if self._call == 1:
+            yield ToolUseComplete(id="tu_read_1", name="mailbox_read", input={})
+            yield ToolUseComplete(
+                id="tu_send",
+                name="mailbox_send",
+                input={"recipient": "owner", "body": "here is your reply"},
+            )
+            # Trip the blocker now: the loop's interrupt check after the NEXT
+            # event breaks into the drain path with both tool_uses queued.
+            self._blocker.trigger()
+            yield ContentDelta(text="...")
+            yield Usage(input_tokens=50, output_tokens=5)
+            yield TurnComplete(stop_reason="end_turn")
+        elif self._call <= 4:
+            # Info-gathering turns: a tool call + end_turn is what trips the
+            # silent-turn nudge (only when made_user_facing_action is False).
+            yield ToolUseComplete(
+                id=f"tu_read_{self._call}", name="mailbox_read", input={}
+            )
+            yield Usage(input_tokens=50, output_tokens=5)
+            yield TurnComplete(stop_reason="end_turn")
+        else:
+            # No-tool turn -> the loop breaks out and runs the silent_close check.
+            yield ContentDelta(text="done")
+            yield TurnComplete(stop_reason="end_turn")
+
+
+@pytest.mark.asyncio
+async def test_mailbox_send_in_drain_path_skips_silent_close(
+    silent_setup, repos: SqliteRepositories
+) -> None:
+    """Regression for the interrupt-drain `made_user_facing_action` fix: if the
+    model's mailbox_send (a real reply) is dispatched in the mid-stream-interrupt
+    drain path, the silent_close apology must NOT fire — even though askers were
+    read. Pre-fix the drain path never set made_user_facing_action, so the nudge
+    budget exhausted and a spurious 'couldn't reply' email went to the asker who
+    actually got a reply."""
+    _unused_adapter, ctx, transcript = silent_setup
+    blocker = _FakeBlocker(
+        [
+            MailboxMessage(
+                id=999, recipient="worker", external_id="b-mid",
+                sender="owner", urgency="blocker", body="STOP",
+            )
+        ]
+    )
+    adapter = _DrainInterruptAdapter(blocker)  # ONE instance (adapter_for runs per turn)
+    loop = AgentLoop(
+        candidates=[fake_entry(id="m")],
+        adapter_for=lambda e: adapter,
+        model_name_for=lambda e: e.id,
+        transcript=transcript,
+        tool_registry=build_default_registry(),
+        tool_context=ctx,
+        allowed_tools=["mailbox_read", "mailbox_send", "mark_read"],
+        blocker_watcher=blocker,
+        max_turns=8,
+    )
+    result = await loop.run(
+        system_prompt="",
+        initial_messages=[
+            LyreMessage(role="user", content=[LyreContentBlock(type="text", text="go")])
+        ],
+    )
+    transcript.close()
+
+    # The send really went through the mid-stream drain path...
+    assert any(ev["where"] == "mid_stream" for ev in result.interrupt_events)
+    # ...so no spurious silent_close apology fires.
+    assert result.status != "silent_close"
+    rows = await repos.outbox.dequeue_batch(limit=50)
+    silent_close_rows = [
+        r for r in rows if (r.payload.get("metadata") or {}).get("silent_close")
+    ]
+    assert not silent_close_rows

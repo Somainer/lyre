@@ -27,6 +27,13 @@ log = structlog.get_logger()
 
 _TIER1_SUBSCRIBERS_FALLBACK = ["owner"]
 
+# Poison-row signal: once a single undispatched outbox row has failed this
+# many times it is almost certainly stuck (bad payload, dead channel). It
+# is STILL retried every tick (delivery semantics unchanged) but we escalate
+# from per-tick warning to a single error so an operator notices instead of
+# it scrolling by forever.
+_POISON_ATTEMPT_THRESHOLD = 5
+
 
 class OutboxDispatcher:
     def __init__(
@@ -102,12 +109,22 @@ class OutboxDispatcher:
             except Exception as exc:  # noqa: BLE001
                 if row.id is not None:
                     await self.repos.outbox.mark_failed(row.id, repr(exc))
+                attempts = row.dispatch_attempts + 1  # +1 = the failure we just recorded
                 log.warning(
                     "outbox_dispatch_failed",
                     row_id=row.id,
                     kind=row.kind,
+                    attempts=attempts,
                     error=str(exc),
                 )
+                if attempts >= _POISON_ATTEMPT_THRESHOLD:
+                    log.error(
+                        "outbox_dispatch_poison",
+                        row_id=row.id,
+                        kind=row.kind,
+                        attempts=attempts,
+                        last_error=repr(exc),
+                    )
         return dispatched
 
     async def _dispatch_one(self, row: OutboxRow) -> None:
@@ -132,6 +149,7 @@ class OutboxDispatcher:
             external_id=payload.get("external_id") or row.external_id,
             sender=payload.get("sender") or "system",
             urgency=payload.get("urgency", "normal"),
+            title=payload.get("title"),  # restore agent-supplied subject; None -> insert_message derives from body
             body=payload.get("body") or "",
             task_id=payload.get("task_id") or row.task_id,
             parent_msg_id=payload.get("parent_msg_id"),

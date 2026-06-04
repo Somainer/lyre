@@ -168,7 +168,7 @@ async def test_dispatch_tool_detects_raw_fallback(tmp_path: Path) -> None:
         health=HealthTracker(),
     )
 
-    out, is_error = await loop._dispatch_tool(
+    out, is_error, _view = await loop._dispatch_tool(
         name="python_exec",
         tool_use_id="tu_truncated",
         tool_input={"_raw": '{"code": "print(\\"hello'},  # truncated JSON
@@ -219,7 +219,7 @@ async def test_dispatch_tool_passes_through_well_formed_args(
     # to the handler (which will then complain about the missing
     # ``code`` field — that's the handler's job, not the dispatch
     # layer's).
-    out, is_error = await loop._dispatch_tool(
+    out, is_error, _view = await loop._dispatch_tool(
         name="python_exec",
         tool_use_id="tu_mixed",
         tool_input={"_raw": "leftover bytes", "code": "print(1)"},

@@ -22,6 +22,7 @@ import asyncio
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable
 
+import structlog
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 
@@ -36,6 +37,7 @@ from ..routes.home import _home_card_context
 from . import broadcaster_from, dashboard_broadcaster_from, repos_from, templates_from
 
 router = APIRouter()
+log = structlog.get_logger()
 
 
 # ---------------------------------------------------------------------------
@@ -260,10 +262,10 @@ async def sse_dashboard(
                             "partials/agent_status.html",
                         ).render(active_wakeups=active)),
                     )
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
                 # Don't tear the stream down for a single broken initial
                 # render — the subsequent change events will repopulate.
-                pass
+                log.warning("sse_initial_render_failed", agent_id=agent_id, error=str(exc))
 
         # No broadcaster attached (tests / minimal embedding) — just
         # keepalive until the client disconnects.
@@ -342,7 +344,14 @@ async def sse_dashboard(
                     try:
                         html = await renderer(request, agent_id, minutes)
                         yield _sse_format(event, html)
-                    except Exception:  # noqa: BLE001
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning(
+                            "sse_render_failed",
+                            event=event,
+                            agent_id=agent_id,
+                            minutes=minutes,
+                            error=str(exc),
+                        )
                         continue
                 if stop_signaled:
                     break

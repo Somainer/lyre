@@ -40,6 +40,14 @@ class _FakeStream:
         for e in self._events:
             yield e
 
+    # Mirror the real openai AsyncStream, which is an async context
+    # manager (the adapter now consumes it via `async with`).
+    async def __aenter__(self) -> _FakeStream:
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None:
+        return None
+
 
 def _attach(adapter: OpenAIResponsesAdapter, events: list[Any]) -> None:
     adapter.client = MagicMock()

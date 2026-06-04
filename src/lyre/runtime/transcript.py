@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -84,7 +85,21 @@ class TranscriptWriter:
         self._write({"type": "note", "text": text})
 
     def close(self) -> None:
-        self._fp.close()
+        # flush()/write() only reach the OS page cache, which survives a
+        # process SIGKILL but not a host power loss / kernel panic. The
+        # transcript is the durable cold-tier audit trail the kill-test
+        # relies on, so fsync once at finalization to make the completed
+        # file power-loss-durable without paying fsync per streamed delta.
+        try:
+            self._fp.flush()
+            os.fsync(self._fp.fileno())
+        except OSError:
+            # Non-seekable/already-detached fd, or fs that can't fsync —
+            # degrade to flush-only rather than crash the scheduler's
+            # end-of-wakeup cleanup.
+            pass
+        finally:
+            self._fp.close()
 
     @property
     def uri(self) -> str:

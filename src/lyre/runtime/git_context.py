@@ -62,6 +62,39 @@ class GitContextError(RuntimeError):
     """Raised when git-context provisioning fails."""
 
 
+# Generous ceiling; a clone/keygen that exceeds this is a hang, not slow
+# progress. Mirrors shell.py's timeout-then-kill contract so a stalled clone
+# becomes a normal GitContextError instead of a runtime-wide event-loop stall.
+_SUBPROCESS_TIMEOUT_S = 300.0
+# Cap the post-kill pipe drain: `git clone` spawns `ssh` as a grandchild that
+# inherits the stdout/stderr write-end, so an unbounded reap after kill could
+# block until that ssh closes the pipe (a network hang ~ forever) and re-pin
+# the single-threaded scheduler — defeating the timeout. Same bound as shell.py.
+_POST_KILL_DRAIN_S = 5.0
+
+
+def _kill_process_tree(proc: asyncio.subprocess.Process) -> None:
+    """SIGKILL the whole session/process group, not just the leader, so a
+    grandchild (e.g. ssh under git) that inherited the pipe is reaped too.
+    Mirrors shell.py's helper; kept local to avoid a cross-module private import.
+    """
+    if proc.pid is None:
+        return
+    killpg = getattr(os, "killpg", None)
+    getpgid = getattr(os, "getpgid", None)
+    if killpg is not None and getpgid is not None:
+        try:
+            os.killpg(getpgid(proc.pid), signal.SIGKILL)
+            return
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    # Fallback (non-POSIX or killpg failed): kill just the leader.
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        pass
+
+
 async def _run(
     argv: list[str],
     *,
@@ -74,8 +107,26 @@ async def _run(
         stderr=asyncio.subprocess.PIPE,
         env=env if env is not None else os.environ.copy(),
         cwd=str(cwd) if cwd is not None else None,
+        start_new_session=True,  # own process group -> killpg reaps grandchildren
     )
-    out, err = await proc.communicate()
+    try:
+        out, err = await asyncio.wait_for(
+            proc.communicate(), timeout=_SUBPROCESS_TIMEOUT_S
+        )
+    except TimeoutError:
+        # Kill the whole tree, then bound the reap so a pipe-holding grandchild
+        # can't re-block the event loop past the drain budget.
+        _kill_process_tree(proc)
+        try:
+            await asyncio.wait_for(
+                proc.communicate(), timeout=_POST_KILL_DRAIN_S
+            )
+        except TimeoutError:
+            pass
+        raise GitContextError(
+            f"subprocess timed out after {_SUBPROCESS_TIMEOUT_S:.0f}s: "
+            f"{' '.join(argv)}"
+        ) from None
     return proc.returncode or 0, out, err
 
 
@@ -102,6 +153,19 @@ def _parse_ssh_agent_output(out: bytes) -> tuple[str, int]:
             f"could not parse ssh-agent output: {out!r}"
         )
     return sock, pid
+
+
+def _extract_agent_pid(out: bytes) -> int | None:
+    """Best-effort SSH_AGENT_PID extraction for cleanup of a started
+    agent whose full output we couldn't parse. Returns None if absent."""
+    for raw in out.decode("utf-8", errors="replace").splitlines():
+        line = raw.strip()
+        if line.startswith("SSH_AGENT_PID="):
+            try:
+                return int(line[len("SSH_AGENT_PID="):].split(";", 1)[0])
+            except ValueError:
+                return None
+    return None
 
 
 class GitContextProvisioner:
@@ -175,7 +239,15 @@ class GitContextProvisioner:
                 f"ssh-agent failed (rc={rc}): "
                 f"{err.decode('utf-8', errors='replace')}"
             )
-        sock, pid = _parse_ssh_agent_output(out)
+        try:
+            sock, pid = _parse_ssh_agent_output(out)
+        except GitContextError:
+            # rc==0 means a real ssh-agent is already running; don't orphan
+            # it just because we couldn't fully parse its output.
+            leaked_pid = _extract_agent_pid(out)
+            if leaked_pid is not None:
+                await asyncio.to_thread(self._kill_agent, leaked_pid)
+            raise
 
         agent_env = {
             **os.environ,
@@ -184,7 +256,7 @@ class GitContextProvisioner:
         }
         rc, _out, err = await _run([self.ssh_add, str(priv)], env=agent_env)
         if rc != 0:
-            self._kill_agent(pid)
+            await asyncio.to_thread(self._kill_agent, pid)
             raise GitContextError(
                 f"ssh-add failed (rc={rc}): "
                 f"{err.decode('utf-8', errors='replace')}"
@@ -209,7 +281,7 @@ class GitContextProvisioner:
             env=agent_env,
         )
         if rc != 0:
-            self._kill_agent(pid)
+            await asyncio.to_thread(self._kill_agent, pid)
             raise GitContextError(
                 f"git clone failed (rc={rc}): "
                 f"{err.decode('utf-8', errors='replace')}"
@@ -221,7 +293,7 @@ class GitContextProvisioner:
             env=agent_env,
         )
         if rc != 0:
-            self._kill_agent(pid)
+            await asyncio.to_thread(self._kill_agent, pid)
             raise GitContextError(
                 f"git switch -c {git_context.target_branch} failed "
                 f"(rc={rc}): "
@@ -252,10 +324,10 @@ class GitContextProvisioner:
         """Kill the SSH agent and remove the sibling ssh dir. Worktree
         dir removal is the WorktreeManager's job — kept separate so a
         non-git task path doesn't need to know GitContext exists."""
-        self._kill_agent(handle.ssh_agent_pid)
+        await asyncio.to_thread(self._kill_agent, handle.ssh_agent_pid)
         ssh_dir = handle.ssh_priv_key_path.parent
         if ssh_dir.is_dir():
-            shutil.rmtree(ssh_dir, ignore_errors=True)
+            await asyncio.to_thread(shutil.rmtree, ssh_dir, ignore_errors=True)
         log.info(
             "git_context_cleaned",
             task_id=handle.task_id,

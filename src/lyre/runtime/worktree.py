@@ -24,6 +24,7 @@ can be discarded on success).
 
 from __future__ import annotations
 
+import asyncio
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -77,7 +78,7 @@ class WorktreeManager:
         is the GitContextProvisioner's job, called separately by the
         scheduler."""
         if remove_dir:
-            shutil.rmtree(handle.dir, ignore_errors=True)
+            await asyncio.to_thread(shutil.rmtree, handle.dir, ignore_errors=True)
         log.info(
             "worktree_cleaned",
             task_id=handle.task_id,

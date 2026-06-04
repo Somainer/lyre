@@ -370,6 +370,19 @@ def serve_cmd(
             except asyncio.CancelledError:
                 pass
             finally:
+                # If gather returned via a peer crash (real exception)
+                # rather than cooperative Ctrl-C, the surviving service
+                # tasks are still running on the shared aiosqlite conn.
+                # Stop them cooperatively, then cancel+await as a backstop,
+                # so none issue queries on the connection we close below
+                # (avoids 'operation on a closed database' and 'Task
+                # exception was never retrieved' noise on the crash path).
+                # On clean Ctrl-C every task is already done -> no-op.
+                _stop_all()
+                for t in services:
+                    if not t.done():
+                        t.cancel()
+                await asyncio.gather(*services, return_exceptions=True)
                 # Owner-mail broadcaster runs alongside the enqueuer;
                 # stop it explicitly so its poll task doesn't hold
                 # the loop open after services drain.
@@ -1095,7 +1108,13 @@ def audit_cmd(
             for line in content.splitlines():
                 if not line.strip():
                     continue
-                evt = json.loads(line)
+                # Append-only transcripts are individually fsync'd, but a wakeup
+                # SIGKILLed mid-write can leave a partial trailing JSONL line.
+                # Skip it rather than aborting the whole audit (matches `tail`).
+                try:
+                    evt = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
                 t = evt.get("type")
                 if t == "system":
                     if system:

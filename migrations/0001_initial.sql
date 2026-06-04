@@ -96,6 +96,14 @@ CREATE TABLE IF NOT EXISTS tasks (
 CREATE INDEX IF NOT EXISTS tasks_status_lease ON tasks(status, lease_until);
 CREATE INDEX IF NOT EXISTS tasks_parent ON tasks(parent_task_id);
 CREATE INDEX IF NOT EXISTS tasks_agent_status ON tasks(agent_id, status);
+-- find_active_for_persona filters WHERE persona_name=? AND status IN
+-- ('pending','in_progress','needs_input') — used by the owner-mail CLI path
+-- (main.py) and busy-persona checks. Index-seek on persona_name + status keeps
+-- it O(active) instead of scanning all status-matched rows across personas as
+-- the (retained) completed-task population grows. (Phase-0 auto-wake no longer
+-- runs this per-agent — it uses the agent_id-keyed active_owner_agent_ids bulk
+-- query, served by tasks_agent_status above.)
+CREATE INDEX IF NOT EXISTS tasks_persona_status ON tasks(persona_name, status);
 -- Phase 0.7 (_resume_parked_tasks) scans only parked tasks each tick;
 -- the partial index keeps that O(parked) instead of O(all tasks).
 CREATE INDEX IF NOT EXISTS tasks_resumable

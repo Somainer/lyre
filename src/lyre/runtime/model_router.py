@@ -9,9 +9,10 @@ Per Q9, the selection algorithm:
        - missing any `requires` capability
   3. **Soft rank**: ascending
        a. unhealthy circuit (opened) sinks to the bottom
-       b. tier match: persona.tier == entry.tier ranked before mismatched tiers
-       c. `prefer` ordering: entries listed in persona.prefer get their index
-          as rank; unlisted get a large sentinel
+       b. `prefer` ordering: entries listed in persona.prefer get their index
+          as rank; unlisted get a large sentinel (so a prefer-named model
+          wins even against a tier-matching model not in `prefer`)
+       c. tier match: persona.tier == entry.tier ranked before mismatched tiers
   4. Return the full ranked list. Agent loop tries them in order on per-turn
      transient errors (rate limit / 5xx).
 
@@ -99,8 +100,15 @@ class ModelRouter:
         # user HAS configured a different reachable model. Filtering
         # at the router lets the user-configured entry (with custom
         # headers, or a different env var that IS set) bubble up.
-        unreachable = [e for e in candidates if not entry_reachable(e)]
-        candidates = [e for e in candidates if entry_reachable(e)]
+        # Single pass: evaluate reachability once per entry. entry_reachable
+        # does an os.getenv, and evaluating it twice (once per list) both
+        # double-reads the env and opens a window where a mid-select env
+        # mutation could land an entry in neither/both lists.
+        reachable: list[ModelEntry] = []
+        unreachable: list[ModelEntry] = []
+        for e in candidates:
+            (reachable if entry_reachable(e) else unreachable).append(e)
+        candidates = reachable
         if not candidates:
             blocked_ids = ", ".join(e.id for e in unreachable)
             raise NoEligibleModelError(

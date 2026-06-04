@@ -130,13 +130,19 @@ async def _dispatch_task(ctx: ToolContext, args: dict[str, Any]) -> dict[str, An
             base_branch=base_branch,
         )
 
+    raw_lease = args.get("lease_duration_s", 1800)
+    try:
+        lease_duration_s = int(raw_lease)
+    except (TypeError, ValueError):
+        raise ToolError(f"lease_duration_s must be an integer (got {raw_lease!r})") from None
+
     spec = TaskSpec(
         agent_id=resolved_agent_id,
         persona_name=resolved_persona,
         goal=goal,
         acceptance=acceptance,
         parent_task_id=ctx.task_id,
-        lease_duration_s=int(args.get("lease_duration_s", 1800)),
+        lease_duration_s=lease_duration_s,
         deadline=None,
         metadata=metadata,
         git_context=git_ctx,

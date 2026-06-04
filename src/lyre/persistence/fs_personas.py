@@ -34,7 +34,7 @@ profile.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, get_args
 
 import structlog
 
@@ -42,7 +42,7 @@ from ..personas.seed import (
     _parse_markdown_with_frontmatter,
     load_persona_from_file,
 )
-from .models import Persona
+from .models import Persona, PersonaStatus
 
 if TYPE_CHECKING:
     from ..config import PersonaOverride
@@ -101,6 +101,18 @@ def _serialize_persona(persona: Persona) -> str:
         + "---\n\n"
         + body
     )
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write through a temp file + atomic rename in the same directory so a
+    partial write under SIGKILL / power-loss / ENOSPC can't leave a
+    half-written or empty identity.md. identity.md is the persona SSOT
+    (no DB mirror); a torn write makes load_persona_from_file raise
+    KeyError, which get()/list_active() swallow, silently dropping the
+    persona. Same kill-test fix as runtime/blob_store.py."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
 
 
 class FilesystemPersonaRepository:
@@ -191,7 +203,7 @@ class FilesystemPersonaRepository:
         untouched."""
         path = _persona_identity_path(self.personas_dir, persona.name)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(_serialize_persona(persona), encoding="utf-8")
+        _atomic_write_text(path, _serialize_persona(persona))
 
     async def propose(
         self,
@@ -232,6 +244,15 @@ class FilesystemPersonaRepository:
         """Flip the persona's frontmatter ``status`` and record the
         reviewer. The body is untouched. Idempotent on already-applied
         decisions."""
+        # Fail fast: an out-of-range status would otherwise be written to
+        # disk and only blow up on the NEXT load_persona_from_file (pydantic
+        # ValidationError, a ValueError), which get()/list_active() swallow —
+        # making the persona silently disappear instead of this call failing.
+        allowed = get_args(PersonaStatus)
+        if status not in allowed:
+            raise ValueError(
+                f"invalid persona status {status!r}; expected one of {allowed}"
+            )
         del comment  # not persisted (no field for it); could live in metadata
         path = _persona_identity_path(self.personas_dir, persona_name)
         if not path.is_file():
@@ -249,4 +270,4 @@ class FilesystemPersonaRepository:
             + "---\n\n"
             + body.lstrip("\n")
         )
-        path.write_text(new_text, encoding="utf-8")
+        _atomic_write_text(path, new_text)

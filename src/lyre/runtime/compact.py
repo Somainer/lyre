@@ -34,15 +34,21 @@ from __future__ import annotations
 
 import json as _json
 import re
-from typing import Any
+from collections.abc import AsyncGenerator
+from typing import Any, cast
+
+import structlog
 
 from ..adapter.llm_adapter import (
     ContentDelta,
     LLMAdapter,
     LyreContentBlock,
     LyreMessage,
+    StreamEvent,
     TurnComplete,
 )
+
+log = structlog.get_logger()
 
 # Tool name → policy.
 # "preserve_in"   = synthesize a user message from the tool_result body
@@ -369,19 +375,52 @@ async def _call_for_summary(
         content=[LyreContentBlock(type="text", text=prompt)],
     )
     pieces: list[str] = []
+    stream: AsyncGenerator[StreamEvent, None] | None = None
     try:
-        stream = adapter.stream_turn(
-            messages=[user_msg],
-            tools=[],
-            model=model,
-            max_tokens=max_tokens,
-            system=None,
+        # The protocol types stream_turn as AsyncIterator, but every concrete
+        # adapter implements it as an async generator, so .aclose() is part of
+        # the documented contract; cast so the finally below type-checks.
+        stream = cast(
+            "AsyncGenerator[StreamEvent, None]",
+            adapter.stream_turn(
+                messages=[user_msg],
+                tools=[],
+                model=model,
+                max_tokens=max_tokens,
+                system=None,
+            ),
         )
         async for evt in stream:
             if isinstance(evt, ContentDelta):
                 pieces.append(evt.text)
             elif isinstance(evt, TurnComplete):
                 break
-    except Exception:  # noqa: BLE001 — caller decides what to do
+    except Exception as exc:  # noqa: BLE001 — caller decides what to do
+        # Returning "" triggers the raw-trace fallback in
+        # _make_work_summary_msg, which is correct but invisible: the
+        # agent_loop's compaction_failed handler never fires because
+        # compact_messages still returns "successfully". Log so a
+        # consistently-erroring summary endpoint is diagnosable.
+        log.warning(
+            "compact_summary_call_failed",
+            model=model,
+            error=str(exc),
+            type=type(exc).__name__,
+        )
         return ""
+    finally:
+        if stream is not None:
+            # Eagerly finalize the adapter's async generator. Breaking on
+            # TurnComplete leaves it suspended inside the adapter's
+            # `async with ...stream(...)` block, holding the HTTP
+            # connection open until GC. aclose() runs GeneratorExit
+            # through it, exiting the context; no-op if already exhausted.
+            # Guard it (like wakeup_summary._call_for_summary) so a close-time
+            # error can't mask the return value / "" — which would escape to
+            # the agent_loop's compaction_failed path instead of the intended
+            # raw-trace fallback.
+            try:
+                await stream.aclose()
+            except Exception:  # noqa: BLE001
+                pass
     return "".join(pieces).strip()

@@ -128,74 +128,81 @@ class OpenAIAdapter:
         last_finish: str | None = None
         usage_payload: tuple[int, int] | None = None
 
-        stream = await self.client.chat.completions.create(**kwargs)
-        async for chunk in stream:
-            # Usage sometimes arrives in its own chunk with no choices
-            usage = getattr(chunk, "usage", None)
-            if usage is not None:
-                usage_payload = (
-                    getattr(usage, "prompt_tokens", 0) or 0,
-                    getattr(usage, "completion_tokens", 0) or 0,
-                )
+        # Enter the SDK stream's own async context manager so a
+        # break/GeneratorExit out of the iteration (e.g. the agent loop
+        # bailing on a blocker interrupt) deterministically closes the
+        # underlying HTTP response rather than leaking it until GC.
+        # Matches anthropic.py's `async with self.client.messages.stream`.
+        async with await self.client.chat.completions.create(**kwargs) as stream:
+            async for chunk in stream:
+                # Usage sometimes arrives in its own chunk with no choices
+                usage = getattr(chunk, "usage", None)
+                if usage is not None:
+                    usage_payload = (
+                        getattr(usage, "prompt_tokens", 0) or 0,
+                        getattr(usage, "completion_tokens", 0) or 0,
+                    )
 
-            choices = getattr(chunk, "choices", None) or []
-            if not choices:
-                continue
-            choice = choices[0]
-            delta = getattr(choice, "delta", None)
-            finish_reason = getattr(choice, "finish_reason", None)
+                choices = getattr(chunk, "choices", None) or []
+                if not choices:
+                    continue
+                choice = choices[0]
+                delta = getattr(choice, "delta", None)
+                finish_reason = getattr(choice, "finish_reason", None)
 
-            if delta is not None:
-                # Plain text content
-                text = getattr(delta, "content", None)
-                if text:
-                    yield ContentDelta(text=text)
+                if delta is not None:
+                    # Plain text content
+                    text = getattr(delta, "content", None)
+                    if text:
+                        yield ContentDelta(text=text)
 
-                # Reasoning content (DeepSeek-Reasoner + some OAI-compat
-                # routes). The attribute is non-standard so we fetch
-                # defensively. We accumulate + emit deltas inline so
-                # the dashboard streams thinking in real time.
-                reasoning = getattr(delta, "reasoning_content", None)
-                if reasoning:
-                    reasoning_chunks.append(reasoning)
-                    yield ThinkingDelta(text=reasoning)
+                    # Reasoning content (DeepSeek-Reasoner + some OAI-compat
+                    # routes). The attribute is non-standard so we fetch
+                    # defensively. We accumulate + emit deltas inline so
+                    # the dashboard streams thinking in real time.
+                    reasoning = getattr(delta, "reasoning_content", None)
+                    if reasoning:
+                        reasoning_chunks.append(reasoning)
+                        yield ThinkingDelta(text=reasoning)
 
-                # Tool calls — partial. Each delta.tool_calls[i] carries
-                # an `index`, sometimes an `id`, sometimes a `function.name`
-                # (usually only in the first delta of that call), and
-                # `function.arguments` as a string fragment that builds
-                # up across deltas. When we see the FIRST piece of args
-                # for a buffer we emit ToolUseStart; on every later
-                # piece we emit ToolUseDelta.
-                tool_calls = getattr(delta, "tool_calls", None) or []
-                for tc in tool_calls:
-                    idx = getattr(tc, "index", 0) or 0
-                    buf = tool_buffers.setdefault(idx, {
-                        "id": None, "name": None, "args": "", "started": False,
-                    })
-                    if getattr(tc, "id", None):
-                        buf["id"] = tc.id
-                    fn = getattr(tc, "function", None)
-                    if fn is not None:
-                        if getattr(fn, "name", None):
-                            buf["name"] = fn.name
-                        args = getattr(fn, "arguments", None)
-                        if args is not None:
-                            # Emit Start once we have both id+name (or
-                            # at least name); some providers send id
-                            # later than name.
+                    # Tool calls — partial. Each delta.tool_calls[i] carries
+                    # an `index`, sometimes an `id`, sometimes a `function.name`
+                    # (usually only in the first delta of that call), and
+                    # `function.arguments` as a string fragment that builds
+                    # up across deltas. We emit ToolUseStart as soon as the
+                    # name is known and ToolUseDelta on each args fragment.
+                    tool_calls = getattr(delta, "tool_calls", None) or []
+                    for tc in tool_calls:
+                        idx = getattr(tc, "index", 0) or 0
+                        buf = tool_buffers.setdefault(idx, {
+                            "id": None, "name": None, "args": "", "started": False,
+                        })
+                        if getattr(tc, "id", None):
+                            buf["id"] = tc.id
+                        fn = getattr(tc, "function", None)
+                        if fn is not None:
+                            if getattr(fn, "name", None):
+                                buf["name"] = fn.name
+                            # Emit Start as soon as the name is known, not when
+                            # the first args fragment arrives — a zero-arg tool
+                            # call (or a host that sends name and args in
+                            # separate deltas) must still get a Start before its
+                            # flushed Complete. Matches anthropic.py /
+                            # openai_responses.py, which start on the call item.
                             if not buf["started"] and buf["name"]:
                                 yield ToolUseStart(
                                     id=buf["id"] or "", name=buf["name"]
                                 )
                                 buf["started"] = True
-                            buf["args"] += args
-                            yield ToolUseDelta(
-                                id=buf["id"] or "", input_partial=args
-                            )
+                            args = getattr(fn, "arguments", None)
+                            if args is not None:
+                                buf["args"] += args
+                                yield ToolUseDelta(
+                                    id=buf["id"] or "", input_partial=args
+                                )
 
-            if finish_reason:
-                last_finish = finish_reason
+                if finish_reason:
+                    last_finish = finish_reason
 
         # Stream done. Flush tool buffers → ToolUseComplete. Then emit
         # the aggregated thinking block, usage, and TurnComplete in the

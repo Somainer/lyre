@@ -7,6 +7,7 @@ NotImplementedError. They get filled in during Sprint 1/2 as needed.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import tempfile
@@ -18,6 +19,7 @@ from contextvars import ContextVar
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from weakref import WeakKeyDictionary
 
 import aiosqlite
 
@@ -71,11 +73,39 @@ if TYPE_CHECKING:
 _IN_TRANSACTION: ContextVar[bool] = ContextVar("lyre_in_transaction", default=False)
 
 
+# One asyncio.Lock per aiosqlite.Connection, created lazily. `lyre serve`
+# shares ONE connection across concurrently-running asyncio tasks (scheduler,
+# outbox dispatcher, channels, owner-mail enqueuer, dashboard broadcaster).
+# A SQLite transaction is connection-global, so without this lock an unrelated
+# single-statement commit()/rollback() from another task can fire at an `await`
+# point inside someone else's transaction() body and commit/discard their
+# half-written transaction. The lock serializes only the commit-boundary
+# critical sections; SQLite already serializes the statements themselves onto
+# aiosqlite's single worker thread, so observable results/ordering are unchanged.
+_COMMIT_LOCKS: WeakKeyDictionary[aiosqlite.Connection, asyncio.Lock] = (
+    WeakKeyDictionary()
+)
+
+
+def _commit_lock(conn: aiosqlite.Connection) -> asyncio.Lock:
+    lock = _COMMIT_LOCKS.get(conn)
+    if lock is None:
+        lock = asyncio.Lock()
+        _COMMIT_LOCKS[conn] = lock
+    return lock
+
+
 async def _commit(conn: aiosqlite.Connection) -> None:
     """Commit, unless we're inside a ``repos.transaction()`` block (then the
     block owns the single commit)."""
     if not _IN_TRANSACTION.get():
-        await conn.commit()
+        # Serialize this stand-alone commit against any in-flight transaction()
+        # on the same connection so it cannot land between that transaction's
+        # BEGIN and its COMMIT/ROLLBACK. A `_commit` reached while inside the
+        # current task's transaction() takes the early return above and never
+        # re-acquires (no deadlock).
+        async with _commit_lock(conn):
+            await conn.commit()
 
 
 def _uuid7() -> str:
@@ -103,10 +133,6 @@ def _uuid7() -> str:
         return f"{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:]}"
     except Exception:
         return str(_uuid.uuid4())
-
-
-def _now_iso() -> str:
-    return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
 def _iso(dt: datetime | str | None) -> str | None:
@@ -767,6 +793,23 @@ class SqliteTaskRepository:
         ) as cur:
             rows = await cur.fetchall()
         return [self._row_to_task(r) for r in rows]
+
+    async def active_owner_agent_ids(self) -> set[str]:
+        """agent_ids that currently own a non-terminal task (one bulk query).
+
+        Phase-0 auto-wake uses this to skip agents already busy without a
+        per-agent ``find_active_for_persona`` SELECT in the loop (an N+1).
+        NULL agent_id rows are excluded.
+        """
+        async with self.conn.execute(
+            """
+            SELECT DISTINCT agent_id FROM tasks
+            WHERE agent_id IS NOT NULL
+              AND status IN ('pending', 'in_progress', 'needs_input')
+            """
+        ) as cur:
+            rows = await cur.fetchall()
+        return {r["agent_id"] for r in rows}
 
     @staticmethod
     def _row_to_task(row: aiosqlite.Row) -> Task:
@@ -1433,21 +1476,24 @@ class SqliteMailboxRepository:
     async def add_reaction(
         self, msg_id: int, reactor: str, kind: str,
     ) -> bool:
-        """Idempotent insert into mail_reactions. `INSERT OR IGNORE`
-        relies on the (msg_id, reactor, kind) PK to drop duplicates
-        cleanly, and `changes()` distinguishes "new row" from "already
-        existed" without an extra round-trip."""
-        await self.conn.execute(
+        """Idempotent insert into mail_reactions. The (msg_id, reactor, kind)
+        PK drops duplicates; `ON CONFLICT DO NOTHING RETURNING 1` yields a row
+        only on a genuine insert, so we learn "new row" vs "already existed"
+        from a single statement — no second `changes()` read, which is
+        connection-global and can be clobbered by an interleaved write on the
+        shared connection (inline `serve` runs the dispatcher concurrently)."""
+        async with self.conn.execute(
             """
-            INSERT OR IGNORE INTO mail_reactions (msg_id, reactor, kind)
+            INSERT INTO mail_reactions (msg_id, reactor, kind)
             VALUES (?, ?, ?)
+            ON CONFLICT (msg_id, reactor, kind) DO NOTHING
+            RETURNING 1
             """,
             (msg_id, reactor, kind),
-        )
-        async with self.conn.execute("SELECT changes()") as cur:
+        ) as cur:
             row = await cur.fetchone()
         await _commit(self.conn)
-        return bool(row and row[0])
+        return row is not None
 
     async def list_reactions(self, msg_id: int) -> list[MailReaction]:
         async with self.conn.execute(
@@ -1829,16 +1875,23 @@ class SqliteOutboxRepository:
         self.conn = conn
 
     async def enqueue(self, rows: list[OutboxRow]) -> None:
-        for r in rows:
-            await self.conn.execute(
-                """
-                INSERT INTO outbox (
-                  task_id, wakeup_id, kind, payload, external_id
-                ) VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT (kind, external_id) DO NOTHING
-                """,
-                (r.task_id, r.wakeup_id, r.kind, _json(r.payload), r.external_id),
-            )
+        if not rows:
+            return
+        # One executemany instead of N per-row round trips (the single trailing
+        # commit already makes the batch atomic; this only cuts round trips for
+        # multi-recipient sends / broadcasts).
+        await self.conn.executemany(
+            """
+            INSERT INTO outbox (
+              task_id, wakeup_id, kind, payload, external_id
+            ) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT (kind, external_id) DO NOTHING
+            """,
+            [
+                (r.task_id, r.wakeup_id, r.kind, _json(r.payload), r.external_id)
+                for r in rows
+            ],
+        )
         await _commit(self.conn)
 
     async def dequeue_batch(self, limit: int = 100) -> list[OutboxRow]:
@@ -1846,7 +1899,7 @@ class SqliteOutboxRepository:
             """
             SELECT * FROM outbox
             WHERE dispatched_at IS NULL
-            ORDER BY created_at
+            ORDER BY dispatch_attempts ASC, created_at ASC, id ASC
             LIMIT ?
             """,
             (limit,),
@@ -2406,15 +2459,23 @@ class SqliteRepositories:
         that shares the same connection.
         """
         if _IN_TRANSACTION.get():
-            # Already inside a transaction — join it; the outer block commits.
+            # Already inside a transaction — join it; the outer block commits
+            # (and already holds the connection's commit lock).
             yield
             return
-        token = _IN_TRANSACTION.set(True)
-        try:
-            yield
-            await self.conn.commit()
-        except BaseException:
-            await self.conn.rollback()
-            raise
-        finally:
-            _IN_TRANSACTION.reset(token)
+        # Hold the connection commit-lock for the whole BEGIN..COMMIT/ROLLBACK
+        # span so no concurrent task's stand-alone commit can land between this
+        # transaction's first write and its commit (the connection-global SQLite
+        # transaction is shared across all async tasks on this connection).
+        # Inner DAO `_commit`s are no-ops once _IN_TRANSACTION is set, so the
+        # lock is acquired exactly once per outermost block — no re-entrancy.
+        async with _commit_lock(self.conn):
+            token = _IN_TRANSACTION.set(True)
+            try:
+                yield
+                await self.conn.commit()
+            except BaseException:
+                await self.conn.rollback()
+                raise
+            finally:
+                _IN_TRANSACTION.reset(token)
