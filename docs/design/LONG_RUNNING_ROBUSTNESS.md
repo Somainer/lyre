@@ -6,7 +6,7 @@
 >
 > **相关**:[`FOUNDATION.md`](./FOUNDATION.md) 铁律三(kill-test)、铁律四(三档持久层)、铁律五(mailbox 唯一);[`AGENT_RUNTIME.md`](./AGENT_RUNTIME.md) §6 压缩;[`AGENT_THREADS.md`](./AGENT_THREADS.md) push-context(本设计与之互补:T1 管"注入什么进 context",本文管"context 撑爆时怎么收、记忆怎么不膨胀")。
 >
-> **状态**:RB-1、RB-3 已落地;RB-2 设计定稿待实现(见 §6)。
+> **状态**:RB-1、RB-2、RB-3 已落地(见 §6)。
 
 ---
 
@@ -73,11 +73,12 @@ return kept_head + new_msgs + kept_tail
 
 ## 4. RB-2:压缩降级可观测
 
-- `compact_messages` 回传"summary 是否降级"(LLM 调用失败、退化成原始 trace)。最小侵入:返回值由 `list[LyreMessage]` 改为轻量 `CompactionOutcome(messages, summary_degraded: bool)`,或经回调累计。
-- `agent_loop` 把降级计入 wakeup 行(类比既有 `compaction_count`),新增 `compaction_summary_degraded` 计数 + 结构化日志事件。
-- `lyre wakeups list` 透出该计数(类比既有 `--has-compaction` 过滤),使"压缩质量打折"的 wakeup 可被筛出复盘。
+- `compact_messages` 回传 `CompactionOutcome(messages, summary_degraded: bool)`(替代裸 `list[LyreMessage]`)。`summary_degraded` 仅在**有工作要 summarize 但 LLM 调用失败、退化成原始 trace** 时为真;无工作量(只 elide 了 mail)发最小 seam 不算降级。
+- `agent_loop` 把降级累加进 wakeup 行的新指标 `compaction_summary_degraded`(类比既有 `compaction_count`),并在 `compacted` 结构化日志里带 `summary_degraded`。
+- 持久化:`wakeups.compaction_summary_degraded`(单基线就地加列,默认 0)+ `end()` 的 `metering` 字段 + `Wakeup` 模型字段 + 防御性 read-back。
+- `lyre wakeups list` 加 `DEGR` 列 + `--summary-degraded` 过滤(类比既有 `--has-compaction`),使"压缩质量打折"的 wakeup 可被筛出复盘。
 
-不改 agent 契约,纯 runtime + CLI 观测面。
+不改 agent 契约,纯 runtime + 持久化 + CLI 观测面。
 
 ---
 
@@ -97,7 +98,7 @@ return kept_head + new_msgs + kept_tail
 |---|---|---|---|
 | **RB-0** | 设计文档(本文) | review anchor | 落地 |
 | **RB-1** | recompaction 幂等:`LyreMessage.compaction_artifact` + carry-forward;重压缩绝不丢 verbatim mail,只重提炼新工作 | 标记自身产出 / 二次压缩保 mail / 不累积空 seam;既有压缩测试全部不变 | 落地 |
-| **RB-2** | 压缩降级可观测:`compact_messages` 回传 `summary_degraded` → wakeup 行计数 + 结构化日志 + `lyre wakeups list` 透出 | summary 失败→标降级 / 成功→不标 / 多次压缩累加 | 待实现 |
+| **RB-2** | 压缩降级可观测:`compact_messages` 回传 `CompactionOutcome.summary_degraded` → wakeup 行 `compaction_summary_degraded` 计数 + 结构化日志 + `lyre wakeups list` 的 `DEGR` 列 / `--summary-degraded` 过滤 | summary 失败→标降级 / 成功→不标 / 只 elide mail→不标 / wakeups.end 计数 round-trip(缺省→0) | 落地 |
 | **RB-3** | notes 轮转 → cold-archive:超阈最旧条目下沉 `object_store/notes_archive/agent-<id>.md`,hot 留最近 `max//2` + 指针;手写区不动;append-cold-先于-rewrite-hot 保 kill-safe;`notes_max_entries` config(env-beats-toml,默认 0=关) | 超阈轮转 / oldest-first 归档 / 手写区保留 / 阈值内不动 / 阈值 0 关闭 / 无 object store 不动 / 重复归档按 wakeup-id 去重 / 多轮不丢不重 / config 三态 | 落地 |
 
 > **依赖序**:三者独立。RB-1 优先级最高——它是会静默丢数据的缺陷。RB-2 / RB-3 可任意顺序。

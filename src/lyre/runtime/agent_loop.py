@@ -63,6 +63,9 @@ class AgentLoopResult:
     context_peak_tokens: int = 0
     # How many times the wakeup auto-compacted its message history.
     compaction_count: int = 0
+    # Of those compactions, how many had their work-summary LLM call fail and
+    # fall back to the raw tool trace (lossy compaction — see compact.py RB-2).
+    compaction_summary_degraded: int = 0
 
 
 class AllCandidatesFailedError(RuntimeError):
@@ -315,6 +318,7 @@ class AgentLoop:
         # Wakeup row for dashboard display.
         context_peak_tokens = 0
         compaction_count = 0
+        compaction_summary_degraded = 0
 
         interrupt_events: list[dict[str, Any]] = []
         # Silent-turn nudge state: whether THIS wakeup has produced any
@@ -653,7 +657,7 @@ class AgentLoop:
                 )
                 pre_compact_len = len(messages)
                 try:
-                    messages = await compact_messages(
+                    outcome = await compact_messages(
                         messages,
                         adapter=adapter_for_compact,
                         model=model_for_compact,
@@ -670,15 +674,21 @@ class AgentLoop:
                         f"compaction_failed: {type(exc).__name__}: {exc}"
                     )
                 else:
+                    messages = outcome.messages
                     compaction_count += 1
+                    if outcome.summary_degraded:
+                        compaction_summary_degraded += 1
                     self.transcript.note(
                         f"compacted: count={compaction_count}, "
                         f"turn_input={turn_usage[0]}, ctx={ctx_window}, "
                         f"messages: {pre_compact_len} → {len(messages)}"
+                        + (" [summary degraded]" if outcome.summary_degraded else "")
                     )
                     log.info(
                         "compacted",
                         compaction_count=compaction_count,
+                        summary_degraded=outcome.summary_degraded,
+                        compaction_summary_degraded=compaction_summary_degraded,
                         turn_input_tokens=turn_usage[0],
                         context_window=ctx_window,
                         pre_messages=pre_compact_len,
@@ -748,6 +758,7 @@ class AgentLoop:
             interrupt_events=interrupt_events,
             context_peak_tokens=context_peak_tokens,
             compaction_count=compaction_count,
+            compaction_summary_degraded=compaction_summary_degraded,
         )
 
     # ------------------------------------------------------------------

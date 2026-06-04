@@ -249,6 +249,9 @@ class Wakeup(BaseModel):
     # count` is how many times the wakeup auto-compacted mid-flight.
     context_peak_tokens: int | None = None
     compaction_count: int = 0
+    # Of those compactions, how many fell back to the raw tool trace because
+    # the work-summary LLM call failed (>0 means a lossy compaction; RB-2).
+    compaction_summary_degraded: int = 0
 
 
 ScheduledMailStatus = Literal["pending", "completed", "cancelled", "bounced"]

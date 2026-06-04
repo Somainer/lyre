@@ -290,6 +290,45 @@ async def test_wakeup_end_records_metering(repos: SqliteRepositories) -> None:
     assert row["transcript_uri"] == "file:///x"
 
 
+@pytest.mark.asyncio
+async def test_wakeup_end_records_compaction_metrics(
+    repos: SqliteRepositories,
+) -> None:
+    """compaction_count + compaction_summary_degraded (RB-2) round-trip
+    through end(); absent keys default to 0, not NULL."""
+    await repos.personas.upsert(
+        Persona(name="w", role_description="w", system_prompt="w")
+    )
+    task_id = await repos.tasks.create(
+        TaskSpec(persona_name="w", goal="g", acceptance="a")
+    )
+    wakeup_id = await repos.wakeups.start(task_id, "w")
+    await repos.wakeups.end(
+        wakeup_id,
+        end_status="completed",
+        metering={"compaction_count": 3, "compaction_summary_degraded": 1},
+    )
+    async with repos.conn.execute(
+        "SELECT compaction_count, compaction_summary_degraded "
+        "FROM wakeups WHERE id = ?",
+        (wakeup_id,),
+    ) as cur:
+        row = await cur.fetchone()
+    assert row is not None
+    assert row["compaction_count"] == 3
+    assert row["compaction_summary_degraded"] == 1
+
+    # A wakeup ended without the keys defaults the degraded count to 0.
+    w2 = await repos.wakeups.start(task_id, "w")
+    await repos.wakeups.end(w2, end_status="completed", metering={})
+    async with repos.conn.execute(
+        "SELECT compaction_summary_degraded FROM wakeups WHERE id = ?", (w2,)
+    ) as cur:
+        row2 = await cur.fetchone()
+    assert row2 is not None
+    assert row2["compaction_summary_degraded"] == 0
+
+
 # ---------------------------------------------------------------------------
 # Blob metadata (multimodal) — content-addressed binary registry.
 # ---------------------------------------------------------------------------

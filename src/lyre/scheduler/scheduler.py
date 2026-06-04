@@ -1506,6 +1506,9 @@ class Scheduler:
                         "model": result.model_id,
                         "context_peak_tokens": result.context_peak_tokens,
                         "compaction_count": result.compaction_count,
+                        "compaction_summary_degraded": (
+                            result.compaction_summary_degraded
+                        ),
                     },
                 )
                 await self.repos.tasks.update_status(task_id, task_status)

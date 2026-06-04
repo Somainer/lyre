@@ -897,7 +897,8 @@ class SqliteWakeupRepository:
                 model = ?,
                 failure_report = ?,
                 context_peak_tokens = ?,
-                compaction_count = COALESCE(?, 0)
+                compaction_count = COALESCE(?, 0),
+                compaction_summary_degraded = COALESCE(?, 0)
             WHERE id = ?
             """,
             (
@@ -911,6 +912,7 @@ class SqliteWakeupRepository:
                 _json(failure_report),
                 m.get("context_peak_tokens"),
                 m.get("compaction_count"),
+                m.get("compaction_summary_degraded"),
                 wakeup_id,
             ),
         )
@@ -1085,6 +1087,10 @@ class SqliteWakeupRepository:
             compaction_count = r["compaction_count"] or 0
         except (KeyError, IndexError):
             compaction_count = 0
+        try:
+            compaction_summary_degraded = r["compaction_summary_degraded"] or 0
+        except (KeyError, IndexError):
+            compaction_summary_degraded = 0
         return Wakeup(
             id=r["id"],
             task_id=r["task_id"],
@@ -1102,6 +1108,7 @@ class SqliteWakeupRepository:
             transcript_uri=r["transcript_uri"],
             context_peak_tokens=context_peak,
             compaction_count=compaction_count,
+            compaction_summary_degraded=compaction_summary_degraded,
         )
 
 
