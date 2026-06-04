@@ -33,6 +33,7 @@ Env wins over the matching `[scheduler]` key in `config.toml`.
 | `LYRE_MAX_CONCURRENT_TASKS` | Max tasks the scheduler runs in parallel (subprocess mode only; inline mode is serial). `0`/negative clamps to 1. | `4` |
 | `LYRE_IDLE_RECLAIM_AGE` | Seconds of idle (since last wakeup) after which `list_agents` marks a **spawned, non-ephemeral** agent `stale` — a hint the Dispatcher may `archive_agent` it. Pull-only: the runtime never auto-archives on this; bootstrap singletons and ephemeral agents (the reaper's job) are never flagged. `0` disables the hint entirely — fitting Lyre's "agents persist across restarts" default. | `0` (off) |
 | `LYRE_FANIN_MAX_AGE` | Seconds — a **global** fan-in barrier TTL. When `> 0`, Phase 0.5 force-`expired`s any `open` fan_in_group older than this, regardless of the group's own (coordinator-set, up to 24h) `deadline`. A backstop / operator ceiling above the per-group deadline, which remains the always-on liveness. `0` disables it. | `0` (off) |
+| `LYRE_NOTES_MAX_ENTRIES` | Max entries kept in an agent's `## Auto-summary log` before rotation. When `> 0`, each wakeup-end summary append that pushes the section past this count rotates the oldest entries down into the cold-archive tier (`object_store/notes_archive/agent-<id>.md`), keeping the hot notes file bounded so an agent reading its own notes can't blow the context window. The hand-written region above the log header is never touched. `0` disables rotation (notes grow forever). | `0` (off) |
 
 ### Coding backends (external coding agents)
 

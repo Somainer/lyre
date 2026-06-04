@@ -6,7 +6,7 @@
 >
 > **相关**:[`FOUNDATION.md`](./FOUNDATION.md) 铁律三(kill-test)、铁律四(三档持久层)、铁律五(mailbox 唯一);[`AGENT_RUNTIME.md`](./AGENT_RUNTIME.md) §6 压缩;[`AGENT_THREADS.md`](./AGENT_THREADS.md) push-context(本设计与之互补:T1 管"注入什么进 context",本文管"context 撑爆时怎么收、记忆怎么不膨胀")。
 >
-> **状态**:**RB-1 已落地;RB-0(本文)落地;RB-2 / RB-3 设计定稿待实现。** PR 路线见 §6。
+> **状态**:**RB-0(本文)+ RB-1 + RB-3 已落地;RB-2 设计定稿待实现。** PR 路线见 §6。
 
 ---
 
@@ -83,8 +83,8 @@ return kept_head + new_msgs + kept_tail
 
 ## 5. RB-3 解法(待实现):notes 轮转 → cold-archive
 
-- **触发**:`_append_to_notes` 追加后,若 `## Auto-summary log` 区条目数(或字节)超阈值(config `LYRE_NOTES_MAX_ENTRIES`,默认保守值如 200,0=关),触发轮转。
-- **轮转**:把**最旧**的若干条目 append-only 下沉到 `object_store/notes_archive/agent-<id>/<ts>.md`(冷档,只读累积),hot notes 留**最近 N 条** + 一行指针("更早摘要已归档至 <uri>")。**手写区(`## Auto-summary log` header 之前)绝不动**——那是 agent 长期沉淀的领域知识。
+- **触发**:`_append_to_notes` 追加后,若 `## Auto-summary log` 区**条目数**超阈值(config `[scheduler] notes_max_entries` / env `LYRE_NOTES_MAX_ENTRIES`,env-beats-toml;0=关,负数/垃圾→0),触发轮转。
+- **轮转**:把**最旧**的若干条目 append-only 下沉到单文件 `object_store/notes_archive/agent-<id>.md`(冷档,只读累积,oldest-first 便于人读),hot notes 留**最近 `max_entries // 2` 条**(轮转即减半、摊销后续触发频率)+ 一行指针(`> _Earlier auto-summaries archived to …_`)。**手写区(`## Auto-summary log` header 之前)绝不动**——那是 agent 长期沉淀的领域知识。entry 边界用**锚定 + 时间戳定形**的正则识别(`^### <ISO8601Z> · wakeup <hex>$`),模型摘要正文里的散装 `### ` 不会被误判为边界;指针行在重解析前被剥除,绝不累积或被并进尾条目。
 - **kill-safe(铁律三)**:固定写序 **先 append 冷档(fsync)→ 再 rewrite hot 文件(write-temp + rename)**。中途 SIGKILL:冷档已落、hot 未截 → 条目同时在两处 → 下次轮转幂等去重(按 `wakeup` 短 id),至少一次、不丢。rewrite 用临时文件原子 rename,hot 永不半写。
 - **位置**:就在 `wakeup_summary.summarize_and_append` 末尾内联(它本就在 wakeup-finalize 写 notes),**不新增调度器 phase**。需把 `Config.object_store` 路径 thread 进 `summarize_and_append`。
 - **契合铁律四**:notes(global,单调精炼)的陈旧过程条目下沉到 cold-archive(海量、只读、按指针取)——正是三档持久层"只存结论密度、过程密度进冷档"的字面执行。
@@ -98,7 +98,7 @@ return kept_head + new_msgs + kept_tail
 | **RB-0** | 设计文档(本文) | review anchor | ✅ 落地 |
 | **RB-1** | recompaction 幂等:`LyreMessage.compaction_artifact` + carry-forward;重压缩绝不丢 verbatim mail,只重提炼新工作 | 标记自身产出 / 二次压缩保 mail / 不累积空 seam(共 3 个)+ 既有 9 个全绿 | ✅ 落地 |
 | **RB-2** | 压缩降级可观测:`compact_messages` 回传 `summary_degraded` → wakeup 行计数 + 结构化日志 + `lyre wakeups list` 透出 | summary 失败→标降级 / 成功→不标 / 多次压缩累加 | 待实现 |
-| **RB-3** | notes 轮转 → cold-archive:超阈最旧条目下沉 `object_store/notes_archive/`,hot 留最近 N + 指针;手写区不动;append-cold-先于-rewrite-hot 保 kill-safe | 超阈轮转 / 手写区不动 / kill 中途不丢(至少一次幂等)/ 阈值内不动 / 阈值 0 关闭 | 待实现 |
+| **RB-3** | notes 轮转 → cold-archive:超阈最旧条目下沉 `object_store/notes_archive/agent-<id>.md`,hot 留最近 `max//2` + 指针;手写区不动;append-cold-先于-rewrite-hot 保 kill-safe;`notes_max_entries` config(env-beats-toml,默认 0=关) | 超阈轮转 / oldest-first 归档 / 手写区不动 / 阈值内不动 / 阈值 0 关闭 / 无 object store 不动 / 重复归档按 wakeup-id 去重(kill-safe)/ 多轮不丢不重 / config 三态,共 11 个,全绿 | ✅ 落地 |
 
 > **依赖序**:三者独立,RB-1 已先行(最高价值——它是会静默丢数据的 bug)。RB-2 / RB-3 可任意顺序。
 

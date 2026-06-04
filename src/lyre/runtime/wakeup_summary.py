@@ -16,6 +16,9 @@ loads its memory index — no race, no scheduling decision.
 
 from __future__ import annotations
 
+import os
+import re
+import tempfile
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -57,6 +60,8 @@ async def summarize_and_append(
     memory_path: Path,
     router: ModelRouter,
     adapter_for_entry: AdapterForEntry,
+    object_store_path: Path | None = None,
+    notes_max_entries: int = 0,
 ) -> str | None:
     """Run a single cheap-model call, append the result to the agent notes.
 
@@ -116,6 +121,16 @@ async def summarize_and_append(
             agent_id=agent_id,
             wakeup_id=wakeup_id,
             summary=summary,
+        )
+        # Rotate the (now one-longer) auto-summary log down into the
+        # cold-archive tier if it crossed the configured ceiling. Own
+        # guard so a rotation hiccup never masks the successful append —
+        # the summary is already durable on disk.
+        _maybe_rotate_notes(
+            memory_path=memory_path,
+            object_store_path=object_store_path,
+            agent_id=agent_id,
+            max_entries=notes_max_entries,
         )
         log.info(
             "wakeup_summary_appended",
@@ -274,6 +289,143 @@ def _append_to_notes(
     tmp = notes.with_name(notes.name + ".tmp")
     tmp.write_text(new_content, encoding="utf-8")
     tmp.replace(notes)
+
+
+# ---------------------------------------------------------------------------
+# RB-3: notes rotation → cold-archive (LONG_RUNNING_ROBUSTNESS.md §5)
+#
+# The `## Auto-summary log` section grows by one entry per wakeup and is never
+# trimmed; an agent that reads its own notes loads the whole (unbounded) file
+# into context. When `notes_max_entries > 0`, rotate the oldest entries beyond
+# the ceiling down into the cold-archive tier, keeping the hot file bounded.
+# The hand-written region ABOVE the log header is never touched.
+# ---------------------------------------------------------------------------
+
+# An entry header is exactly what `_append_to_notes` writes:
+#   ### 2026-06-04T12:00:00Z · wakeup deadbeef
+# Anchored + timestamp-shaped so a stray "### " inside a model-written summary
+# body can't be mistaken for an entry boundary.
+_ENTRY_HEADER_RE = re.compile(
+    r"^### \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z · wakeup ([0-9a-fA-F]+)\s*$",
+    re.MULTILINE,
+)
+# The pointer line we leave behind after rotating. Stripped before re-parsing
+# so it never accretes or gets absorbed into the trailing entry block.
+_POINTER_RE = re.compile(
+    r"^> _Earlier auto-summaries archived to .*$\n?", re.MULTILINE
+)
+
+
+def _archived_wakeup_ids(archive_file: Path) -> set[str]:
+    """Wakeup ids already present in the cold archive. Best-effort: a read
+    failure returns empty (we'd then re-append, at-least-once with a possible
+    duplicate — tolerable for a research-only archive)."""
+    try:
+        text = archive_file.read_text(encoding="utf-8")
+    except OSError:
+        return set()
+    return {m.group(1) for m in _ENTRY_HEADER_RE.finditer(text)}
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    """Write `text` to `path` via a same-dir temp file + os.replace, so a
+    SIGKILL mid-write never leaves the hot notes half-truncated."""
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".notes-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _maybe_rotate_notes(
+    *,
+    memory_path: Path,
+    object_store_path: Path | None,
+    agent_id: str,
+    max_entries: int,
+) -> None:
+    """Rotate the oldest auto-summary entries to cold-archive if the section
+    exceeds `max_entries`. No-op when disabled (max_entries<=0), no object
+    store configured, or the file/section is small. Best-effort: swallows its
+    own errors (the summary append already succeeded and is durable)."""
+    if max_entries <= 0 or object_store_path is None:
+        return
+    notes = memory_path / "facts" / f"agent-{agent_id}-notes.md"
+    try:
+        if not notes.exists():
+            return
+        text = notes.read_text(encoding="utf-8")
+        marker_pos = text.find(SUMMARY_SECTION_HEADER)
+        if marker_pos < 0:
+            return
+        line_end = text.find("\n", marker_pos)
+        if line_end < 0:
+            return
+        # prefix = hand-written region + the log header line (NEVER rewritten
+        # below the header except for the entries themselves).
+        prefix = text[: line_end + 1]
+        body = _POINTER_RE.sub("", text[line_end + 1 :])
+
+        matches = list(_ENTRY_HEADER_RE.finditer(body))
+        if len(matches) <= max_entries:
+            return
+        leading = body[: matches[0].start()]
+        entries: list[tuple[str, str]] = []  # (wakeup_id, block) — newest-first
+        for i, m in enumerate(matches):
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(body)
+            entries.append((m.group(1), body[m.start() : end]))
+
+        keep_recent = max(1, max_entries // 2)
+        keep = entries[:keep_recent]        # newest
+        overflow = entries[keep_recent:]    # oldest → archive
+
+        # (1) Append overflow to the cold archive FIRST (oldest-first, fsync).
+        # Ordering is the kill-safety hinge: archive-then-rewrite means a crash
+        # between the two re-archives the same overflow next time — deduped by
+        # wakeup id — never loses an entry.
+        archive_dir = object_store_path / "notes_archive"
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        archive_file = archive_dir / f"agent-{agent_id}.md"
+        seen = _archived_wakeup_ids(archive_file)
+        to_archive = [
+            blk for (wid, blk) in reversed(overflow) if wid and wid not in seen
+        ]
+        if to_archive:
+            with open(archive_file, "a", encoding="utf-8") as f:
+                for blk in to_archive:
+                    f.write(blk if blk.endswith("\n") else blk + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+
+        # (2) Rewrite the hot file atomically: kept entries + a pointer to the
+        # archive where the older ones now live.
+        pointer = (
+            f"\n> _Earlier auto-summaries archived to "
+            f"`notes_archive/agent-{agent_id}.md`._\n"
+        )
+        kept_text = "".join(blk for _, blk in keep)
+        _atomic_write(notes, prefix + leading + kept_text + pointer)
+        log.info(
+            "notes_rotated",
+            agent_id=agent_id,
+            kept=len(keep),
+            archived=len(overflow),
+        )
+    except Exception as e:  # noqa: BLE001 — best-effort sidecar, never bubble
+        log.warning(
+            "notes_rotation_failed",
+            agent_id=agent_id,
+            error=str(e),
+            type=type(e).__name__,
+        )
 
 
 # Provided for callers (and tests) that want to construct a synchronous

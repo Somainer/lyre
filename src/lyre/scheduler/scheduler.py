@@ -1551,6 +1551,8 @@ class Scheduler:
                     memory_path=self.config.memory_path,
                     router=self.router,
                     adapter_for_entry=self._adapter_for_entry,
+                    object_store_path=self.config.object_store_path,
+                    notes_max_entries=self.config.notes_max_entries,
                 )
         except Exception as e:  # noqa: BLE001
             log.exception("task_failed", task_id=task_id, error=str(e))

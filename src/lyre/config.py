@@ -355,6 +355,15 @@ class Config:
     # the always-on liveness; this is an opt-in global ceiling for operators who
     # want "no barrier lives past N".
     fanin_max_age_s: int = 0
+    # Per-agent notes rotation threshold (entries in the `## Auto-summary log`
+    # section). When > 0, after each wakeup-end summary append, the oldest
+    # entries beyond this count are rotated down into the cold-archive tier
+    # (`object_store/notes_archive/agent-<id>.md`), keeping the hot notes file
+    # bounded so an agent reading its own notes can't blow the context window.
+    # 0 (default) DISABLES rotation — matches "notes persist forever" until an
+    # operator opts in. The hand-written region (above the log header) is never
+    # touched. See LONG_RUNNING_ROBUSTNESS.md RB-3.
+    notes_max_entries: int = 0
 
     @classmethod
     def from_env(cls) -> Config:
@@ -552,6 +561,22 @@ class Config:
         if fanin_max_age_s < 0:
             fanin_max_age_s = 0
 
+        # ---- per-agent notes rotation threshold ----
+        # [scheduler] notes_max_entries = N; env `LYRE_NOTES_MAX_ENTRIES` wins.
+        # 0 / absent / garbage / negative → disabled (notes never rotated).
+        notes_env = os.environ.get("LYRE_NOTES_MAX_ENTRIES")
+        notes_toml = scheduler_raw.get("notes_max_entries")
+        notes_chosen = notes_env if notes_env is not None else notes_toml
+        if notes_chosen is None:
+            notes_max_entries = 0
+        else:
+            try:
+                notes_max_entries = int(notes_chosen)
+            except (ValueError, TypeError):
+                notes_max_entries = 0
+        if notes_max_entries < 0:
+            notes_max_entries = 0
+
         # ---- coding-agent credential bundles ----
         # [coding_backends.<name>] auth_env = "..." [allowed_personas = [...]].
         # Each entry needs an auth_env; entries missing it are skipped with a
@@ -621,6 +646,7 @@ class Config:
             max_concurrent_tasks=max_concurrent,
             idle_reclaim_age_s=idle_reclaim_age_s,
             fanin_max_age_s=fanin_max_age_s,
+            notes_max_entries=notes_max_entries,
             coding_backends=coding_backends,
         )
 
