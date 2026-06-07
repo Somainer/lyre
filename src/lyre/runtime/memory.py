@@ -79,6 +79,25 @@ class MemoryEntry:
         s = self.frontmatter.get("scope")
         return str(s) if s else None
 
+    def applies_to(self, *, agent_id: str | None, persona_name: str | None) -> bool:
+        """Whether this fact's scope makes it relevant to the given agent.
+
+        C2: reuses the skills scope grammar ('global' | 'persona=<name>' |
+        'agent=<id>'). Existing facts carry FREE-FORM scope strings (e.g.
+        'lisa-lang') that the grammar rejects — those fall back to global
+        (always-applies), so scoping is strictly opt-in and never hides a fact
+        that didn't deliberately scope itself.
+        """
+        # Local import keeps the memory↔skills dependency one-directional and
+        # lazy (skills.py never imports memory.py).
+        from .skills import SkillScope
+
+        try:
+            parsed = SkillScope.parse(self.scope)
+        except ValueError:
+            return True  # free-form / unparseable scope → treat as global
+        return parsed.applies_to(agent_id=agent_id, persona_name=persona_name)
+
 
 def _parse_frontmatter(text: str) -> dict[str, Any]:
     """Parse YAML frontmatter block; tolerate files without it.
@@ -150,6 +169,14 @@ def scan_memory_dir(root: Path) -> list[MemoryEntry]:
             if not path.is_file() or path.suffix != ".md":
                 continue
             if path.name.startswith("."):
+                continue
+            # C3: per-agent private notebooks (facts/agent-<id>-notes.md) are
+            # already pushed to their owner via the identity preamble and are
+            # readable via read_memory. Excluding them from the shared index
+            # stops every agent's "Available global memory" from listing every
+            # OTHER agent's notebook — an unbounded per-prompt token tax that
+            # grows with the system's lifetime agent population.
+            if path.name.startswith("agent-") and path.name.endswith("-notes.md"):
                 continue
             entry = _read_entry(path, kind, root)
             if entry is not None:
@@ -257,10 +284,27 @@ def _format_line(e: MemoryEntry) -> str:
 
 
 def build_memory_index_for_prompt(
-    root: Path, allowed_tools: list[str] | None = None
+    root: Path,
+    allowed_tools: list[str] | None = None,
+    *,
+    agent_id: str | None = None,
+    persona_name: str | None = None,
 ) -> str:
-    """One-shot helper used at wakeup start."""
-    return format_memory_index(scan_memory_dir(root), allowed_tools=allowed_tools)
+    """One-shot helper used at wakeup start.
+
+    C2: when agent_id/persona_name are given, facts are filtered by their
+    scope — only globally-scoped facts (the default for every existing fact)
+    plus facts scoped to this persona/agent are injected. Passing neither
+    keeps the unfiltered behavior, so non-wakeup callers are unaffected.
+    """
+    entries = scan_memory_dir(root)
+    if agent_id is not None or persona_name is not None:
+        entries = [
+            e
+            for e in entries
+            if e.applies_to(agent_id=agent_id, persona_name=persona_name)
+        ]
+    return format_memory_index(entries, allowed_tools=allowed_tools)
 
 
 # ---------------------------------------------------------------------------

@@ -567,7 +567,19 @@ class SqliteTaskRepository:
         )
         await _commit(self.conn)
 
-    async def update_status(self, task_id: str, status: str) -> None:
+    async def update_status(
+        self, task_id: str, status: str, holder_wakeup_id: str | None = None
+    ) -> bool:
+        """Advance a task's status. Returns True iff a row was actually updated.
+
+        A1 fencing: at the TERMINAL call sites, a stale (superseded) worker must
+        not clobber the new lease-holder's status — pass holder_wakeup_id to add
+        ``AND lease_holder=?`` (mirrors update_checkpoint/release_lease). A False
+        return tells the caller it no longer holds the lease, so it can also skip
+        the co-committed task_terminated mail (which would otherwise shadow the
+        new holder's real outcome via external_id dedup). Pre-wakeup callers hold
+        no lease and pass None → unfenced, always True if the row exists.
+        """
         sql = """
             UPDATE tasks SET status = ?,
                              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
@@ -575,8 +587,15 @@ class SqliteTaskRepository:
         if status == "completed":
             sql += ", completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')"
         sql += " WHERE id = ?"
-        await self.conn.execute(sql, (status, task_id))
+        params: list[Any] = [status, task_id]
+        if holder_wakeup_id is not None:
+            sql += " AND lease_holder = ?"
+            params.append(holder_wakeup_id)
+        sql += " RETURNING id"
+        async with self.conn.execute(sql, params) as cur:
+            row = await cur.fetchone()
         await _commit(self.conn)
+        return row is not None
 
     # --- Park / resume seam (scheduler-driven barriers) ------------------
     # A task parked in 'needs_input' is invisible to BOTH find_pending
@@ -629,6 +648,46 @@ class SqliteTaskRepository:
             row = await cur.fetchone()
         await _commit(self.conn)
         return row is not None
+
+    async def request_cancel(self, task_id: str, reason: str | None = None) -> bool:
+        """B2: durably flag a non-terminal task for cooperative cancel. The
+        running wakeup observes the flag at a turn boundary and stops with
+        end_status 'cancelled'; a not-yet-running task cancels on its next
+        wakeup's first turn. Idempotent. Returns True iff a non-terminal row
+        was flagged (False if already terminal or absent)."""
+        async with self.conn.execute(
+            """
+            UPDATE tasks
+            SET metadata = json_set(
+                    json_set(coalesce(metadata, '{}'), '$.cancel_requested', 1),
+                    '$.cancel_reason', ?
+                ),
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+            WHERE id = ? AND status NOT IN ('completed','failed','cancelled')
+            RETURNING id
+            """,
+            (reason or "", task_id),
+        ) as cur:
+            row = await cur.fetchone()
+        await _commit(self.conn)
+        return row is not None
+
+    async def get_cancel_request(self, task_id: str) -> str | None:
+        """B2: the cancel reason if a cooperative cancel was requested for this
+        task, else None. The reason may be the empty string (cancel requested
+        with no reason given) — callers must test ``is not None``, not truthiness."""
+        async with self.conn.execute(
+            """
+            SELECT json_extract(metadata, '$.cancel_requested') AS req,
+                   json_extract(metadata, '$.cancel_reason')    AS reason
+            FROM tasks WHERE id = ?
+            """,
+            (task_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None or not row["req"]:
+            return None
+        return row["reason"] or ""
 
     async def find_resumable(self, limit: int = 20) -> list[Task]:
         """Parked tasks whose resume flag is set — Phase 0.7 flips these back

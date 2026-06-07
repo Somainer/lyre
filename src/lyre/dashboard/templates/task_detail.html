@@ -33,6 +33,22 @@
       <div style="font-size:var(--t-micro);text-transform:uppercase;letter-spacing:0.06em;color:var(--fg-3);margin:var(--s-4) 0 var(--s-2);">Checkpoint</div>
       <pre class="mail-raw">{{ task.checkpoint }}</pre>
     {% endif %}
+
+    {# B2: operator cooperative cancel. Banner if already requested; otherwise
+       a cancel form for non-terminal tasks. #}
+    {% if cancel_requested %}
+      <div style="margin-top:var(--s-4);padding:var(--s-3) var(--s-4);border-radius:var(--r-2);background:var(--warn-bg, #3a2a00);color:var(--warn-fg, #ffcf66);font-size:var(--t-micro);">
+        ⏹ Cancel requested{% if cancel_reason %} — {{ cancel_reason }}{% endif %}. The task stops at its next turn boundary.
+      </div>
+    {% elif task.status in ['pending', 'in_progress', 'needs_input'] %}
+      <form method="post" action="/tasks/{{ task.id }}/cancel"
+            onsubmit="return confirm('Request cooperative cancel of this task? It stops at the next turn boundary.');"
+            style="margin-top:var(--s-4);display:flex;gap:var(--s-2);align-items:center;flex-wrap:wrap;">
+        <input type="text" name="reason" placeholder="reason (optional)"
+               style="flex:1;min-width:180px;max-width:280px;padding:var(--s-2) var(--s-3);border-radius:var(--r-2);border:1px solid var(--border, #333);background:var(--bg-2, #1a1a1a);color:var(--fg-1, #eee);font-size:var(--t-micro);">
+        <button type="submit" class="btn sm" style="color:#ff8080;border-color:#ff8080;">Request cancel</button>
+      </form>
+    {% endif %}
   </div>
 
   <div class="card" style="margin-top:var(--s-5);">

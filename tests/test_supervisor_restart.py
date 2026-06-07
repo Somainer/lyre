@@ -150,6 +150,33 @@ async def test_temporary_failed_child_emits_failure_notice_and_reclaims(
 
 
 @pytest.mark.asyncio
+async def test_restart_does_not_inherit_cancel_flag(
+    repos: SqliteRepositories, tmp_path: Path
+) -> None:
+    """LR2 review finding 1: a B2 cancel flag must NOT propagate into a restart.
+    Otherwise cancelling one leg of a permanent/transient ephemeral reincarnates
+    as 'born cancelled' and storms the agent to death instead of cancelling the
+    leg. Unrelated metadata is still preserved."""
+    await repos.agents.create("coordinator-1", "dispatcher", parent_agent_id="owner")
+    await _ephemeral(repos, "reviewer-1", restart="permanent")
+    await _task(
+        repos, "reviewer-1", status="cancelled",
+        metadata={
+            "cancel_requested": 1, "cancel_reason": "operator", "fan_in_group": "g",
+        },
+    )
+
+    await _scheduler(repos, tmp_path)._reap_ephemeral_agents()
+
+    latest = await repos.tasks.find_latest_task_for_agent("reviewer-1")
+    assert latest is not None and latest.status == "pending"  # restarted clean
+    # The restart must NOT carry the cancel flag (else it cancels on turn 0).
+    assert await repos.tasks.get_cancel_request(latest.id) is None
+    # …but unrelated metadata survives the restart.
+    assert (latest.metadata or {}).get("fan_in_group") == "g"
+
+
+@pytest.mark.asyncio
 async def test_restart_preserves_fan_in_metadata(
     repos: SqliteRepositories, tmp_path: Path
 ) -> None:

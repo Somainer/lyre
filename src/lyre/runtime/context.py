@@ -203,7 +203,13 @@ def assemble_system_prompt(
         effective_lyre_home = memory_root.parent
     if memory_root is not None:
         index_md = build_memory_index_for_prompt(
-            memory_root, allowed_tools=list(persona.allowed_lyre_tools or [])
+            memory_root,
+            allowed_tools=list(persona.allowed_lyre_tools or []),
+            # C2: scope the index to this agent — global facts (the default)
+            # plus any scoped to this persona/agent. Same effective_id +
+            # persona.name the skills block below already filters on.
+            agent_id=effective_id,
+            persona_name=persona.name,
         )
         if index_md:
             parts.append("")

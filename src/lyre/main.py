@@ -1898,6 +1898,50 @@ def tasks_list_cmd(
     asyncio.run(_run())
 
 
+@tasks_group.command("cancel")
+@click.argument("task_id")
+@click.option("--reason", default=None, help="Why you're cancelling (recorded).")
+def tasks_cancel_cmd(task_id: str, reason: str | None) -> None:
+    """Request cooperative cancel of a running / pending task.
+
+    The running wakeup observes the request at its next turn boundary, finishes
+    the current turn cleanly, then stops with status 'cancelled' (a
+    task_terminated mail is sent to the supervisor). A not-yet-running task
+    cancels on its next wakeup's first turn. This cancels the TASK, not the
+    agent — the agent stays alive for other work.
+
+    Examples:
+        lyre tasks cancel task_ab12 --reason "wrong approach, will re-dispatch"
+    """
+
+    async def _run() -> None:
+        cfg = Config.from_env()
+        conn = await init_db(cfg.db_path)
+        try:
+            repos = SqliteRepositories(
+                conn,
+                personas_dir=cfg.user_personas_dir,
+                persona_overrides=cfg.persona_overrides,
+            )
+            ok = await repos.tasks.request_cancel(task_id, reason)
+        finally:
+            await conn.close()
+        if ok:
+            click.echo(
+                f"Cancel requested for {task_id}. It will stop at the next "
+                f"turn boundary."
+            )
+        else:
+            click.echo(
+                f"Task {task_id} not found or already terminal — nothing to "
+                f"cancel.",
+                err=True,
+            )
+            sys.exit(1)
+
+    asyncio.run(_run())
+
+
 @cli.group("mail")
 def mail_group() -> None:
     """Manage scheduled (future / recurring) mail."""

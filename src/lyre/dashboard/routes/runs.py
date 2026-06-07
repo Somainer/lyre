@@ -7,8 +7,8 @@ nav slot with a chip switcher. Tasks default. Per-row drill-down to
 
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi import APIRouter, Form, HTTPException, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
 from starlette.templating import _TemplateResponse
 
 from . import repos_from, templates_from
@@ -100,7 +100,29 @@ async def task_detail(task_id: str, request: Request) -> _TemplateResponse:
     if task is None:
         raise HTTPException(status_code=404, detail=f"task {task_id} not found")
     children = await repos.tasks.find_children(task_id)
+    # B2: surface whether a cooperative cancel is already pending so the UI can
+    # show the banner instead of the button.
+    cancel_reason = await repos.tasks.get_cancel_request(task_id)
     return templates_from(request).TemplateResponse(
         request, "task_detail.html",
-        {"tab": "runs", "task": task, "children": children},
+        {
+            "tab": "runs",
+            "task": task,
+            "children": children,
+            "cancel_requested": cancel_reason is not None,
+            "cancel_reason": cancel_reason or "",
+        },
     )
+
+
+@router.post("/tasks/{task_id}/cancel")
+async def task_cancel(
+    task_id: str, request: Request, reason: str = Form(""),
+) -> RedirectResponse:
+    """B2: operator cooperative cancel from the dashboard — the one write path
+    here besides /send. Sets the durable cancel flag; the running wakeup stops
+    at its next turn boundary and finalizes as 'cancelled'. Cancels the TASK,
+    not the agent."""
+    repos = repos_from(request)
+    await repos.tasks.request_cancel(task_id, (reason or "").strip() or "via dashboard")
+    return RedirectResponse(url=f"/tasks/{task_id}", status_code=303)

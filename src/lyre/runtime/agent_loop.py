@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import json as _json
 import time
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, cast
 
@@ -108,6 +108,33 @@ _SILENT_TURN_NUDGE_TEMPLATE = (
     "task_id) or future-mail yourself (`deliver_in=…`), and tell "
     "the asker so."
 )
+
+
+_LOOP_REPEAT_NUDGE_TEMPLATE = (
+    "You have called the SAME tool with the SAME arguments several times in "
+    "a row this wakeup. Within one wakeup the world doesn't change between "
+    "identical calls — repeating it won't produce a different result.\n\n"
+    "Change approach: use a different tool or different arguments, act on "
+    "what you already have (e.g. `mailbox_send` your conclusion), or — if "
+    "you're genuinely blocked — stop calling tools to end the wakeup and "
+    "escalate via mail. If you repeat the identical call again, the wakeup "
+    "will be stopped for re-dispatch."
+)
+
+
+@dataclass
+class _StopRequest:
+    """A cooperative stop asked of the wakeup loop at a turn boundary (S0).
+
+    The loop breaks at the next boundary and runs its normal finalize/commit
+    path, finalizing with ``target_status``. One seam, three triggers:
+    operator cancel (→ ``cancelled``, B2), per-wakeup wall deadline and a lost
+    lease (→ ``needs_continuation``, A1), and the dead-loop guard (→
+    ``needs_continuation``, H1). See LONG_RUNNING_ROBUSTNESS_2.md §3.
+    """
+
+    target_status: str
+    reason: str
 _MAX_SILENT_TURN_NUDGES = 2  # give the model 2 chances before giving up
 
 # Thrashing cap: if a wakeup compacts this many times, bail to silent_close.
@@ -265,6 +292,8 @@ class AgentLoop:
         kill_switch: KillSwitch | None = None,
         compact_threshold: float = 0.7,
         compact_keep_last_k: int = 3,
+        loop_repeat_threshold: int = 0,
+        cancel_check: Callable[[], Awaitable[str | None]] | None = None,
     ):
         if not candidates:
             raise ValueError("AgentLoop needs at least one model candidate")
@@ -286,6 +315,30 @@ class AgentLoop:
         # wakeup hits this many compacts and still can't fit, we bail.
         self.compact_threshold = compact_threshold
         self.compact_keep_last_k = compact_keep_last_k
+        # H1: K consecutive identical (tool, args) calls in one wakeup → nudge
+        # once, then cooperative-stop. 0 disables. Set from config by the
+        # scheduler; defaults off so unconfigured callers (tests) are unaffected.
+        self.loop_repeat_threshold = loop_repeat_threshold
+        # B2: optional per-turn-boundary check for an operator cancel. Returns a
+        # reason string (possibly empty) if cancel was requested, else None.
+        # The scheduler wires this to a durable DB flag; tests/unconfigured
+        # callers leave it None (no per-turn DB read).
+        self.cancel_check = cancel_check
+        # S0: a cooperative stop requested at a turn boundary. Lives on the
+        # instance (not a local) so an async setter — the A1 lease heartbeat —
+        # can raise it concurrently with the loop. Reset at the top of run();
+        # AgentLoop instances are per-wakeup, so there's no cross-wakeup leak.
+        self._stop_request: _StopRequest | None = None
+
+    def request_stop(self, target_status: str, reason: str) -> None:
+        """S0: ask the running loop to stop cooperatively at the next turn
+        boundary, finalizing with ``target_status``. Safe to call from another
+        task (the A1 lease heartbeat) or after reading a DB flag (B2 operator
+        cancel). First request wins — a later one doesn't override it."""
+        if self._stop_request is None:
+            self._stop_request = _StopRequest(
+                target_status=target_status, reason=reason
+            )
 
     # ------------------------------------------------------------------
     # Multi-turn with tool dispatch
@@ -319,6 +372,21 @@ class AgentLoop:
         context_peak_tokens = 0
         compaction_count = 0
         compaction_summary_degraded = 0
+        # True iff the turn loop ran off the end of range(max_turns) without
+        # taking EITHER natural break (clean finish or compaction-thrash bail).
+        # Set by the for...else below. Without it, result_status keys purely on
+        # the last turn's stop_reason — and since DeepSeek/Anthropic routinely
+        # emit stop_reason='end_turn' ALONGSIDE tool_use, a wakeup truncated by
+        # max_turns on such a turn would be misclassified 'completed'. See
+        # AGENT_RUNTIME §3.1 (the documented for...else invariant) + A2.
+        hit_max_turns = False
+        # S0/H1 state. _stop_request is reset here (the instance may be reused
+        # in tests). The repeat-tracker fingerprints each turn's tool calls to
+        # catch a wakeup spinning on the SAME call (H1).
+        self._stop_request = None
+        repeat_fingerprint: str | None = None
+        repeat_count = 0
+        repeat_nudged = False
 
         interrupt_events: list[dict[str, Any]] = []
         # Silent-turn nudge state: whether THIS wakeup has produced any
@@ -346,6 +414,21 @@ class AgentLoop:
 
         for turn_idx in range(self.max_turns):
             turn_count = turn_idx + 1
+
+            # B2: observe an operator cancel requested for this task (durable DB
+            # flag). Checked at the turn boundary so a long shell finishes its
+            # current turn rather than being killed mid-action.
+            if self.cancel_check is not None and self._stop_request is None:
+                cancel_reason = await self.cancel_check()
+                if cancel_reason is not None:
+                    self.request_stop("cancelled", cancel_reason or "operator cancel")
+
+            # S0: a cooperative stop raised at a turn boundary (A1 wall/lost
+            # lease, B2 operator cancel — all set self._stop_request). Break
+            # and let the finalize path below carry its target_status. (H1
+            # sets it AND breaks inline, so it doesn't rely on this check.)
+            if self._stop_request is not None:
+                break
 
             # Turn-boundary interrupt: if blockers arrived between turns,
             # inject a user-role notice BEFORE the next LLM call.
@@ -559,6 +642,62 @@ class AgentLoop:
                     self.kill_switch.check("mid_action_after_tool")
             messages.append(LyreMessage(role="user", content=tool_result_blocks))
 
+            # H1 dead-loop guard: fingerprint this turn's tool call(s) by
+            # (name, args). If the SAME fingerprint repeats turn after turn,
+            # the wakeup is spinning — within one synchronous wakeup an
+            # identical call can't yield a new result. Nudge once at the
+            # threshold; if the model ignores the nudge and repeats again,
+            # cooperative-stop via the S0 seam (needs_continuation → failed →
+            # re-dispatchable), instead of burning every remaining turn.
+            if self.loop_repeat_threshold > 0 and tool_uses_this_turn:
+                fp = "|".join(
+                    sorted(
+                        _json.dumps(
+                            {"n": tu["name"], "i": tu["input"]},
+                            sort_keys=True,
+                            default=str,
+                        )
+                        for tu in tool_uses_this_turn
+                    )
+                )
+                if fp == repeat_fingerprint:
+                    repeat_count += 1
+                else:
+                    repeat_fingerprint = fp
+                    repeat_count = 1
+                    repeat_nudged = False
+                if repeat_count >= self.loop_repeat_threshold:
+                    if not repeat_nudged:
+                        messages.append(
+                            LyreMessage(
+                                role="user",
+                                content=[
+                                    LyreContentBlock(
+                                        type="text",
+                                        text=_LOOP_REPEAT_NUDGE_TEMPLATE,
+                                    )
+                                ],
+                            )
+                        )
+                        repeat_nudged = True
+                        self.transcript.note(
+                            f"loop_repeat_nudge_injected: {repeat_count}x identical call"
+                        )
+                    else:
+                        self._stop_request = _StopRequest(
+                            target_status="needs_continuation",
+                            reason=f"dead_loop: {repeat_count}x identical tool call",
+                        )
+                        self.transcript.note(
+                            f"loop_repeat_bail: {repeat_count}x identical call"
+                        )
+                        log.warning(
+                            "loop_repeat_bail",
+                            count=repeat_count,
+                            threshold=self.loop_repeat_threshold,
+                        )
+                        break
+
             # After executing tool calls we ALWAYS give the model another
             # turn to react to tool_results, regardless of stop_reason.
             # Rationale: with DeepSeek-V4 (and occasionally Anthropic),
@@ -698,6 +837,16 @@ class AgentLoop:
             # Always continue — let the model see tool_results and decide
             # whether to keep working or emit a final no-tool response.
 
+        else:
+            # for...else: reached ONLY when the loop ran all max_turns
+            # iterations without a break. Both natural exits (clean no-tool
+            # finish at ~:501; compaction-thrash bail at ~:643) use break, so
+            # this fires exactly on max_turns exhaustion → the wakeup was
+            # truncated mid-work, not finished. (A2)
+            hit_max_turns = True
+            self.transcript.note(f"max_turns_exhausted: {self.max_turns} turns")
+            log.warning("max_turns_exhausted", max_turns=self.max_turns)
+
         wall_ms = int((time.time() - started) * 1000)
 
         # Silent-close detection: wakeup ended after exhausting the nudge
@@ -709,6 +858,13 @@ class AgentLoop:
             and silent_turn_nudges_used >= _MAX_SILENT_TURN_NUDGES
             and not made_user_facing_action
             and bool(all_tool_calls)
+            # A2: a max_turns truncation is a genuine failure, not a chose-not-
+            # to-reply. Route it through needs_continuation (→ failed →
+            # task_terminated) instead of the silent-close apology path.
+            and not hit_max_turns
+            # S0: a cooperative stop (cancel / wall / dead-loop) is not a
+            # silent close either — it carries its own target_status.
+            and self._stop_request is None
         )
         if silent_close:
             await self._emit_silent_close_fallback(
@@ -717,13 +873,21 @@ class AgentLoop:
                 final_text=final_text,
             )
 
-        result_status = (
-            "silent_close"
-            if silent_close
-            else "completed"
-            if final_stop_reason == "end_turn"
-            else "needs_continuation"
-        )
+        # Precedence: an explicit cooperative stop (S0) wins; then a max_turns
+        # truncation (A2) — both must be observable + re-dispatchable, never
+        # silently 'completed'; then the normal silent-close / end_turn paths.
+        if self._stop_request is not None:
+            result_status = self._stop_request.target_status
+        elif hit_max_turns:
+            result_status = "needs_continuation"
+        else:
+            result_status = (
+                "silent_close"
+                if silent_close
+                else "completed"
+                if final_stop_reason == "end_turn"
+                else "needs_continuation"
+            )
 
         # Phantom-delegation observability: if this wakeup sent any
         # mail to the owner BUT had no successful dispatch_task /
