@@ -98,6 +98,29 @@ def _tool_results(*results: dict[str, Any]) -> LyreMessage:
     return LyreMessage(role="user", content=blocks)
 
 
+async def _compact(*args: Any, **kwargs: Any) -> list[LyreMessage]:
+    """Shim: most tests only assert on the resulting message list, not the
+    degraded flag — unwrap the CompactionOutcome for them."""
+    return (await compact_messages(*args, **kwargs)).messages
+
+
+class FailingAdapter:
+    """An adapter whose summarizer turn always raises — exercises the
+    work-summary LLM failure → raw-trace fallback (degraded) path."""
+
+    async def stream_turn(
+        self,
+        messages: list[LyreMessage],
+        tools: list[LyreToolSpec],
+        model: str,
+        max_tokens: int = 4096,
+        temperature: float | None = None,
+        system: str | None = None,
+    ) -> AsyncIterator[StreamEvent]:
+        raise RuntimeError("summarizer down")
+        yield TurnComplete(stop_reason="end_turn")  # pragma: no cover
+
+
 # ----------------------------------------------------------------------
 # find_pivot
 # ----------------------------------------------------------------------
@@ -174,7 +197,7 @@ async def test_compact_preserves_mailbox_get_message_as_user_msg() -> None:
         _tool_results({"id": "tu5", "result": "12:00 up"}),
     ]
     adapter = StubAdapter(canned_summary="ran shell_exec×2 in /tmp, no failures")
-    out = await compact_messages(
+    out = await _compact(
         msgs, adapter=adapter, model="x", keep_last_k=2, wakeup_id="wk-1",
     )
 
@@ -231,7 +254,7 @@ async def test_compact_preserves_mailbox_send_as_assistant_msg() -> None:
         ),
         _tool_results({"id": "tu4", "result": "done"}),
     ]
-    out = await compact_messages(
+    out = await _compact(
         msgs, adapter=StubAdapter(), model="x", keep_last_k=2,
     )
     # Find the synthetic assistant msg carrying the send body.
@@ -281,7 +304,7 @@ async def test_compact_drops_idempotent_and_listing_tools() -> None:
         _tool_results({"id": "tu6", "result": "now"}),
     ]
     adapter = StubAdapter(canned_summary="ran shell_exec a few times")
-    await compact_messages(
+    await _compact(
         msgs, adapter=adapter, model="x", keep_last_k=2,
     )
     # The work-summary prompt MUST NOT mention the dropped tools.
@@ -319,7 +342,7 @@ async def test_compact_quotes_dispatch_task_id_verbatim() -> None:
         _tool_results({"id": "tu3", "result": "/"}),
     ]
     adapter = StubAdapter()
-    await compact_messages(
+    await _compact(
         msgs, adapter=adapter, model="x", keep_last_k=2,
     )
     summary_prompt = adapter.calls[0]["messages"][0].content[0].text or ""
@@ -349,7 +372,7 @@ async def test_compact_keeps_last_k_turns_intact() -> None:
         last_assistant,
         last_result,
     ]
-    out = await compact_messages(
+    out = await _compact(
         msgs, adapter=StubAdapter(), model="x", keep_last_k=1,
     )
     # The last two messages must be byte-identical to the input.
@@ -368,10 +391,236 @@ async def test_compact_bails_when_too_short_to_be_useful() -> None:
         ),
         _tool_results({"id": "1"}),
     ]
-    out = await compact_messages(
+    out = await _compact(
         msgs, adapter=StubAdapter(), model="x", keep_last_k=3,
     )
     assert out == msgs
+
+
+@pytest.mark.asyncio
+async def test_compaction_marks_its_own_output_as_artifact() -> None:
+    """Synthetic mail messages + the work-summary seam must be flagged
+    `compaction_artifact=True` so a later compaction recognizes its own
+    output. The kept head/tail (real turns) must NOT be flagged."""
+    mail_result = json.dumps({
+        "id": 5, "sender": "owner", "urgency": "high", "body": "keep me",
+    })
+    msgs = [
+        _user("task"),
+        _assistant_with_tools(
+            {"id": "g1", "name": "mailbox_get_message", "input": {"msg_id": 5}}
+        ),
+        _tool_results({"id": "g1", "result": mail_result}),
+        _assistant_with_tools(
+            {"id": "a1", "name": "shell_exec", "input": {"argv": ["ls"]}}
+        ),
+        _tool_results({"id": "a1", "result": "x"}),
+        _assistant_with_tools(
+            {"id": "a2", "name": "shell_exec", "input": {"argv": ["pwd"]}}
+        ),
+        _tool_results({"id": "a2", "result": "/"}),
+        _assistant_with_tools(
+            {"id": "a3", "name": "shell_exec", "input": {"argv": ["id"]}}
+        ),
+        _tool_results({"id": "a3", "result": "u"}),
+    ]
+    out = await _compact(
+        msgs, adapter=StubAdapter(), model="x", keep_last_k=2,
+    )
+    artifacts = [m for m in out if m.compaction_artifact]
+    # The synthetic mail (user) + the summary seam (user) are artifacts.
+    assert len(artifacts) >= 2
+    assert all(m.compaction_artifact for m in artifacts)
+    # The initial task msg and the kept-tail real turns are NOT artifacts.
+    assert out[0].compaction_artifact is False
+    assert out[-1].compaction_artifact is False
+    assert out[-2].compaction_artifact is False
+
+
+@pytest.mark.asyncio
+async def test_recompaction_preserves_mail_verbatim() -> None:
+    """REGRESSION: a SECOND compaction must not destroy mail that the
+    FIRST compaction preserved. The synthetic mail message carries no
+    tool_use block, so the naive elision walk produces nothing for it and
+    silently drops the owner's words — exactly the kill-test / 铁律五
+    violation this guards against."""
+    mail_result = json.dumps({
+        "id": 7, "sender": "owner", "urgency": "blocker",
+        "body": "DO NOT LOSE THIS owner instruction.",
+    })
+    msgs = [
+        _user("start"),
+        _assistant_with_tools(
+            {"id": "g1", "name": "mailbox_get_message", "input": {"msg_id": 7}}
+        ),
+        _tool_results({"id": "g1", "result": mail_result}),
+        _assistant_with_tools(
+            {"id": "a1", "name": "shell_exec", "input": {"argv": ["ls"]}}
+        ),
+        _tool_results({"id": "a1", "result": "x"}),
+        _assistant_with_tools(
+            {"id": "a2", "name": "shell_exec", "input": {"argv": ["pwd"]}}
+        ),
+        _tool_results({"id": "a2", "result": "/"}),
+        _assistant_with_tools(
+            {"id": "a3", "name": "shell_exec", "input": {"argv": ["id"]}}
+        ),
+        _tool_results({"id": "a3", "result": "u"}),
+    ]
+    first = await _compact(
+        msgs, adapter=StubAdapter(), model="x", keep_last_k=2,
+    )
+    flat1 = " ".join(
+        b.text or "" for m in first for b in m.content if b.type == "text"
+    )
+    assert "DO NOT LOSE THIS owner instruction." in flat1  # sanity
+
+    # Simulate more turns accruing after the first compaction, then a
+    # second compaction (the case `_MAX_COMPACTIONS` used to paper over).
+    extended = first + [
+        _assistant_with_tools(
+            {"id": "b1", "name": "shell_exec", "input": {"argv": ["echo", "1"]}}
+        ),
+        _tool_results({"id": "b1", "result": "1"}),
+        _assistant_with_tools(
+            {"id": "b2", "name": "shell_exec", "input": {"argv": ["echo", "2"]}}
+        ),
+        _tool_results({"id": "b2", "result": "2"}),
+    ]
+    second = await _compact(
+        extended, adapter=StubAdapter(), model="x", keep_last_k=2,
+    )
+    flat2 = " ".join(
+        b.text or "" for m in second for b in m.content if b.type == "text"
+    )
+    assert "DO NOT LOSE THIS owner instruction." in flat2, (
+        "recompaction destroyed mail preserved by the first compaction"
+    )
+
+
+@pytest.mark.asyncio
+async def test_recompaction_does_not_accrete_empty_summary_seams() -> None:
+    """A recompaction whose only fresh content is mail (no tool work to
+    fold) should carry the prior seam forward, NOT append a fresh empty
+    'no substantive tool work' marker on top — otherwise every compaction
+    grows the history by one useless seam. Built from mail-only turns so
+    the fresh range has zero trace-policy tool work."""
+    def _mail_in(msg_id: int, body: str) -> tuple[LyreMessage, LyreMessage]:
+        return (
+            _assistant_with_tools(
+                {"id": f"g{msg_id}", "name": "mailbox_get_message",
+                 "input": {"msg_id": msg_id}}
+            ),
+            _tool_results({"id": f"g{msg_id}", "result": json.dumps(
+                {"id": msg_id, "sender": "owner", "urgency": "normal",
+                 "body": body}
+            )}),
+        )
+
+    def _mail_out(send_id: str, body: str) -> tuple[LyreMessage, LyreMessage]:
+        return (
+            _assistant_with_tools(
+                {"id": send_id, "name": "mailbox_send",
+                 "input": {"to": "owner", "body": body}}
+            ),
+            _tool_results({"id": send_id, "result": '{"status":"queued"}'}),
+        )
+
+    g1a, g1r = _mail_in(1, "first")
+    s1a, s1r = _mail_out("s1", "ack first")
+    g2a, g2r = _mail_in(2, "second")
+    msgs = [_user("task"), g1a, g1r, s1a, s1r, g2a, g2r]
+    first = await _compact(
+        msgs, adapter=StubAdapter(), model="x", keep_last_k=1,
+    )
+    seams_first = [
+        m for m in first
+        if any("[Compact summary" in (b.text or "") for b in m.content)
+    ]
+    assert len(seams_first) == 1
+
+    # Extend with ONLY new mail turns (no shell/python work), recompact.
+    s2a, s2r = _mail_out("s2", "ack second")
+    g3a, g3r = _mail_in(3, "third")
+    extended = first + [s2a, s2r, g3a, g3r]
+    second = await _compact(
+        extended, adapter=StubAdapter(), model="x", keep_last_k=1,
+    )
+    seams_second = [
+        m for m in second
+        if any("[Compact summary" in (b.text or "") for b in m.content)
+    ]
+    # The single prior seam is carried forward; no fresh empty seam added.
+    assert len(seams_second) == 1
+
+
+@pytest.mark.asyncio
+async def test_compaction_flags_summary_degraded_when_llm_call_fails() -> None:
+    """When the work-summary LLM call fails, compaction still returns a
+    usable (shorter) history via the raw-trace fallback — but flags
+    `summary_degraded` so the lossy compaction is observable (RB-2). A
+    successful summary leaves the flag False."""
+    msgs = [
+        _user("task"),
+        _assistant_with_tools(
+            {"id": "a1", "name": "shell_exec", "input": {"argv": ["make"]}}
+        ),
+        _tool_results({"id": "a1", "result": "built OK"}),
+        _assistant_with_tools(
+            {"id": "a2", "name": "shell_exec", "input": {"argv": ["pytest"]}}
+        ),
+        _tool_results({"id": "a2", "result": "42 passed"}),
+        _assistant_with_tools(
+            {"id": "a3", "name": "shell_exec", "input": {"argv": ["ls"]}}
+        ),
+        _tool_results({"id": "a3", "result": "files"}),
+    ]
+    degraded = await compact_messages(
+        msgs, adapter=FailingAdapter(), model="x", keep_last_k=2,
+    )
+    assert degraded.summary_degraded is True
+    # The raw trace is still inlined so the work isn't lost outright.
+    flat = " ".join(
+        b.text or "" for m in degraded.messages
+        for b in m.content if b.type == "text"
+    )
+    assert "Tool actions during elided turns" in flat
+
+    ok = await compact_messages(
+        msgs, adapter=StubAdapter(canned_summary="built + tested clean"),
+        model="x", keep_last_k=2,
+    )
+    assert ok.summary_degraded is False
+
+
+@pytest.mark.asyncio
+async def test_compaction_not_degraded_when_only_mail_elided() -> None:
+    """A compaction whose elided range has no tool work emits the minimal
+    seam without an LLM call — that's not a degradation."""
+    msgs = [
+        _user("task"),
+        _assistant_with_tools(
+            {"id": "g1", "name": "mailbox_get_message", "input": {"msg_id": 1}}
+        ),
+        _tool_results({"id": "g1", "result": json.dumps(
+            {"id": 1, "sender": "owner", "urgency": "high", "body": "hi"}
+        )}),
+        _assistant_with_tools(
+            {"id": "s1", "name": "mailbox_send",
+             "input": {"to": "owner", "body": "ok"}}
+        ),
+        _tool_results({"id": "s1", "result": '{"status":"queued"}'}),
+        _assistant_with_tools(
+            {"id": "g2", "name": "mailbox_get_message", "input": {"msg_id": 2}}
+        ),
+        _tool_results({"id": "g2", "result": json.dumps(
+            {"id": 2, "sender": "owner", "urgency": "high", "body": "more"}
+        )}),
+    ]
+    out = await compact_messages(
+        msgs, adapter=FailingAdapter(), model="x", keep_last_k=1,
+    )
+    assert out.summary_degraded is False
 
 
 @pytest.mark.asyncio
@@ -413,7 +662,7 @@ async def test_compact_chronological_order_preserved() -> None:
         ),
         _tool_results({"id": "p2", "result": "u"}),
     ]
-    out = await compact_messages(
+    out = await _compact(
         msgs, adapter=StubAdapter(), model="x", keep_last_k=2,
     )
     flat = " ".join(

@@ -35,6 +35,7 @@ from __future__ import annotations
 import json as _json
 import re
 from collections.abc import AsyncGenerator
+from dataclasses import dataclass
 from typing import Any, cast
 
 import structlog
@@ -49,6 +50,20 @@ from ..adapter.llm_adapter import (
 )
 
 log = structlog.get_logger()
+
+
+@dataclass
+class CompactionOutcome:
+    """Result of one `compact_messages` call.
+
+    `summary_degraded` is True when the work-summary LLM call failed and the
+    compaction fell back to inlining the raw tool trace — the compaction still
+    produced a usable (shorter) history, but the elided work was NOT distilled.
+    The caller surfaces this so a degraded compaction is observable rather than
+    silently lossy (see LONG_RUNNING_ROBUSTNESS.md RB-2)."""
+
+    messages: list[LyreMessage]
+    summary_degraded: bool = False
 
 # Tool name → policy.
 # "preserve_in"   = synthesize a user message from the tool_result body
@@ -102,10 +117,10 @@ async def compact_messages(
     keep_last_k: int = 3,
     wakeup_id: str | None = None,
     max_summary_tokens: int = 600,
-) -> list[LyreMessage]:
-    """Return a new (shorter) messages list after compaction.
+) -> CompactionOutcome:
+    """Return a `CompactionOutcome` (shorter messages + a degraded flag).
 
-    `messages` is NOT mutated. Caller should swap in the return value.
+    `messages` is NOT mutated. Caller should swap in `outcome.messages`.
 
     The caller is responsible for the compact-threshold decision, peak
     tracking, thrashing detection (e.g. count of consecutive compacts),
@@ -114,23 +129,44 @@ async def compact_messages(
     """
     if len(messages) < 3:
         # Not enough history to meaningfully compact.
-        return list(messages)
+        return CompactionOutcome(list(messages))
     pivot = find_pivot(messages, keep_last_k)
     if pivot <= 1:
         # No room to elide anything; bail.
-        return list(messages)
+        return CompactionOutcome(list(messages))
 
     kept_head = list(messages[:1])  # initial user msg (task goal)
     elided = list(messages[1:pivot])
     kept_tail = list(messages[pivot:])
 
-    synthetic, work_trace = _extract_synthetic_history(elided)
-    summary_msg = await _make_work_summary_msg(
-        adapter=adapter, model=model, work_trace=work_trace,
-        wakeup_id=wakeup_id, max_tokens=max_summary_tokens,
-    )
+    # Carry forward this function's OWN prior output (synthetic mail + summary
+    # seams from an earlier compaction of the same wakeup) VERBATIM. Without
+    # this, a second compaction re-elides those messages — and because they
+    # carry no tool_use blocks, `_extract_synthetic_history` produces nothing
+    # for them, silently destroying the owner/peer mail that the five laws
+    # require kept verbatim. Only genuinely-new turns since the last compaction
+    # get summarized.
+    carried = [m for m in elided if m.compaction_artifact]
+    fresh = [m for m in elided if not m.compaction_artifact]
 
-    return kept_head + synthetic + [summary_msg] + kept_tail
+    synthetic, work_trace = _extract_synthetic_history(fresh)
+    new_msgs: list[LyreMessage] = carried + synthetic
+    summary_degraded = False
+    # Emit a summary seam when there's fresh tool work to fold, OR on the
+    # FIRST compaction (carried empty) where the seam marks the elision even
+    # if only mail was elided. A recompaction with no fresh tool work skips
+    # the seam — the carried artifacts already represent the elided history,
+    # so a fresh empty marker would just accrete on every compaction.
+    if work_trace or not carried:
+        summary_msg, summary_degraded = await _make_work_summary_msg(
+            adapter=adapter, model=model, work_trace=work_trace,
+            wakeup_id=wakeup_id, max_tokens=max_summary_tokens,
+        )
+        new_msgs.append(summary_msg)
+
+    return CompactionOutcome(
+        kept_head + new_msgs + kept_tail, summary_degraded=summary_degraded
+    )
 
 
 def _extract_synthetic_history(
@@ -221,6 +257,7 @@ def _synth_mail_in(
     return LyreMessage(
         role="user",
         content=[LyreContentBlock(type="text", text=f"{header}\n{body}")],
+        compaction_artifact=True,
     )
 
 
@@ -251,6 +288,7 @@ def _synth_mail_out(tool_input: dict[str, Any]) -> LyreMessage | None:
     return LyreMessage(
         role="assistant",
         content=[LyreContentBlock(type="text", text=f"{header}\n{body}")],
+        compaction_artifact=True,
     )
 
 
@@ -310,19 +348,22 @@ async def _make_work_summary_msg(
     work_trace: list[str],
     wakeup_id: str | None,
     max_tokens: int,
-) -> LyreMessage:
+) -> tuple[LyreMessage, bool]:
     """Call the SAME model the wakeup is on to produce a brief summary
     of the elided work. Mail in/out is NOT in this prompt — it's
     already preserved verbatim as synthetic messages — so the model
     only has to digest tool traces (shell_exec, python_exec, dispatch,
     etc.).
+
+    Returns `(message, degraded)`. `degraded` is True when there was work
+    to summarize but the LLM call failed and we fell back to the raw trace.
     """
     transcript_ref = (
         f" Full transcript: wakeup={wakeup_id}." if wakeup_id else ""
     )
     if not work_trace:
         # No tool work to summarize; emit a minimal marker so the model
-        # still sees the seam.
+        # still sees the seam. Not a degradation — nothing needed the LLM.
         body = (
             "[Compact summary of prior turns — no substantive tool work "
             f"to summarize between the mail messages above.{transcript_ref}]"
@@ -330,7 +371,8 @@ async def _make_work_summary_msg(
         return LyreMessage(
             role="user",
             content=[LyreContentBlock(type="text", text=body)],
-        )
+            compaction_artifact=True,
+        ), False
 
     prompt = (
         "You are producing a compaction summary for an ongoing agent task.\n\n"
@@ -348,8 +390,10 @@ async def _make_work_summary_msg(
     summary_text = await _call_for_summary(
         adapter=adapter, model=model, prompt=prompt, max_tokens=max_tokens,
     )
-    if not summary_text:
-        # Fallback: emit the raw trace inline. Information dense but cheap.
+    degraded = not summary_text
+    if degraded:
+        # Fallback: emit the raw trace inline. Information dense but cheap —
+        # and flagged degraded so the lossy compaction is observable.
         summary_text = (
             "Tool actions during elided turns:\n" + "\n".join(work_trace[:40])
         )
@@ -358,7 +402,8 @@ async def _make_work_summary_msg(
     return LyreMessage(
         role="user",
         content=[LyreContentBlock(type="text", text=body)],
-    )
+        compaction_artifact=True,
+    ), degraded
 
 
 async def _call_for_summary(

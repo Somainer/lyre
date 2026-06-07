@@ -78,6 +78,39 @@ def test_config_idle_reclaim_age_garbage_and_negative_clamp(
     assert Config.from_env().idle_reclaim_age_s == 0  # negative → clamped to 0
 
 
+def test_config_notes_max_entries_defaults_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LYRE_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("LYRE_NOTES_MAX_ENTRIES", raising=False)
+    assert Config.from_env().notes_max_entries == 0
+
+
+def test_config_notes_max_entries_env_beats_toml(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LYRE_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "config.toml").write_text(
+        "[scheduler]\nnotes_max_entries = 200\n", encoding="utf-8"
+    )
+    assert Config.from_env().notes_max_entries == 200  # from toml
+    monkeypatch.setenv("LYRE_NOTES_MAX_ENTRIES", "50")
+    assert Config.from_env().notes_max_entries == 50  # env wins
+
+
+def test_config_notes_max_entries_garbage_and_negative_clamp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LYRE_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("LYRE_NOTES_MAX_ENTRIES", "not-a-number")
+    assert Config.from_env().notes_max_entries == 0  # garbage → disabled
+    monkeypatch.setenv("LYRE_NOTES_MAX_ENTRIES", "-9")
+    assert Config.from_env().notes_max_entries == 0  # negative → clamped
+
+
 def test_config_fanin_max_age_defaults_disabled(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

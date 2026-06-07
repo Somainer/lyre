@@ -1675,6 +1675,11 @@ def wakeups_group() -> None:
     help="Only wakeups that auto-compacted at least once.",
 )
 @click.option(
+    "--summary-degraded", "summary_degraded", is_flag=True,
+    help="Only wakeups where a compaction's work-summary LLM call failed "
+         "and fell back to the raw trace (lossy compaction).",
+)
+@click.option(
     "--json", "as_json", is_flag=True,
     help="Emit JSON Lines (one object per wakeup) for piping to jq.",
 )
@@ -1684,6 +1689,7 @@ def wakeups_list_cmd(
     status: str | None,
     since: str | None,
     has_compaction: bool,
+    summary_degraded: bool,
     as_json: bool,
 ) -> None:
     """List recent wakeups with status / tokens / context-usage / compactions.
@@ -1721,12 +1727,15 @@ def wakeups_list_cmd(
             params.append(cutoff)
         if has_compaction:
             clauses.append("compaction_count > 0")
+        if summary_degraded:
+            clauses.append("compaction_summary_degraded > 0")
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         sql = (
             f"SELECT id, persona_name, agent_id, task_id, started_at, "
             f"ended_at, end_status, token_input, token_output, "
             f"wall_clock_ms, tool_call_count, model, "
-            f"context_peak_tokens, compaction_count "
+            f"context_peak_tokens, compaction_count, "
+            f"compaction_summary_degraded "
             f"FROM wakeups {where} "
             f"ORDER BY started_at DESC LIMIT ?"
         )
@@ -1760,7 +1769,7 @@ def wakeups_list_cmd(
 
         click.echo(
             f"{'ID':10s} {'PERSONA':18s} {'STARTED':19s} {'WALL':>7s} "
-            f"{'IN':>7s} {'OUT':>7s} {'CTX%':>5s} {'CMPCT':>5s} "
+            f"{'IN':>7s} {'OUT':>7s} {'CTX%':>5s} {'CMPCT':>5s} {'DEGR':>4s} "
             f"{'TOOLS':>5s} {'STATUS':12s} MODEL"
         )
         for r in rows:
@@ -1781,6 +1790,7 @@ def wakeups_list_cmd(
                 f"{_fmt_tokens_short(r['token_output']):>7s} "
                 f"{ctx_pct:>5s} "
                 f"{r['compaction_count'] or 0:>5d} "
+                f"{r['compaction_summary_degraded'] or 0:>4d} "
                 f"{r['tool_call_count'] or 0:>5d} "
                 f"{(r['end_status'] or '-')[:12]:12s} "
                 f"{r['model'] or '-'}"

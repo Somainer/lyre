@@ -33,7 +33,7 @@ stuck?").
 
 | Command | Purpose |
 |---|---|
-| `lyre wakeups list [--limit N] [--persona P] [--status S] [--since 1h] [--has-compaction] [--json]` | List recent wakeups with status, tokens, context-usage %, compaction count. The first thing you run when something feels off. |
+| `lyre wakeups list [--limit N] [--persona P] [--status S] [--since 1h] [--has-compaction] [--summary-degraded] [--json]` | List recent wakeups with status, tokens, context-usage %, compaction count, and degraded-compaction count. The first thing you run when something feels off. `--summary-degraded` filters to wakeups where a compaction's work-summary LLM call failed (lossy compaction). |
 | `lyre tasks list [--limit N] [--persona P] [--agent A] [--status S] [--since 1h] [--json]` | List recent tasks with status and goal preview. |
 | `lyre status <task_id>` | Single-task detail: checkpoint, all wakeups for it, latest transcript. |
 | `lyre audit <wakeup_id_prefix> [--system/--no-system] [--full-result] [--json]` | Pretty-print a wakeup's transcript. `--latest [--persona P]` for the most recent. `--json` for raw JSONL. |

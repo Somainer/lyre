@@ -143,7 +143,10 @@ CREATE TABLE IF NOT EXISTS wakeups (
   context_peak_tokens   INTEGER,
   -- Number of mid-wakeup auto-compactions (>0 means we crossed the
   -- threshold at least once).
-  compaction_count      INTEGER NOT NULL DEFAULT 0
+  compaction_count      INTEGER NOT NULL DEFAULT 0,
+  -- Of those compactions, how many had their work-summary LLM call fail and
+  -- fall back to the raw tool trace (>0 means a lossy/degraded compaction).
+  compaction_summary_degraded INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS wakeups_task ON wakeups(task_id, started_at);
