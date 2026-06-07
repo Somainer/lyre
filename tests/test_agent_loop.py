@@ -123,6 +123,62 @@ async def test_max_turns_exhaustion_on_end_turn_is_needs_continuation_not_comple
 
 
 @pytest.mark.asyncio
+async def test_compaction_signal_falls_back_to_estimate_when_no_usage(
+    object_store: Path,
+) -> None:
+    """D1: when the adapter emits no Usage event, the loop falls back to a
+    coarse client token estimate so context_peak (and the compaction guard)
+    don't silently stay at zero — which would let the wakeup sail past the
+    model's real context window with auto-compaction disabled."""
+    adapter = FakeAdapter()
+    # A turn with NO Usage event (FakeAdapter only auto-appends TurnComplete).
+    adapter.push_turn([ContentDelta(text="reply"), TurnComplete(stop_reason="end_turn")])
+    transcript = TranscriptWriter(object_store, "wakeup-d1")
+    loop = build_single_candidate_loop(adapter, transcript)
+
+    result = await loop.run(
+        system_prompt="sys",
+        initial_messages=[
+            LyreMessage(
+                role="user",
+                content=[LyreContentBlock(type="text", text="word " * 400)],
+            )
+        ],
+    )
+    transcript.close()
+
+    # No Usage was emitted, yet context_peak is populated from the estimate.
+    assert result.context_peak_tokens > 0
+
+
+@pytest.mark.asyncio
+async def test_real_usage_wins_over_estimate(object_store: Path) -> None:
+    """D1: a real Usage event is never overridden by the client estimate."""
+    adapter = FakeAdapter()
+    adapter.push_turn(
+        [
+            ContentDelta(text="x" * 8000),
+            Usage(input_tokens=7, output_tokens=2),
+            TurnComplete(stop_reason="end_turn"),
+        ]
+    )
+    transcript = TranscriptWriter(object_store, "wakeup-d1b")
+    loop = build_single_candidate_loop(adapter, transcript)
+
+    result = await loop.run(
+        system_prompt="",
+        initial_messages=[
+            LyreMessage(role="user", content=[LyreContentBlock(type="text", text="hi")])
+        ],
+    )
+    transcript.close()
+
+    # Real Usage (7), not the ~2000-token estimate of the 8000-char turn.
+    assert result.usage["input_tokens"] == 7
+    assert result.context_peak_tokens == 7
+
+
+@pytest.mark.asyncio
 async def test_run_passes_system_and_messages_through(object_store: Path) -> None:
     adapter = FakeAdapter()
     adapter.push_turn([ContentDelta(text=""), TurnComplete(stop_reason="end_turn")])
