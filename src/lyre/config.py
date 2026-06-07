@@ -379,6 +379,18 @@ class Config:
     # operator opts in. The hand-written region (above the log header) is never
     # touched. See LONG_RUNNING_ROBUSTNESS.md RB-3.
     notes_max_entries: int = 0
+    # C4 DB retention (days). When > 0, a low-frequency scheduler maintenance
+    # phase (and the `lyre maintenance` CLI) prune terminal/delivered rows older
+    # than this — delivered outbox, ended wakeups (keeping the most-recent K per
+    # agent), terminal scheduled_mail, resolved/expired fan_in — and checkpoint
+    # the WAL. NEVER touches mailbox_messages / blobs / artifacts. 0 (default)
+    # DISABLES it (matches "persist forever" until an operator opts in). See
+    # LONG_RUNNING_ROBUSTNESS_3.md C4.
+    retention_days: int = 0
+    # How often the scheduler maintenance phase runs (seconds), when
+    # retention_days > 0. Default 6h — maintenance is cheap (delete + WAL
+    # checkpoint; full VACUUM is CLI-only) so it needn't run every tick.
+    maintenance_interval_s: int = 21600
 
     @classmethod
     def from_env(cls) -> Config:
@@ -617,6 +629,34 @@ class Config:
         if notes_max_entries < 0:
             notes_max_entries = 0
 
+        # ---- C4 DB retention ----
+        # [scheduler] retention_days = N; env `LYRE_RETENTION_DAYS` wins.
+        # 0 / absent / garbage / negative → disabled.
+        ret_env = os.environ.get("LYRE_RETENTION_DAYS")
+        ret_chosen = (
+            ret_env if ret_env is not None else scheduler_raw.get("retention_days")
+        )
+        try:
+            retention_days = int(ret_chosen) if ret_chosen is not None else 0
+        except (ValueError, TypeError):
+            retention_days = 0
+        if retention_days < 0:
+            retention_days = 0
+        # [scheduler] maintenance_interval_s = N; env wins. Floor 60s; default 6h.
+        mi_env = os.environ.get("LYRE_MAINTENANCE_INTERVAL_S")
+        mi_chosen = (
+            mi_env if mi_env is not None
+            else scheduler_raw.get("maintenance_interval_s")
+        )
+        try:
+            maintenance_interval_s = (
+                int(mi_chosen) if mi_chosen is not None else 21600
+            )
+        except (ValueError, TypeError):
+            maintenance_interval_s = 21600
+        if maintenance_interval_s < 60:
+            maintenance_interval_s = 60
+
         # ---- coding-agent credential bundles ----
         # [coding_backends.<name>] auth_env = "..." [allowed_personas = [...]].
         # Each entry needs an auth_env; entries missing it are skipped with a
@@ -689,6 +729,8 @@ class Config:
             idle_reclaim_age_s=idle_reclaim_age_s,
             fanin_max_age_s=fanin_max_age_s,
             notes_max_entries=notes_max_entries,
+            retention_days=retention_days,
+            maintenance_interval_s=maintenance_interval_s,
             coding_backends=coding_backends,
         )
 

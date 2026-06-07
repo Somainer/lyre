@@ -34,6 +34,7 @@ import structlog
 
 from ..adapter.llm_adapter import LLMAdapter
 from ..config import Config
+from ..persistence.maintenance import run_maintenance
 from ..persistence.models import (
     Agent,
     MailboxMessage,
@@ -205,6 +206,9 @@ class Scheduler:
         # Cap from config; only consulted in subprocess mode. inline
         # is single-threaded by design so the cap doesn't apply.
         self._max_concurrent = max(1, self.config.max_concurrent_tasks)
+        # C4: monotonic timestamp of the last DB maintenance run (None = never).
+        # The maintenance phase runs at most once per maintenance_interval_s.
+        self._last_maintenance: float | None = None
 
     def request_stop(self) -> None:
         self._stop_event.set()
@@ -420,6 +424,32 @@ class Scheduler:
                 dispatched_nonsingleton += 1
             if self._available_slots() <= 0:
                 break
+
+        # Phase 4 (C4): low-frequency DB maintenance — retention prune + WAL
+        # checkpoint. No-op unless retention_days>0; throttled internally.
+        await self._maybe_run_maintenance()
+
+    async def _maybe_run_maintenance(self) -> None:
+        """C4: run DB retention + WAL checkpoint at most once per
+        maintenance_interval_s, only when retention_days>0. Best-effort — a
+        maintenance failure must never wedge the tick. Full VACUUM is CLI-only
+        (`lyre maintenance`); the periodic phase keeps it cheap."""
+        rd = self.config.retention_days
+        if rd <= 0:
+            return
+        now = time.monotonic()
+        if (
+            self._last_maintenance is not None
+            and now - self._last_maintenance < self.config.maintenance_interval_s
+        ):
+            return
+        self._last_maintenance = now
+        try:
+            await run_maintenance(self.repos.conn, retention_days=rd, vacuum=False)
+        except Exception as exc:  # noqa: BLE001 — best-effort
+            log.warning(
+                "db_maintenance_failed", error=str(exc), type=type(exc).__name__
+            )
 
     def _available_slots(self) -> int:
         """How many fresh tasks we can take on right now.

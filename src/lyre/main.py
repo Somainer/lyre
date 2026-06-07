@@ -424,6 +424,54 @@ def dispatch_cmd(persona: str, goal: str, acceptance: str) -> None:
 
 
 # ----------------------------------------------------------------------
+# lyre maintenance  (C4)
+# ----------------------------------------------------------------------
+
+@cli.command("maintenance")
+@click.option(
+    "--retention-days", type=int, default=None,
+    help="Override [scheduler] retention_days for this run.",
+)
+@click.option(
+    "--vacuum/--no-vacuum", default=True,
+    help="Run VACUUM to reclaim file space (default on for manual runs).",
+)
+def maintenance_cmd(retention_days: int | None, vacuum: bool) -> None:
+    """Prune terminal/delivered DB rows past the retention window + reclaim space.
+
+    Deletes delivered outbox, ended wakeups (keeping the most-recent per agent),
+    terminal scheduled_mail, and resolved/expired fan_in groups older than the
+    window; checkpoints the WAL and (by default) VACUUMs. NEVER touches
+    mailbox_messages, blobs, or artifacts.
+
+    The scheduler runs this automatically (without VACUUM) when retention_days>0;
+    this command is for on-demand / full-reclaim runs.
+    """
+
+    async def _run() -> None:
+        from .persistence.maintenance import run_maintenance
+
+        cfg = Config.from_env()
+        rd = retention_days if retention_days is not None else cfg.retention_days
+        if rd <= 0:
+            click.echo(
+                "retention_days is 0 (disabled). Pass --retention-days N to prune.",
+                err=True,
+            )
+            sys.exit(1)
+        conn = await init_db(cfg.db_path)
+        try:
+            counts = await run_maintenance(conn, retention_days=rd, vacuum=vacuum)
+        finally:
+            await conn.close()
+        click.echo(f"Maintenance done (retention_days={rd}, vacuum={vacuum}):")
+        for table, n in counts.items():
+            click.echo(f"  {table:16s} {n} rows pruned")
+
+    asyncio.run(_run())
+
+
+# ----------------------------------------------------------------------
 # lyre status <task_id>
 # ----------------------------------------------------------------------
 
