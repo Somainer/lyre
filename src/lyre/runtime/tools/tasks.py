@@ -107,6 +107,20 @@ async def _dispatch_task(ctx: ToolContext, args: dict[str, Any]) -> dict[str, An
     if ctx.thread_id is not None and (metadata is None or "thread_id" not in metadata):
         metadata = {**(metadata or {}), "thread_id": ctx.thread_id}
 
+    # H3: dispatch-depth cap. Stamp child depth = parent+1 (depth rides
+    # task.metadata; the scheduler carries the running task's depth into
+    # ctx.extras). Refuse to recurse past the cap so a runaway A→B→C→… dispatch
+    # chain escalates to the owner instead of spawning forever.
+    max_depth = ctx.extras.get("max_dispatch_depth", 0)
+    child_depth = ctx.extras.get("task_depth", 0) + 1
+    if max_depth > 0 and child_depth > max_depth:
+        raise ToolError(
+            f"dispatch-depth cap reached ({child_depth} > {max_depth}) on this "
+            f"chain — do NOT dispatch deeper. Escalate to your parent/owner via "
+            f"mailbox_send: report what's blocking and what you need."
+        )
+    metadata = {**(metadata or {}), "depth": child_depth}
+
     git_ctx_arg = args.get("git_context")
     git_ctx: GitContext | None = None
     if git_ctx_arg is not None:

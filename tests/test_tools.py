@@ -541,6 +541,44 @@ async def test_dispatch_task_rejects_unknown_persona(ctx: ToolContext) -> None:
 
 
 @pytest.mark.asyncio
+async def test_dispatch_task_stamps_child_depth(ctx: ToolContext) -> None:
+    """H3: a dispatched child's depth = parent depth + 1 (carried in metadata)."""
+    import dataclasses
+
+    c = dataclasses.replace(ctx, extras={"task_depth": 2, "max_dispatch_depth": 8})
+    result = await DISPATCH_TASK.handler(
+        c, {"persona": "worker", "goal": "g", "acceptance": "a"}
+    )
+    child = await ctx.repos.tasks.get(result["task_id"])
+    assert child is not None and (child.metadata or {}).get("depth") == 3
+
+
+@pytest.mark.asyncio
+async def test_dispatch_task_rejects_past_depth_cap(ctx: ToolContext) -> None:
+    """H3: a dispatch that would exceed the depth cap is refused so a runaway
+    A→B→C→… chain escalates instead of recursing."""
+    import dataclasses
+
+    c = dataclasses.replace(ctx, extras={"task_depth": 8, "max_dispatch_depth": 8})
+    with pytest.raises(ToolError, match="depth"):
+        await DISPATCH_TASK.handler(
+            c, {"persona": "worker", "goal": "g", "acceptance": "a"}
+        )
+
+
+@pytest.mark.asyncio
+async def test_dispatch_task_depth_cap_disabled(ctx: ToolContext) -> None:
+    """H3: max_dispatch_depth=0 disables the cap entirely."""
+    import dataclasses
+
+    c = dataclasses.replace(ctx, extras={"task_depth": 100, "max_dispatch_depth": 0})
+    result = await DISPATCH_TASK.handler(
+        c, {"persona": "worker", "goal": "g", "acceptance": "a"}
+    )
+    assert result["task_id"]
+
+
+@pytest.mark.asyncio
 async def test_query_task_status_returns_state(ctx: ToolContext) -> None:
     result = await QUERY_TASK_STATUS.handler(ctx, {"task_id": ctx.task_id})
     assert result["id"] == ctx.task_id

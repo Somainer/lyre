@@ -1631,6 +1631,12 @@ class Scheduler:
             # shell_exec(credentials=<name>) resolves bundles from here to
             # inject an external coding-agent's key into one subprocess.
             extras["coding_backends"] = self.config.coding_backends
+            # H3: dispatch-depth cap. Carry THIS task's depth + the ceiling so
+            # dispatch_task can stamp child depth = parent+1 and refuse to
+            # recurse past the cap (a runaway A→B→C→… dispatch chain), without
+            # an extra DB read in the tool.
+            extras["task_depth"] = (task.metadata or {}).get("depth", 0)
+            extras["max_dispatch_depth"] = self.config.max_dispatch_depth
             # archive_agent (tool) consults the agents table at call time
             # for "is this a bootstrap-seeded singleton" via
             # parent_agent_id IS NULL. No need to pre-compute a snapshot

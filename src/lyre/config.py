@@ -391,6 +391,12 @@ class Config:
     # retention_days > 0. Default 6h — maintenance is cheap (delete + WAL
     # checkpoint; full VACUUM is CLI-only) so it needn't run every tick.
     maintenance_interval_s: int = 21600
+    # H3: dispatch-depth cap. The longest chain of nested dispatch_task calls
+    # (owner→A→B→…) before a dispatch is refused and the agent must escalate to
+    # its parent/owner instead of recursing — bounds a runaway cross-actor
+    # dispatch tree. Default 8 (generous; real trees are 2-3 deep). 0 disables.
+    # See ORCHESTRATION_ROBUSTNESS.md / H3.
+    max_dispatch_depth: int = 8
 
     @classmethod
     def from_env(cls) -> Config:
@@ -656,6 +662,19 @@ class Config:
             maintenance_interval_s = 21600
         if maintenance_interval_s < 60:
             maintenance_interval_s = 60
+        # H3 dispatch-depth cap: env LYRE_MAX_DISPATCH_DEPTH > [scheduler]
+        # max_dispatch_depth > default 8. Negative/garbage → default; 0 disables.
+        mdd_env = os.environ.get("LYRE_MAX_DISPATCH_DEPTH")
+        mdd_chosen = (
+            mdd_env if mdd_env is not None
+            else scheduler_raw.get("max_dispatch_depth")
+        )
+        try:
+            max_dispatch_depth = int(mdd_chosen) if mdd_chosen is not None else 8
+        except (ValueError, TypeError):
+            max_dispatch_depth = 8
+        if max_dispatch_depth < 0:
+            max_dispatch_depth = 8
 
         # ---- coding-agent credential bundles ----
         # [coding_backends.<name>] auth_env = "..." [allowed_personas = [...]].
@@ -731,6 +750,7 @@ class Config:
             notes_max_entries=notes_max_entries,
             retention_days=retention_days,
             maintenance_interval_s=maintenance_interval_s,
+            max_dispatch_depth=max_dispatch_depth,
             coding_backends=coding_backends,
         )
 
