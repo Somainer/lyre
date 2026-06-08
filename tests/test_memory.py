@@ -16,6 +16,7 @@ from lyre.persistence.models import Persona, TaskSpec
 from lyre.persistence.sqlite_impl import SqliteRepositories
 from lyre.runtime.context import assemble_system_prompt
 from lyre.runtime.memory import (
+    build_memory_index_for_prompt,
     ensure_skeleton,
     format_memory_index,
     scan_memory_dir,
@@ -97,6 +98,23 @@ def test_scan_skips_non_md_and_hidden_files(tmp_path: Path) -> None:
     assert {e.name for e in entries} == {"real"}
 
 
+def test_scan_excludes_per_agent_notes_from_shared_index(tmp_path: Path) -> None:
+    """C3: per-agent private notebooks (facts/agent-<id>-notes.md) must NOT
+    appear in the shared memory index — they are pushed to their owner via the
+    identity preamble and readable via read_memory, and would otherwise tax
+    every agent's prompt with every other agent's notebook."""
+    ensure_skeleton(tmp_path)
+    _write_md(tmp_path / "facts" / "shared-fact.md", {"description": "shared"}, "")
+    _write_md(
+        tmp_path / "facts" / "agent-worker-maintainer-1-notes.md",
+        {"description": "worker-maintainer-1's private notebook"},
+        "",
+    )
+    names = {e.name for e in scan_memory_dir(tmp_path)}
+    assert "shared-fact" in names
+    assert "agent-worker-maintainer-1-notes" not in names
+
+
 def test_scan_tolerates_missing_frontmatter(tmp_path: Path) -> None:
     ensure_skeleton(tmp_path)
     (tmp_path / "facts" / "raw.md").write_text("just body, no frontmatter")
@@ -156,6 +174,63 @@ def test_format_index_skips_empty_groups(tmp_path: Path) -> None:
     assert "### Facts" in out
     assert "### Persona profiles" not in out
     assert "### Skills" not in out
+
+
+# ---------------------------------------------------------------------------
+# C2: scope-aware index filtering
+# ---------------------------------------------------------------------------
+
+
+def test_index_scope_filters_by_persona_and_agent(tmp_path: Path) -> None:
+    """C2: facts scoped to a persona/agent only appear for that persona/agent;
+    global and free-form-scoped facts always appear (no regression)."""
+    ensure_skeleton(tmp_path)
+    _write_md(tmp_path / "facts" / "g.md", {"description": "global fact"}, "")
+    _write_md(
+        tmp_path / "facts" / "freeform.md",
+        {"description": "freeform", "scope": "lisa-lang"},
+        "",
+    )
+    _write_md(
+        tmp_path / "facts" / "p.md",
+        {"description": "persona fact", "scope": "persona=analyst"},
+        "",
+    )
+    _write_md(
+        tmp_path / "facts" / "a.md",
+        {"description": "agent fact", "scope": "agent=analyst-1"},
+        "",
+    )
+
+    # analyst-1: global + freeform + persona=analyst + agent=analyst-1.
+    idx = build_memory_index_for_prompt(
+        tmp_path, agent_id="analyst-1", persona_name="analyst"
+    )
+    assert "facts/g.md" in idx
+    assert "facts/freeform.md" in idx  # free-form scope falls back to global
+    assert "facts/p.md" in idx
+    assert "facts/a.md" in idx
+
+    # worker-1: only global + freeform; the persona/agent-scoped facts hide.
+    idx2 = build_memory_index_for_prompt(
+        tmp_path, agent_id="worker-1", persona_name="worker"
+    )
+    assert "facts/g.md" in idx2
+    assert "facts/freeform.md" in idx2
+    assert "facts/p.md" not in idx2
+    assert "facts/a.md" not in idx2
+
+
+def test_index_unfiltered_when_no_agent_given(tmp_path: Path) -> None:
+    """C2: omitting agent_id/persona_name keeps the legacy unfiltered behavior
+    — every fact regardless of scope (non-wakeup callers are unaffected)."""
+    ensure_skeleton(tmp_path)
+    _write_md(
+        tmp_path / "facts" / "p.md",
+        {"description": "persona fact", "scope": "persona=analyst"},
+        "",
+    )
+    assert "facts/p.md" in build_memory_index_for_prompt(tmp_path)
 
 
 # ---------------------------------------------------------------------------

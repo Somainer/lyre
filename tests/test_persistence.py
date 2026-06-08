@@ -79,6 +79,77 @@ async def test_task_lifecycle_with_lease(repos: SqliteRepositories) -> None:
 
 
 @pytest.mark.asyncio
+async def test_update_status_fencing_by_lease_holder(
+    repos: SqliteRepositories,
+) -> None:
+    """A1: a terminal status write fenced by holder_wakeup_id no-ops when a
+    DIFFERENT wakeup now holds the lease — a superseded worker can't clobber
+    the new holder's status. Unfenced writes (holder=None, pre-wakeup callers)
+    always apply, preserving existing behavior."""
+    await repos.personas.upsert(
+        Persona(name="worker", role_description="w", system_prompt="w")
+    )
+    task_id = await repos.tasks.create(
+        TaskSpec(persona_name="worker", goal="g", acceptance="a")
+    )
+    assert await repos.tasks.claim_lease(task_id, "wakeup-a", duration_sec=60)
+
+    # A stale worker (wakeup-b) tries to finalize — fenced out, no-op, returns
+    # False so the caller knows to skip the co-committed task_terminated mail.
+    assert not await repos.tasks.update_status(
+        task_id, "completed", holder_wakeup_id="wakeup-b"
+    )
+    t = await repos.tasks.get(task_id)
+    assert t is not None and t.status != "completed"
+
+    # The real lease holder (wakeup-a) finalizes — applies, returns True.
+    assert await repos.tasks.update_status(
+        task_id, "completed", holder_wakeup_id="wakeup-a"
+    )
+    t = await repos.tasks.get(task_id)
+    assert t is not None and t.status == "completed"
+
+    # Unfenced write (holder=None) always applies regardless of holder.
+    assert await repos.tasks.update_status(task_id, "failed")
+    t = await repos.tasks.get(task_id)
+    assert t is not None and t.status == "failed"
+
+    # No such task → no row updated → False.
+    assert not await repos.tasks.update_status("no-such-task", "failed")
+
+
+@pytest.mark.asyncio
+async def test_request_cancel_flag_roundtrip(repos: SqliteRepositories) -> None:
+    """B2: request_cancel durably flags a non-terminal task; get_cancel_request
+    reads the reason back (empty string when none given, never None once set).
+    A terminal task can't be cancelled; an unknown task reads None."""
+    await repos.personas.upsert(
+        Persona(name="worker", role_description="w", system_prompt="w")
+    )
+    task_id = await repos.tasks.create(
+        TaskSpec(persona_name="worker", goal="g", acceptance="a")
+    )
+
+    assert await repos.tasks.get_cancel_request(task_id) is None
+    assert await repos.tasks.request_cancel(task_id, "wrong path")
+    assert await repos.tasks.get_cancel_request(task_id) == "wrong path"
+
+    # Reason is optional — flag still set, reason reads back as "".
+    task2 = await repos.tasks.create(
+        TaskSpec(persona_name="worker", goal="g2", acceptance="a2")
+    )
+    assert await repos.tasks.request_cancel(task2)
+    assert await repos.tasks.get_cancel_request(task2) == ""
+
+    # A terminal task can't be cancelled.
+    await repos.tasks.update_status(task_id, "completed")
+    assert not await repos.tasks.request_cancel(task_id, "too late")
+
+    # Unknown task reads None.
+    assert await repos.tasks.get_cancel_request("no-such-task") is None
+
+
+@pytest.mark.asyncio
 async def test_task_expired_lease_is_reclaimable(
     repos: SqliteRepositories,
 ) -> None:

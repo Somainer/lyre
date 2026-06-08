@@ -286,6 +286,21 @@ class Config:
     # ---- defaults: existing runtime knobs ----
     model_override: str | None = None
     compact_threshold: float = 0.7
+    # H1 dead-loop guard: K consecutive identical (tool, args) calls within ONE
+    # wakeup → one nudge, then stop the wakeup as needs_continuation. Same-args
+    # repetition inside a single synchronous wakeup is degenerate (state can't
+    # change between the calls). Default 5 (active); 0 disables. See
+    # LONG_RUNNING_ROBUSTNESS_2.md H1.
+    loop_repeat_threshold: int = 5
+    # A1 per-wakeup wall budget (seconds). The lease heartbeat renews the task
+    # lease while a wakeup runs; this caps how long it will do so. When > 0 and
+    # a wakeup outlives the budget, the loop is cooperatively stopped
+    # (needs_continuation) so a wedged-but-not-repeating wakeup eventually
+    # releases its lease for recovery. 0 (default) = no wall: the heartbeat
+    # renews indefinitely (a healthy long wakeup is never falsely recovered;
+    # H1 + operator cancel still bound the common runaway cases). Opt-in,
+    # matching the other safety knobs. See LONG_RUNNING_ROBUSTNESS_2.md A1.
+    wakeup_wall_budget_s: int = 0
     # Per-turn output budget passed to the LLM (``max_tokens``) — i.e.
     # the cap on a single assistant message, NOT a lifetime budget.
     # Long-running ≠ large per-turn output; what really sets this floor
@@ -490,6 +505,31 @@ class Config:
             )
         except (ValueError, TypeError):
             max_tokens = 32768
+        # H1 dead-loop guard threshold: env LYRE_LOOP_REPEAT_THRESHOLD >
+        # [runtime] loop_repeat_threshold > default 5. 0 / negative disables;
+        # garbage falls back to the default rather than silently disabling it.
+        loop_repeat_raw = os.environ.get(
+            "LYRE_LOOP_REPEAT_THRESHOLD"
+        ) or runtime_raw.get("loop_repeat_threshold")
+        try:
+            loop_repeat_threshold = (
+                int(loop_repeat_raw) if loop_repeat_raw is not None else 5
+            )
+        except (ValueError, TypeError):
+            loop_repeat_threshold = 5
+        if loop_repeat_threshold < 0:
+            loop_repeat_threshold = 0
+        # A1 per-wakeup wall budget: env LYRE_WAKEUP_WALL_BUDGET_S > [runtime]
+        # wakeup_wall_budget_s > default 0 (off). Negative/garbage → 0.
+        wall_raw = os.environ.get(
+            "LYRE_WAKEUP_WALL_BUDGET_S"
+        ) or runtime_raw.get("wakeup_wall_budget_s")
+        try:
+            wakeup_wall_budget_s = int(wall_raw) if wall_raw is not None else 0
+        except (ValueError, TypeError):
+            wakeup_wall_budget_s = 0
+        if wakeup_wall_budget_s < 0:
+            wakeup_wall_budget_s = 0
         dashboard_port_raw = os.environ.get("LYRE_DASHBOARD_PORT") or runtime_raw.get(
             "default_dashboard_port", 8765
         )
@@ -632,6 +672,8 @@ class Config:
             default_model=default_model,
             model_override=model_override,
             compact_threshold=compact_threshold,
+            loop_repeat_threshold=loop_repeat_threshold,
+            wakeup_wall_budget_s=wakeup_wall_budget_s,
             max_tokens=max_tokens,
             lyre_home=home,
             user_md_path=user_md_path,

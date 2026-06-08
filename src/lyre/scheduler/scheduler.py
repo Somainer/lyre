@@ -23,8 +23,10 @@ takes over.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import sys
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -95,6 +97,22 @@ _WAKEUP_TO_TASK_STATUS: dict[str, str] = {
 
 def _wakeup_status_to_task_status(wakeup_status: str) -> str:
     return _WAKEUP_TO_TASK_STATUS.get(wakeup_status, wakeup_status)
+
+
+# B2 stores the operator cancel signal in tasks.metadata. A restarted task must
+# NOT inherit it from the task it replaces — otherwise cancelling one leg of a
+# permanent/transient ephemeral reincarnates as "born cancelled", and the agent
+# storms itself to death (restart → cancel turn 0 → restart …) instead of just
+# cancelling that leg. Strip the cancel keys wherever task.metadata is copied
+# into a new task. (LR2 review finding 1.)
+_CANCEL_METADATA_KEYS: frozenset[str] = frozenset({"cancel_requested", "cancel_reason"})
+
+
+def _metadata_without_cancel(metadata: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not metadata:
+        return metadata
+    stripped = {k: v for k, v in metadata.items() if k not in _CANCEL_METADATA_KEYS}
+    return stripped or None
 
 
 # task_terminated mail (OTP `monitor`/DOWN analogue): only a TERMINAL task
@@ -688,7 +706,8 @@ class Scheduler:
                                 goal=latest.goal,
                                 acceptance=latest.acceptance,
                                 parent_task_id=latest.parent_task_id,
-                                metadata=latest.metadata,
+                                # Never carry a B2 cancel flag into the restart.
+                                metadata=_metadata_without_cancel(latest.metadata),
                             )
                         )
                         restarted = True
@@ -1233,6 +1252,62 @@ class Scheduler:
         # task still in `_active_subprocesses` won't double-spawn.
         self._active_subprocesses.pop(task_id, None)
 
+    async def _lease_heartbeat(
+        self,
+        task_id: str,
+        wakeup_id: str,
+        lease_duration_s: int,
+        agent_loop: AgentLoop,
+    ) -> None:
+        """A1: renew this wakeup's task lease every ~lease_duration_s/3 while it
+        runs, up to an optional per-wakeup wall budget.
+
+        - ``renew_lease``'s ``WHERE lease_holder=?`` self-fences: if the lease
+          was stolen (recovery re-dispatched a long-stalled task), renew returns
+          False and we ask the loop to stop — a superseded worker stops mutating
+          shared FS state instead of racing to a (fenced) terminal commit.
+        - When ``wakeup_wall_budget_s > 0`` and exceeded, stop renewing and ask
+          the loop to stop (needs_continuation) so a wedged-but-not-repeating
+          wakeup eventually releases its lease for recovery.
+
+        Best-effort: a transient renew error just retries next interval. The
+        task is cancelled in the caller's ``finally``.
+        """
+        interval = max(1.0, lease_duration_s / 3)
+        wall = self.config.wakeup_wall_budget_s
+        deadline = (time.monotonic() + wall) if wall > 0 else None
+        while True:
+            await asyncio.sleep(interval)
+            if deadline is not None and time.monotonic() >= deadline:
+                agent_loop.request_stop(
+                    "needs_continuation", f"per-wakeup wall budget {wall}s exceeded"
+                )
+                log.warning(
+                    "wakeup_wall_budget_exceeded",
+                    task_id=task_id,
+                    wakeup_id=wakeup_id,
+                    budget_s=wall,
+                )
+                return
+            try:
+                renewed = await self.repos.tasks.renew_lease(
+                    task_id, wakeup_id, duration_sec=lease_duration_s
+                )
+            except Exception as exc:  # noqa: BLE001 — heartbeat is best-effort
+                log.warning(
+                    "lease_renew_error",
+                    task_id=task_id,
+                    wakeup_id=wakeup_id,
+                    error=str(exc),
+                )
+                continue
+            if not renewed:
+                agent_loop.request_stop("needs_continuation", "lease lost")
+                log.warning(
+                    "lease_lost_stopping_wakeup", task_id=task_id, wakeup_id=wakeup_id
+                )
+                return
+
     async def _run_task_inline(self, task_id: str) -> None:
         task = await self.repos.tasks.get(task_id)
         if task is None:
@@ -1465,15 +1540,36 @@ class Scheduler:
                 blocker_watcher=blocker_watcher,
                 kill_switch=self.kill_switch,
                 compact_threshold=self.config.compact_threshold,
+                loop_repeat_threshold=self.config.loop_repeat_threshold,
+                # B2: let the loop observe an operator cancel at each turn
+                # boundary. Reads the durable cancel flag off this task's row.
+                cancel_check=lambda: self.repos.tasks.get_cancel_request(task_id),
             )
 
             # Kill point 1: lease claimed, context assembled, before any action
             self.kill_switch.check("before_action")
 
-            result = await agent_loop.run(
-                system_prompt=system_prompt,
-                initial_messages=[initial_user_msg],
+            # A1: keep this wakeup's lease alive while it runs (the lease was
+            # claimed once at start and would otherwise expire mid-wakeup,
+            # letting recovery re-dispatch a still-live task → double execution
+            # on shared FS state). The heartbeat self-fences via
+            # renew_lease's WHERE lease_holder=? and asks the loop to stop if
+            # the lease was stolen or the wall budget is exceeded. Runs inside
+            # _run_task_inline so it covers both inline AND subprocess modes.
+            heartbeat = asyncio.create_task(
+                self._lease_heartbeat(
+                    task_id, wakeup_id, task.lease_duration_s, agent_loop
+                )
             )
+            try:
+                result = await agent_loop.run(
+                    system_prompt=system_prompt,
+                    initial_messages=[initial_user_msg],
+                )
+            finally:
+                heartbeat.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await heartbeat
 
             # Kill point 3 boundary: agent has finished its work (possibly
             # incl. remote-side push/PR via shell_exec) and may or may not
@@ -1511,20 +1607,30 @@ class Scheduler:
                         ),
                     },
                 )
-                await self.repos.tasks.update_status(task_id, task_status)
+                # A1 fencing: only advance status if WE still hold the lease.
+                # If a long stall let recovery steal it, a stale terminal write
+                # must not clobber the new holder.
+                still_holder = await self.repos.tasks.update_status(
+                    task_id, task_status, holder_wakeup_id=wakeup_id
+                )
                 # Notify the supervisor that this task terminated (OTP monitor).
                 # needs_continuation→failed carries the wakeup status as a coarse
-                # reason until the structured end-contract lands.
-                await self._emit_task_terminated_mail(
-                    task,
-                    wakeup_id,
-                    task_status,
-                    summary=(result.text or "").strip()[:500] or None,
-                    failure_reason=(
-                        result.status if task_status == "failed" else None
-                    ),
-                    transcript_uri=transcript.uri,
-                )
+                # reason until the structured end-contract lands. Gated on the
+                # fenced write succeeding: a superseded worker must not emit a
+                # stale outcome that shadows the new holder's real one (the
+                # task_terminated external_id is keyed on task_id, first-write
+                # wins). The new holder emits the true notice. (LR2 review.)
+                if still_holder:
+                    await self._emit_task_terminated_mail(
+                        task,
+                        wakeup_id,
+                        task_status,
+                        summary=(result.text or "").strip()[:500] or None,
+                        failure_reason=(
+                            result.status if task_status == "failed" else None
+                        ),
+                        transcript_uri=transcript.uri,
+                    )
             succeeded = task_status == "completed"
             log.info(
                 "task_done",
@@ -1568,19 +1674,26 @@ class Scheduler:
                     end_status="failed",
                     failure_report={"error": str(e), "type": type(e).__name__},
                 )
-                await self.repos.tasks.update_status(task_id, "failed")
+                # A1 fencing (see success path): don't let a superseded worker's
+                # failure write clobber the new lease-holder's status.
+                still_holder = await self.repos.tasks.update_status(
+                    task_id, "failed", holder_wakeup_id=wakeup_id
+                )
                 # The original "sudden failed 没人知道" path: a mid-wakeup crash
                 # never produced an end-of-wakeup declaration, so the supervisor
                 # must still be told. ``task`` may be stale (pre-wakeup) but its
                 # parent/metadata — all this needs — don't change mid-wakeup.
-                await self._emit_task_terminated_mail(
-                    task,
-                    wakeup_id,
-                    "failed",
-                    summary=f"{type(e).__name__}: {e}"[:500],
-                    failure_reason=type(e).__name__,
-                    transcript_uri=getattr(transcript, "uri", None),
-                )
+                # Gated on holding the lease (see success path) so a superseded
+                # worker doesn't shadow the new holder's real outcome.
+                if still_holder:
+                    await self._emit_task_terminated_mail(
+                        task,
+                        wakeup_id,
+                        "failed",
+                        summary=f"{type(e).__name__}: {e}"[:500],
+                        failure_reason=type(e).__name__,
+                        transcript_uri=getattr(transcript, "uri", None),
+                    )
         finally:
             # Simulated process death (Q5 chaos test): if a SimulatedKill is
             # propagating, real process would already be dead and no `finally`

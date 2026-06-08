@@ -88,6 +88,41 @@ async def test_run_with_tool_use_loops_until_end_turn(object_store: Path) -> Non
 
 
 @pytest.mark.asyncio
+async def test_max_turns_exhaustion_on_end_turn_is_needs_continuation_not_completed(
+    object_store: Path,
+) -> None:
+    """A2: a wakeup truncated by max_turns must NOT be reported 'completed',
+    even when every turn's stop_reason is 'end_turn' alongside tool_use (the
+    DeepSeek/Anthropic pattern where end_turn is metadata, not a control
+    signal). The clean-finish break only fires on a no-tool turn, so this loop
+    runs to exhaustion and must surface as 'needs_continuation' — observable
+    and re-dispatchable — instead of silently claiming success."""
+    adapter = FakeAdapter()
+    # Every turn calls a tool AND reports end_turn → the no-tool clean-finish
+    # break never fires; the loop runs all max_turns iterations.
+    for _ in range(3):
+        adapter.push_turn(
+            [
+                ToolUseComplete(id="t", name="mailbox_send", input={"to": "owner"}),
+                TurnComplete(stop_reason="end_turn"),
+            ]
+        )
+    transcript = TranscriptWriter(object_store, "wakeup-maxturns")
+    loop = build_single_candidate_loop(adapter, transcript, max_turns=3)
+
+    result = await loop.run(
+        system_prompt="",
+        initial_messages=[
+            LyreMessage(role="user", content=[LyreContentBlock(type="text", text="go")])
+        ],
+    )
+    transcript.close()
+
+    assert result.turns == 3
+    assert result.status == "needs_continuation"
+
+
+@pytest.mark.asyncio
 async def test_run_passes_system_and_messages_through(object_store: Path) -> None:
     adapter = FakeAdapter()
     adapter.push_turn([ContentDelta(text=""), TurnComplete(stop_reason="end_turn")])

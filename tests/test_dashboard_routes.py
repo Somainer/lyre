@@ -120,6 +120,45 @@ def test_home_renders_with_cards_and_blockers(
     assert "STOP, awaiting decision" in body  # blocker preview
 
 
+def test_task_detail_cancel_button_then_banner(
+    seeded_dashboard: tuple[TestClient, SqliteRepositories, dict],
+) -> None:
+    """B2 dashboard: a non-terminal task shows a cancel form; POSTing it sets
+    the durable flag (303 back to the detail) and the page then shows the
+    'Cancel requested' banner instead of the form."""
+    client, _repos, ids = seeded_dashboard
+    tid = ids["running_task"]  # in_progress
+
+    r = client.get(f"/tasks/{tid}")
+    assert r.status_code == 200
+    assert f"/tasks/{tid}/cancel" in r.text
+    assert "Request cancel" in r.text
+
+    r2 = client.post(
+        f"/tasks/{tid}/cancel", data={"reason": "wrong path"},
+        follow_redirects=False,
+    )
+    assert r2.status_code == 303
+    assert r2.headers["location"] == f"/tasks/{tid}"
+
+    r3 = client.get(f"/tasks/{tid}")
+    assert "Cancel requested" in r3.text
+    assert "wrong path" in r3.text
+    assert "Request cancel" not in r3.text  # form replaced by banner
+
+
+def test_task_detail_terminal_task_has_no_cancel_form(
+    seeded_dashboard: tuple[TestClient, SqliteRepositories, dict],
+) -> None:
+    """A completed task offers no cancel control."""
+    client, _repos, ids = seeded_dashboard
+    done = ids["done_task"]
+    r = client.get(f"/tasks/{done}")
+    assert r.status_code == 200
+    assert f"/tasks/{done}/cancel" not in r.text
+    assert "Request cancel" not in r.text
+
+
 def test_activity_is_overview_only_no_transcript_noise(
     seeded_dashboard: tuple[TestClient, SqliteRepositories, dict],
 ) -> None:

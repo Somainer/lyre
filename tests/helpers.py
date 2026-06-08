@@ -52,6 +52,8 @@ def build_single_candidate_loop(
     allowed_tools=None,
     max_turns: int = 24,
     model_id: str = "fake.test-model",
+    loop_repeat_threshold: int = 0,
+    cancel_check=None,
 ) -> AgentLoop:
     """Convenience: wrap a single adapter into the new candidate-list shape."""
     entry = fake_entry(id=model_id)
@@ -68,4 +70,6 @@ def build_single_candidate_loop(
         tool_context=tool_context,
         allowed_tools=allowed_tools,
         max_turns=max_turns,
+        loop_repeat_threshold=loop_repeat_threshold,
+        cancel_check=cancel_check,
     )
