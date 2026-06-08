@@ -452,50 +452,100 @@ def test_write_config_toml_minimal(tmp_path: Path) -> None:
     assert "[integrations.lark]" not in active  # no lark passed → stays clean
 
 
-def test_write_config_toml_omits_lark_when_default(tmp_path: Path) -> None:
-    """A LarkConfig with nothing set (the default) must NOT emit a section —
-    a first-run config should not sprout an empty [integrations.lark]."""
-    from lyre.config import LarkConfig
-
+def test_write_config_toml_no_existing_stays_clean(tmp_path: Path) -> None:
+    """First run (no existing config) emits none of the preserved sections —
+    config.toml shouldn't sprout empty [integrations]/[scheduler]/etc."""
     cfg = tmp_path / "config.toml"
-    write_config_toml(
-        cfg, owner_name="Alice", owner_email=None, lark=LarkConfig(),
-    )
-    assert "[integrations.lark]" not in cfg.read_text(encoding="utf-8")
+    write_config_toml(cfg, owner_name="Alice", owner_email=None, existing={})
+    text = cfg.read_text(encoding="utf-8")
+    active = _strip_comments(text)
+    assert "[integrations" not in active
+    assert "[scheduler]" not in active
+    assert "[coding_backends" not in active
 
 
-def test_write_config_toml_preserves_lark_across_reonboard(
+def test_write_config_toml_preserves_unmanaged_sections(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Re-onboard must not drop the owner's [integrations.lark] section.
+    """Re-onboard must round-trip EVERY section the wizard doesn't own.
 
-    Regression: the wizard rewrites config.toml from scratch and never
-    prompts for Lark, so onboard used to silently erase the channel —
-    including authorized_user_id (the owner's app-scoped open_id), which
-    is painful to recover. write_config_toml now re-emits it."""
-    from lyre.config import LarkConfig
-
+    Regression: the wizard rewrites config.toml from scratch, so onboard
+    used to silently erase owner-provisioned config it never prompts for —
+    [integrations.lark] (the open_id!), [scheduler], [personas.*],
+    [coding_backends.*], and any unknown/future section. write_config_toml
+    now preserves all of them verbatim."""
     cfg = tmp_path / "config.toml"
+    existing = {
+        # wizard-owned: must be REPLACED by the fresh args, not preserved.
+        "owner": {"name": "StaleName"},
+        "models": [{"id": "stale.model", "provider": "openai", "tier": "x"}],
+        # everything below is owner-provisioned and must survive.
+        "integrations": {"lark": {"enabled": True, "authorized_user_id": "ou_abc123"}},
+        "scheduler": {"max_concurrent_tasks": 8, "notes_max_entries": 50},
+        "personas": {"dispatcher": {"allowed_lyre_tools": ["mailbox_send"]}},
+        "coding_backends": {"codex": {"auth_env": "CODEX_API_KEY"}},
+        # a section Lyre's loader doesn't even know about yet:
+        "future_thing": {"hello": "world"},
+    }
+    spec = ModelSpec("anthropic.sonnet", "anthropic", "", "ANTHROPIC_API_KEY")
     write_config_toml(
-        cfg,
-        owner_name="Alice",
-        owner_email=None,
-        lark=LarkConfig(enabled=True, authorized_user_id="ou_abc123"),
+        cfg, owner_name="FreshName", owner_email=None,
+        models=[spec], default_model=spec.id, existing=existing,
     )
     text = cfg.read_text(encoding="utf-8")
-    assert "[integrations.lark]" in text
-    assert "enabled = true" in text
-    assert 'authorized_user_id = "ou_abc123"' in text
 
-    # Round-trips back through Config.from_env so a real `lyre serve`
-    # re-reads the preserved channel after the re-onboard.
+    # Wizard-owned sections: the fresh values win, the stale ones are gone.
+    assert 'name = "FreshName"' in text
+    assert "StaleName" not in text
+    assert "stale.model" not in text
+    assert _strip_comments(text).count("[[models]]") == 1
+
+    # Preserved sections all present.
+    assert "[integrations.lark]" in text
+    assert 'authorized_user_id = "ou_abc123"' in text
+    assert "[scheduler]" in text
+    assert "[personas.dispatcher]" in text
+    assert "[coding_backends.codex]" in text
+    assert "[future_thing]" in text
+
+    # And it all loads back through Config.from_env — proving the round-trip
+    # is real config a `lyre serve` re-reads, not just matching strings.
     monkeypatch.setenv("LYRE_HOME", str(tmp_path))
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("LARK_APP_ID", raising=False)
     monkeypatch.delenv("LARK_APP_SECRET", raising=False)
     loaded = Config.from_env()
-    assert loaded.integrations.lark.enabled is True
+    assert loaded.owner.name == "FreshName"
     assert loaded.integrations.lark.authorized_user_id == "ou_abc123"
+    assert loaded.max_concurrent_tasks == 8
+    assert loaded.notes_max_entries == 50
+    assert loaded.persona_overrides["dispatcher"].allowed_lyre_tools == ["mailbox_send"]
+    assert loaded.coding_backends["codex"].auth_env == "CODEX_API_KEY"
+
+
+def test_write_config_toml_merges_default_model_into_preserved_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The wizard owns the default_model KEY, not the whole [runtime]
+    section: a custom runtime knob the owner set must survive, default_model
+    is overridden, and the result is a single legal [runtime] table."""
+    cfg = tmp_path / "config.toml"
+    existing = {"runtime": {"default_model": "old.model", "compact_threshold": 0.85}}
+    write_config_toml(
+        cfg, owner_name="o", owner_email=None,
+        default_model="new.model", existing=existing,
+    )
+    text = cfg.read_text(encoding="utf-8")
+    assert text.count("[runtime]") == 1  # not two redefined tables
+    assert 'default_model = "new.model"' in text
+    assert "old.model" not in text
+    assert "compact_threshold = 0.85" in text
+
+    monkeypatch.setenv("LYRE_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    loaded = Config.from_env()
+    assert loaded.default_model == "new.model"
+    assert loaded.compact_threshold == 0.85
 
 
 def test_write_config_toml_header_only_auth(tmp_path: Path) -> None:

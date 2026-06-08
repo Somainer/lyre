@@ -29,6 +29,11 @@ dependencies = [
   # Config
   "pyyaml>=6.0",
   "python-dotenv>=1.0",
+  # Writing config.toml back: stdlib `tomllib` only reads. `lyre onboard`
+  # rewrites config.toml and must round-trip the owner-provisioned sections
+  # it doesn't prompt for (lark/scheduler/personas/coding_backends/…), so it
+  # needs a serializer — tomli_w is tomllib's write counterpart.
+  "tomli-w>=1.0",
   # Logging
   "structlog>=24.0",
   # Dashboard (Sprint D1)

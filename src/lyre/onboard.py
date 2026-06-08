@@ -25,8 +25,8 @@ from pathlib import Path
 from typing import Any
 
 import click
+import tomli_w
 
-from .config import LarkConfig
 from .persistence.db import init_db
 from .persistence.sqlite_impl import SqliteRepositories
 from .personas.seed import ensure_user_personas, seed_default_agents
@@ -177,7 +177,7 @@ def write_config_toml(
     owner_email: str | None,
     models: list[ModelSpec] | None = None,
     default_model: str | None = None,
-    lark: LarkConfig | None = None,
+    existing: dict[str, Any] | None = None,
 ) -> None:
     """Write ``~/.lyre/config.toml`` with the minimum fields onboard sets.
 
@@ -189,12 +189,14 @@ def write_config_toml(
     Per-persona model assignment is left to the user via ``[personas.<name>]
     model_preference = ...`` (commented example included in the output).
 
-    ``lark`` carries the owner's existing ``[integrations.lark]`` section so
-    a *re-run* preserves it. The wizard never prompts for Lark, so without
-    threading it through here an onboard re-run would silently drop the
-    channel — including ``authorized_user_id`` (the owner's app-scoped
-    open_id), which is painful to rediscover. Only the non-sensitive fields
-    are written; ``app_id`` / ``app_secret`` stay in ``.env``.
+    ``existing`` is the owner's *current* parsed ``config.toml`` (the wizard
+    rewrites the file from scratch each run). The wizard fully owns ``[owner]``
+    and ``[[models]]`` (it prompts for both) and the ``default_model`` key of
+    ``[runtime]``; **every other section is preserved verbatim** —
+    ``[integrations.lark]`` (the open_id!), ``[scheduler]``, ``[personas.*]``,
+    ``[coding_backends.*]``, any custom ``[runtime]`` knobs, and any unknown /
+    future section the wizard never asks about. Without this, a re-onboard
+    silently erased owner-provisioned config that's painful to recreate.
     """
     config_path.parent.mkdir(parents=True, exist_ok=True)
     lines = [
@@ -209,10 +211,9 @@ def write_config_toml(
         lines.append(f'email = "{_toml_escape(owner_email)}"')
     lines.append("")
 
-    if default_model:
-        lines.append("[runtime]")
-        lines.append(f'default_model = "{_toml_escape(default_model)}"')
-        lines.append("")
+    # NB: [runtime] is no longer hand-written here — it's folded into the
+    # preserved `tail` below so the wizard's `default_model` merges with any
+    # custom runtime knobs the owner had, in a single (legal) [runtime] table.
 
     # Persona display names (e.g. "luna" instead of "dispatcher") live in
     # ~/.lyre/personas/<name>/identity.md as `display_name:` frontmatter —
@@ -298,24 +299,46 @@ def write_config_toml(
         "",
     ])
 
-    # Carry the owner's Lark/Feishu channel through a re-onboard. The
-    # wizard owns owner/models/default_model and rewrites the file from
-    # scratch; [integrations.lark] is owner-provisioned config it never
-    # asks about, so it must be re-emitted here or it's lost on every
-    # re-run. Emit only when the section actually holds something (enabled
-    # or an authorized_user_id) so a first run stays clean. MUST come after
-    # the [[models]] blocks: TOML binds sub-tables to the most recent
-    # header, so a top-level table after the array-of-tables is correct.
-    if lark is not None and (lark.enabled or lark.authorized_user_id):
-        lines.append("[integrations.lark]")
-        lines.append(f"enabled = {'true' if lark.enabled else 'false'}")
-        if lark.authorized_user_id:
-            lines.append(
-                f'authorized_user_id = "{_toml_escape(lark.authorized_user_id)}"'
-            )
-        lines.append("")
+    # ---- preserve every section the wizard doesn't own ----
+    # The wizard owns [owner], [[models]], and the default_model key of
+    # [runtime]. Everything else in the owner's existing config.toml is
+    # round-tripped verbatim so a re-onboard never silently drops it. We
+    # serialize via tomli_w (not hand-emitted per known section) precisely
+    # so UNKNOWN / future sections survive too.
+    tail: dict[str, Any] = {
+        k: v for k, v in (existing or {}).items() if k not in ("owner", "models")
+    }
+    # default_model is wizard-owned: write it into [runtime], keeping any
+    # other runtime knobs the owner set, and surface it first for readability.
+    if default_model is not None or "runtime" in tail:
+        runtime_tbl = dict(tail.get("runtime") or {})
+        if default_model is not None:
+            runtime_tbl = {
+                "default_model": default_model,
+                **{k: v for k, v in runtime_tbl.items() if k != "default_model"},
+            }
+        if runtime_tbl:
+            tail["runtime"] = runtime_tbl
+        else:
+            tail.pop("runtime", None)
 
-    config_path.write_text("\n".join(lines), encoding="utf-8")
+    # tomli_w emits bare top-level keys BEFORE any [table] header. Appended
+    # after the [[models]] blocks, such a key would bind to the last model
+    # (TOML's most-recent-header rule). Lyre's config is a table-of-tables so
+    # this is normally moot, but stay correct if the owner hand-added a bare
+    # key: scalars go at the very top (top-level context), tables at the end.
+    scalar_tail = {k: v for k, v in tail.items() if not isinstance(v, dict)}
+    table_tail = {k: v for k, v in tail.items() if isinstance(v, dict)}
+
+    parts: list[str] = []
+    if scalar_tail:
+        parts.append(tomli_w.dumps(scalar_tail).rstrip("\n"))
+    parts.append("\n".join(lines).rstrip("\n"))
+    if table_tail:
+        parts.append(tomli_w.dumps(table_tail).rstrip("\n"))
+    # Blank line between fragments so the preserved tables don't butt up
+    # against the wizard's trailing stub comments.
+    config_path.write_text("\n\n".join(parts) + "\n", encoding="utf-8")
 
 
 def _toml_escape(s: str) -> str:
@@ -640,18 +663,24 @@ def run_wizard(
     # ---- config.toml ----
     # Rewritten from scratch each run — the wizard is the SSOT for the
     # sections it owns (owner / models / default_model) and controls their
-    # shape end-to-end. Owner-provisioned sections the wizard never prompts
-    # for must be threaded back in explicitly or they're lost on re-run:
-    # [integrations.lark] is preserved below. (Other owner-added [runtime] /
-    # [scheduler] / [coding_backends] knobs are still re-add-after-onboard;
-    # a general "write-back unchanged" path is future work.)
+    # shape end-to-end. Everything else the owner put in config.toml is
+    # round-tripped through write_config_toml so a re-onboard never drops
+    # owner-provisioned sections (lark / scheduler / personas /
+    # coding_backends / custom runtime knobs / unknown). Read the CURRENT
+    # file here — it still holds the pre-onboard content; config.toml is
+    # only written below.
+    existing_raw: dict[str, Any] = {}
+    if config_path.is_file():
+        import tomllib
+        with config_path.open("rb") as f:
+            existing_raw = tomllib.load(f)
     write_config_toml(
         config_path,
         owner_name=owner_name,
         owner_email=owner_email,
         models=models,
         default_model=default_model,
-        lark=current_cfg.integrations.lark if current_cfg is not None else None,
+        existing=existing_raw,
     )
     click.echo(f"  ✓ wrote {config_path}")
 
