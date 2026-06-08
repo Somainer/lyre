@@ -69,10 +69,14 @@ judge that defaults skeptical and states what would flip the call.
 {
   "stance": "prosecution | defense",
   "strongest_case": "the single strongest, specific argument",
-  "evidence": "file:line / data / source backing it — concrete, not abstract",
-  "concedes": "what you honestly grant the other side"
+  "evidence": ["one concrete item per entry — file:line / data / source", "..."],
+  "concedes": ["one honest concession per entry", "..."]
 }
 ```
+
+`evidence` and `concedes` are **arrays** — they're naturally multi-item (several
+citations, several distinct concessions), and discrete entries let the judge
+weigh them one by one instead of parsing a blob.
 
 **Your verdict to the owner is structured TEXT — a `mailbox_send`, NOT JSON.**
 The owner reads prose, not a payload. Send these labelled lines:
