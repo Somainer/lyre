@@ -37,6 +37,7 @@ from ..config import Config
 from ..persistence.maintenance import run_maintenance
 from ..persistence.models import (
     Agent,
+    FanInGroup,
     MailboxMessage,
     OutboxRow,
     Persona,
@@ -612,6 +613,9 @@ class Scheduler:
         max_age = self.config.fanin_max_age_s
         ttl_cutoff = now - timedelta(seconds=max_age) if max_age > 0 else None
         for g in await self.repos.fan_in.find_open(limit=20, ttl_cutoff=ttl_cutoff):
+            # O1: turn any failed/abandoned leg into a counted barrier event so
+            # the group resolves at quorum instead of hanging to its deadline.
+            await self._reconcile_fan_in_failed_legs(g)
             delivered = await self.repos.mailbox.count_fan_in_results(
                 g.coordinator_agent_id, g.id
             )
@@ -663,6 +667,65 @@ class Scheduler:
                     quorum=g.quorum,
                     coordinator=g.coordinator_agent_id,
                 )
+
+    async def _reconcile_fan_in_failed_legs(self, g: FanInGroup) -> None:
+        """O1: a fan-in leg whose child task terminated WITHOUT delivering a typed
+        result (failed/cancelled, incl. an O2 downgrade) is invisible to the
+        barrier — count_fan_in_results sees only result-mails, so the group would
+        hang to its deadline with no coordinator signal. For each such leg, insert
+        an idempotent sentinel result-mail (metadata.fan_in.result._leg_failed) so
+        the barrier counts it (resolves at quorum) and the coordinator can see
+        which legs failed (O1b). Low-urgency so it doesn't prematurely wake the
+        coordinator — the quorum 'ready' mail is the wake. task_terminated stays
+        suppressed for fan-in legs; the failure travels the barrier channel.
+
+        Scheduler-owned (single-threaded tick, no lease); idempotent via
+        external_id, so a re-run inserts nothing new.
+        """
+        from ..persistence.models import MailboxMessage as _Msg
+
+        members = await self.repos.fan_in.members(g.id)
+        if not members:
+            return
+        have_result = {
+            r.leg_key
+            for r in await self.repos.mailbox.read_fan_in_results(
+                g.coordinator_agent_id, g.id
+            )
+        }
+        for m in members:
+            if m.leg_key in have_result:
+                continue
+            child = await self.repos.tasks.get(m.child_task_id)
+            if child is None or child.status not in ("failed", "cancelled"):
+                continue
+            # A result still pending in the outbox will deliver on its own.
+            if await self.repos.outbox.has_pending_fan_in_result(
+                m.child_task_id, g.id, m.leg_key
+            ):
+                continue
+            await self.repos.mailbox.ensure_mailbox(g.coordinator_agent_id)
+            await self.repos.mailbox.insert_message(
+                _Msg(
+                    recipient=g.coordinator_agent_id,
+                    external_id=f"fanin:{g.id}:{m.leg_key}:failed",
+                    sender="system:fan-in",
+                    urgency="low",
+                    title=f"fan-in {g.id} leg {m.leg_key} failed",
+                    body=(
+                        f"Leg {m.leg_key} of fan-in {g.id} terminated "
+                        f"'{child.status}' without a typed result."
+                    ),
+                    task_id=g.parent_task_id,
+                    metadata={
+                        "fan_in": {
+                            "group_id": g.id,
+                            "leg_key": m.leg_key,
+                            "result": {"_leg_failed": True, "reason": child.status},
+                        }
+                    },
+                )
+            )
 
     async def _resume_parked_tasks(self) -> None:
         """Phase 0.7: resume tasks parked in 'needs_input' once their resume

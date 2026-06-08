@@ -15,12 +15,15 @@ import pytest
 
 from lyre.persistence.models import (
     FanInGroup,
+    FanInMember,
     MailboxMessage,
     OutboxRow,
     Persona,
     TaskSpec,
 )
 from lyre.persistence.sqlite_impl import SqliteRepositories
+from lyre.runtime.tools import ToolContext
+from lyre.runtime.tools.fan_in import _fan_in_results
 from lyre.scheduler.scheduler import Scheduler
 
 
@@ -120,3 +123,89 @@ async def test_fan_in_leg_submitted_result_validation(
                                             "result": {"ok": 1}}})
     )
     assert await Scheduler._fan_in_leg_submitted_result(fake, t_delivered, t_delivered.id) is True
+
+
+def _fake_sched(repos: SqliteRepositories) -> SimpleNamespace:
+    fake = SimpleNamespace(repos=repos, config=SimpleNamespace(fanin_max_age_s=0))
+    # _resolve_fan_in_barriers calls self._reconcile_fan_in_failed_legs; bind it
+    # so the lightweight fake-self exercises the real composition.
+    fake._reconcile_fan_in_failed_legs = (
+        lambda g: Scheduler._reconcile_fan_in_failed_legs(fake, g)
+    )
+    return fake
+
+
+@pytest.mark.asyncio
+async def test_fanin_dispatcher_sees_failed_leg_no_result_and_continuation_failure(
+    repos: SqliteRepositories,
+) -> None:
+    """Acceptance mock: a 3-leg fanout where leg0 delivers a typed result, leg1
+    completed without a typed result (O2-downgraded to failed), and leg2
+    exhausted turns (needs_continuation→failed). The coordinator must see the
+    barrier resolve at QUORUM (not the deadline), with failed_legs=[1,2] and no
+    still-missing legs — instead of the group hanging silently."""
+    await repos.personas.upsert(
+        Persona(name="w", role_description="w", system_prompt="w")
+    )
+    await repos.agents.create("coordinator-1", "w")
+    for a in ("leg0", "leg1", "leg2"):
+        await repos.agents.create(a, "w")
+    await repos.fan_in.create_group(
+        FanInGroup(
+            id="g", coordinator_agent_id="coordinator-1", expect_replies=3,
+            quorum=3, result_schema={}, deadline=datetime(2999, 1, 1, tzinfo=UTC),
+        )
+    )
+    tids: dict[int, str] = {}
+    for leg, agent in enumerate(("leg0", "leg1", "leg2")):
+        tid = await repos.tasks.create(
+            TaskSpec(persona_name="w", goal="g", acceptance="a")
+        )
+        tids[leg] = tid
+        await repos.fan_in.add_member(
+            FanInMember(group_id="g", leg_key=leg, child_task_id=tid, child_agent_id=agent)
+        )
+
+    # leg0: a real typed result delivered to the coordinator.
+    await repos.mailbox.insert_message(
+        MailboxMessage(
+            recipient="coordinator-1", external_id="leg0-result", sender="leg0",
+            urgency="low", body="finding",
+            metadata={"fan_in": {"group_id": "g", "leg_key": 0, "result": {"finding": "x"}}},
+        )
+    )
+    # leg1 (no-result completed → O2 downgrade) and leg2 (turn-exhaust) both failed.
+    await repos.tasks.update_status(tids[1], "failed")
+    await repos.tasks.update_status(tids[2], "failed")
+
+    fake = _fake_sched(repos)
+
+    # Reconciliation is idempotent: running it twice yields 2 sentinels, not 4.
+    g = await repos.fan_in.get("g")
+    await Scheduler._reconcile_fan_in_failed_legs(fake, g)
+    await Scheduler._reconcile_fan_in_failed_legs(fake, g)
+    assert await repos.mailbox.count_fan_in_results("coordinator-1", "g") == 3
+
+    # Phase 0.5 resolves at QUORUM (1 real + 2 failed-sentinels == 3), not deadline.
+    await Scheduler._resolve_fan_in_barriers(fake)
+    g = await repos.fan_in.get("g")
+    assert g.status == "quorum_met"
+
+    async with repos.conn.execute(
+        "SELECT json_extract(metadata,'$.trigger') AS trig FROM mailbox_messages "
+        "WHERE recipient='coordinator-1' AND external_id='fanin:g:resolved'"
+    ) as cur:
+        row = await cur.fetchone()
+    assert row is not None and row["trig"] == "quorum"
+
+    # The fan_in_results tool separates real results from failed legs.
+    ctx = ToolContext(
+        repos=repos, task_id="t", wakeup_id="wk", persona_name="w",
+        agent_id="coordinator-1",
+    )
+    out = await _fan_in_results(ctx, {"group_id": "g"})
+    assert out["delivered"] == 1
+    assert [r["leg_key"] for r in out["results"]] == [0]
+    assert {f["leg_key"] for f in out["failed_legs"]} == {1, 2}
+    assert all(f["reason"] == "failed" for f in out["failed_legs"])
+    assert out["missing_legs"] == []

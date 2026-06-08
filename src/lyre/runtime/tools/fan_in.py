@@ -95,24 +95,40 @@ async def _fan_in_results(ctx: ToolContext, args: dict[str, Any]) -> dict[str, A
     g = await ctx.repos.fan_in.get(group_id)
     if g is None:
         raise ToolError(f"fan-in group {group_id!r} not found")
-    results: list[FanInResult] = await ctx.repos.mailbox.read_fan_in_results(
+    raw: list[FanInResult] = await ctx.repos.mailbox.read_fan_in_results(
         g.coordinator_agent_id, g.id
     )
-    delivered_legs = {r.leg_key for r in results}
-    missing = [k for k in range(g.expect_replies) if k not in delivered_legs]
+    # O1: a failed/abandoned leg is surfaced as a sentinel result-mail
+    # (result._leg_failed) so the barrier counts it. Split those out of the real
+    # typed payloads so synthesis doesn't ingest a failure marker as data.
+    real = [
+        r for r in raw
+        if not (isinstance(r.result, dict) and r.result.get("_leg_failed"))
+    ]
+    failed = [
+        r for r in raw
+        if isinstance(r.result, dict) and r.result.get("_leg_failed")
+    ]
+    seen_legs = {r.leg_key for r in raw}
+    missing = [k for k in range(g.expect_replies) if k not in seen_legs]
     return {
         "group_id": g.id,
         "status": g.status,
         "expect_replies": g.expect_replies,
         "quorum": g.quorum,
-        "delivered": len(results),
+        "delivered": len(real),
         # The typed payloads, one per leg — aggregate these into your synthesis.
         "results": [
             {"leg_key": r.leg_key, "from": r.sender, "result": r.result}
-            for r in results
+            for r in real
         ],
-        # Legs that never delivered (lagged past deadline / failed). With a
-        # quorum < expect_replies this is expected; synthesize from what arrived.
+        # O1: legs that terminated WITHOUT a typed result (failed / no-result),
+        # surfaced as a barrier event so you know they FAILED (vs still lagging).
+        "failed_legs": [
+            {"leg_key": r.leg_key, "reason": (r.result or {}).get("reason")}
+            for r in failed
+        ],
+        # Legs that have neither a result nor a failure yet — still in flight.
         "missing_legs": missing,
     }
 
