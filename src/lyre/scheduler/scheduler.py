@@ -909,6 +909,31 @@ class Scheduler:
             return "owner"
         return None
 
+    async def _fan_in_leg_submitted_result(
+        self, task: Task, task_id: str
+    ) -> bool | None:
+        """O2: did this fan-in leg submit its typed result — either still pending
+        in the outbox (the common case; the dispatcher runs out-of-band) or
+        already delivered to the coordinator? Returns None when the task is not a
+        fan-in leg (nothing to validate)."""
+        meta = task.metadata or {}
+        group_id = meta.get("fan_in_group")
+        leg_key = meta.get("leg_key")
+        if group_id is None or leg_key is None:
+            return None
+        if await self.repos.outbox.has_pending_fan_in_result(
+            task_id, group_id, leg_key
+        ):
+            return True
+        grp = await self.repos.fan_in.get(group_id)
+        if grp is not None:
+            delivered = await self.repos.mailbox.read_fan_in_results(
+                grp.coordinator_agent_id, group_id
+            )
+            if any(r.leg_key == leg_key for r in delivered):
+                return True
+        return False
+
     async def _emit_task_terminated_mail(
         self,
         task: Task | None,
@@ -1613,6 +1638,22 @@ class Scheduler:
                 self.registry.by_id(result.model_id) if result.model_id else None
             )
             task_status = _wakeup_status_to_task_status(result.status)
+            # O2: a fan-in leg that completed WITHOUT ever submitting its typed
+            # result is a silent dead leg — the barrier never increments and the
+            # task_terminated mail is suppressed for fan-in legs, so the group
+            # would hang to its deadline. Downgrade to failed so it surfaces
+            # (Phase-0.5 reconciliation, O1, then turns it into a coordinator
+            # event). The wakeup itself ran fine, so end_status stays
+            # result.status; only the TASK fails its fan-in contract.
+            if task_status == "completed":
+                submitted = await self._fan_in_leg_submitted_result(task, task_id)
+                if submitted is False:
+                    task_status = "failed"
+                    transcript.note(
+                        "fan_in_no_typed_result: leg completed without a typed "
+                        "result — downgraded to failed"
+                    )
+                    log.warning("fan_in_no_typed_result", task_id=task_id)
             # Step 9 COMMIT POINT: the wakeup-end metering, the task-status
             # advance, and the supervisor task_terminated outbox row must land
             # as ONE commit. A SIGKILL between update_status (terminal) and the

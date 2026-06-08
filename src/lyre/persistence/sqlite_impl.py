@@ -2005,6 +2005,28 @@ class SqliteOutboxRepository:
         )
         await _commit(self.conn)
 
+    async def has_pending_fan_in_result(
+        self, task_id: str, group_id: str, leg_key: int
+    ) -> bool:
+        """O2: whether THIS leg's typed fan-in result is enqueued in the outbox
+        but not yet dispatched. ``count_fan_in_results`` sees only DELIVERED
+        mail, so at the leg's terminal commit a result one tick from delivery
+        would look missing — this guards O2's downgrade against that
+        false-negative. The result-mail rides the outbox payload as
+        ``$.metadata.fan_in.{group_id,leg_key}`` (the dispatcher copies
+        ``payload.metadata`` onto the delivered row)."""
+        async with self.conn.execute(
+            """
+            SELECT 1 FROM outbox
+            WHERE task_id = ? AND kind = 'mailbox_send' AND dispatched_at IS NULL
+              AND json_extract(payload, '$.metadata.fan_in.group_id') = ?
+              AND json_extract(payload, '$.metadata.fan_in.leg_key') = ?
+            LIMIT 1
+            """,
+            (task_id, group_id, leg_key),
+        ) as cur:
+            return await cur.fetchone() is not None
+
 
 # -----------------------------------------------------------------------
 # Local-hot
