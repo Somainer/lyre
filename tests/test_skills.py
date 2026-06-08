@@ -104,7 +104,7 @@ def test_load_skips_proposed_and_archived(tmp_path: Path) -> None:
     _write_skill(tmp_path, "a", state="approved")
     _write_skill(tmp_path, "b", state="proposed")
     _write_skill(tmp_path, "c", state="archived")
-    result = load_skills_for_context(tmp_path)
+    result = load_skills_for_context(tmp_path, include_builtin=False)
     names = {s.name for s in result.skills}
     assert names == {"a"}
 
@@ -116,7 +116,7 @@ def test_load_finds_dir_per_skill(tmp_path: Path) -> None:
         description="how to rebase",
         extra_files={"example.txt": "demo"},
     )
-    result = load_skills_for_context(tmp_path)
+    result = load_skills_for_context(tmp_path, include_builtin=False)
     assert len(result.skills) == 1
     skill = result.skills[0]
     assert skill.name == "git-rebase"
@@ -136,7 +136,7 @@ def test_load_does_not_recurse_under_skill_root(tmp_path: Path) -> None:
     (inner / "SKILL.md").write_text(
         "---\nname: inner\ndescription: should not surface\n---\nbody"
     )
-    result = load_skills_for_context(tmp_path)
+    result = load_skills_for_context(tmp_path, include_builtin=False)
     assert {s.name for s in result.skills} == {"outer"}
 
 
@@ -147,7 +147,7 @@ def test_load_rejects_invalid_name(tmp_path: Path) -> None:
     (d / "SKILL.md").write_text(
         "---\nname: Bad_Name\ndescription: x\n---\nbody"
     )
-    result = load_skills_for_context(tmp_path)
+    result = load_skills_for_context(tmp_path, include_builtin=False)
     assert result.skills == []
     assert any(
         d_.level == "warning" and "name must match" in d_.message
@@ -160,7 +160,7 @@ def test_load_rejects_missing_description(tmp_path: Path) -> None:
     d = tmp_path / "skills" / "approved" / "no-desc"
     d.mkdir(parents=True)
     (d / "SKILL.md").write_text("---\nname: no-desc\n---\nbody")
-    result = load_skills_for_context(tmp_path)
+    result = load_skills_for_context(tmp_path, include_builtin=False)
     assert result.skills == []
     assert any("description" in d_.message for d_ in result.diagnostics)
 
@@ -172,7 +172,7 @@ def test_load_falls_back_to_dir_name_when_no_name_field(tmp_path: Path) -> None:
     (d / "SKILL.md").write_text(
         "---\ndescription: name comes from parent dir\n---\nbody"
     )
-    result = load_skills_for_context(tmp_path)
+    result = load_skills_for_context(tmp_path, include_builtin=False)
     assert {s.name for s in result.skills} == {"from-dirname"}
 
 
@@ -185,7 +185,7 @@ def test_load_filters_global_visible_to_everyone(tmp_path: Path) -> None:
     ensure_skills_skeleton(tmp_path)
     _write_skill(tmp_path, "a", description="any", scope="global")
     out = load_skills_for_context(
-        tmp_path, agent_id="alice", persona_name="worker"
+        tmp_path, agent_id="alice", persona_name="worker", include_builtin=False
     )
     assert {s.name for s in out.skills} == {"a"}
 
@@ -195,7 +195,7 @@ def test_load_filters_persona_scope(tmp_path: Path) -> None:
     _write_skill(tmp_path, "for-worker", scope="persona=worker-maintainer")
     _write_skill(tmp_path, "for-reviewer", scope="persona=reviewer")
     out = load_skills_for_context(
-        tmp_path, agent_id="alice", persona_name="worker-maintainer"
+        tmp_path, agent_id="alice", persona_name="worker-maintainer", include_builtin=False
     )
     assert {s.name for s in out.skills} == {"for-worker"}
 
@@ -205,7 +205,7 @@ def test_load_filters_agent_scope(tmp_path: Path) -> None:
     _write_skill(tmp_path, "for-alice", scope="agent=alice")
     _write_skill(tmp_path, "for-bob", scope="agent=bob")
     out = load_skills_for_context(
-        tmp_path, agent_id="alice", persona_name="worker"
+        tmp_path, agent_id="alice", persona_name="worker", include_builtin=False
     )
     assert {s.name for s in out.skills} == {"for-alice"}
 
@@ -226,7 +226,7 @@ def test_collision_first_wins(tmp_path: Path) -> None:
     (other / "SKILL.md").write_text(
         "---\nname: dupe\ndescription: second\n---\nbody"
     )
-    out = load_skills_for_context(tmp_path)
+    out = load_skills_for_context(tmp_path, include_builtin=False)
     assert len(out.skills) == 1
     assert out.skills[0].description == "first"
     collisions = [d for d in out.diagnostics if d.level == "collision"]
@@ -243,7 +243,7 @@ def test_format_skills_for_prompt_xml_shape(tmp_path: Path) -> None:
     _write_skill(
         tmp_path, "git-rebase", description="how to git rebase safely"
     )
-    out = load_skills_for_context(tmp_path)
+    out = load_skills_for_context(tmp_path, include_builtin=False)
     rendered = format_skills_for_prompt(out.skills)
     assert "<available_skills>" in rendered
     assert "<name>git-rebase</name>" in rendered
@@ -259,7 +259,7 @@ def test_format_skills_for_prompt_omits_disabled(tmp_path: Path) -> None:
     ensure_skills_skeleton(tmp_path)
     _write_skill(tmp_path, "visible")
     _write_skill(tmp_path, "hidden", disable=True)
-    out = load_skills_for_context(tmp_path)
+    out = load_skills_for_context(tmp_path, include_builtin=False)
     rendered = format_skills_for_prompt(out.skills)
     assert "<name>visible</name>" in rendered
     assert "<name>hidden</name>" not in rendered
@@ -267,7 +267,7 @@ def test_format_skills_for_prompt_omits_disabled(tmp_path: Path) -> None:
 
 def test_format_skills_empty_returns_empty(tmp_path: Path) -> None:
     ensure_skills_skeleton(tmp_path)
-    out = load_skills_for_context(tmp_path)
+    out = load_skills_for_context(tmp_path, include_builtin=False)
     assert format_skills_for_prompt(out.skills) == ""
 
 
@@ -278,7 +278,7 @@ def test_format_includes_scope_when_non_global(tmp_path: Path) -> None:
     _write_skill(tmp_path, "g")  # global default
     _write_skill(tmp_path, "p", scope="persona=worker")
     out = load_skills_for_context(
-        tmp_path, agent_id="x", persona_name="worker"
+        tmp_path, agent_id="x", persona_name="worker", include_builtin=False
     )
     rendered = format_skills_for_prompt(out.skills)
     assert "<scope>persona=worker</scope>" in rendered

@@ -1,43 +1,48 @@
-"""Builtin skills (Option B — startup mirror).
+"""Builtin skills — read DIRECTLY from the packaged library (no mirror).
 
-Packaged skills under src/lyre/data/skills/ are refreshed into
-~/.lyre/skills/builtin/ every startup (sync_builtin_skills), surfaced in the
-skill menu alongside approved/, and an owner skill of the same name in approved/
-shadows the builtin (override). Unlike copy-once shipped personas/facts, builtin
-skills track the installed version.
+Packaged skills under src/lyre/data/skills/ are scanned in place by the skill
+menu and read in place by read_memory (which permits that one trusted read-only
+root). Builtin skills are code-like — they track the installed version with no
+copy step. An owner skill of the same name in approved/ shadows the builtin
+(override).
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
+from lyre.persistence.sqlite_impl import SqliteRepositories
 from lyre.runtime.skills import (
     ensure_skills_skeleton,
     load_skills_for_context,
-    sync_builtin_skills,
+    shipped_skills_dir,
 )
+from lyre.runtime.tools import ToolContext, ToolError
+from lyre.runtime.tools.introspect import READ_MEMORY
 
 
-def test_sync_mirrors_packaged_skills(tmp_path: Path) -> None:
-    names = sync_builtin_skills(tmp_path)
-    assert "adversarial-review" in names
-    assert (
-        tmp_path / "skills" / "builtin" / "adversarial-review" / "SKILL.md"
-    ).is_file()
+def _ctx(repos: SqliteRepositories, memory_root: Path) -> ToolContext:
+    return ToolContext(
+        repos=repos, task_id="t", wakeup_id="w", persona_name="dispatcher",
+        extras={"memory_root": str(memory_root)},
+    )
 
 
-def test_builtin_skill_surfaces_in_menu(tmp_path: Path) -> None:
+def test_builtin_skill_surfaces_from_package_no_copy(tmp_path: Path) -> None:
     ensure_skills_skeleton(tmp_path)
-    sync_builtin_skills(tmp_path)
     by_name = {s.name: s for s in load_skills_for_context(tmp_path).skills}
     assert "adversarial-review" in by_name
-    assert by_name["adversarial-review"].source == "builtin"
+    s = by_name["adversarial-review"]
+    assert s.source == "builtin"
+    # Read in place from the package — NOT copied/mirrored into ~/.lyre.
+    assert shipped_skills_dir().resolve() in s.path.resolve().parents
+    assert not (tmp_path / "skills" / "builtin").exists()
 
 
 def test_approved_shadows_builtin_override(tmp_path: Path) -> None:
     ensure_skills_skeleton(tmp_path)
-    sync_builtin_skills(tmp_path)
-    # Owner override: same-named skill in approved/.
     ov = tmp_path / "skills" / "approved" / "adversarial-review"
     ov.mkdir(parents=True)
     (ov / "SKILL.md").write_text(
@@ -50,15 +55,24 @@ def test_approved_shadows_builtin_override(tmp_path: Path) -> None:
     assert s.description == "owner override version"
 
 
-def test_sync_removes_stale_builtin(tmp_path: Path) -> None:
-    sync_builtin_skills(tmp_path)
-    stale = tmp_path / "skills" / "builtin" / "ghost-skill"
-    stale.mkdir(parents=True)
-    (stale / "SKILL.md").write_text(
-        "---\nname: ghost-skill\ndescription: not in the package\n---\n",
-        encoding="utf-8",
-    )
-    names = sync_builtin_skills(tmp_path)  # wipe + recopy
-    assert "ghost-skill" not in names
-    assert not stale.exists()
-    assert "adversarial-review" in names
+@pytest.mark.asyncio
+async def test_read_memory_reads_builtin_skill_body_in_place(
+    repos: SqliteRepositories, tmp_path: Path
+) -> None:
+    memory = tmp_path / "memory"
+    memory.mkdir()
+    skill_md = shipped_skills_dir() / "adversarial-review" / "SKILL.md"
+    out = await READ_MEMORY.handler(_ctx(repos, memory), {"rel_path": str(skill_md)})
+    assert "prosecution" in out["body"].lower()
+
+
+@pytest.mark.asyncio
+async def test_read_memory_still_rejects_foreign_absolute_paths(
+    repos: SqliteRepositories, tmp_path: Path
+) -> None:
+    memory = tmp_path / "memory"
+    memory.mkdir()
+    # An absolute path NOT under the trusted package skills dir is still rejected
+    # — the builtin allowance is bounded to that one read-only root.
+    with pytest.raises(ToolError, match="relative"):
+        await READ_MEMORY.handler(_ctx(repos, memory), {"rel_path": "/etc/passwd"})
