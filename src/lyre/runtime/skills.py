@@ -38,6 +38,7 @@ the loser is logged as a diagnostic (a `SkillDiagnostic`).
 from __future__ import annotations
 
 import re
+import shutil
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -285,19 +286,26 @@ def load_skills_for_context(
     iteration is sorted, deterministic).
     """
     skills_root = lyre_home / "skills"
-    approved_dir = skills_root / "approved"
-    raw = _scan_dir_for_skills(approved_dir, source="approved")
+    # approved/ is scanned FIRST so a same-named owner/agent skill SHADOWS a
+    # builtin one (first-wins below) — the override escape hatch. builtin/ is
+    # Lyre's shipped capability library, refreshed each startup from the package
+    # by sync_builtin_skills() (code-like: tracks the installed version, unlike
+    # copy-once shipped personas/facts).
+    approved = _scan_dir_for_skills(skills_root / "approved", source="approved")
+    builtin = _scan_dir_for_skills(skills_root / "builtin", source="builtin")
+    raw_skills = approved.skills + builtin.skills
+    raw_diagnostics = approved.diagnostics + builtin.diagnostics
 
     # Scope filter
     in_scope: list[Skill] = [
         s
-        for s in raw.skills
+        for s in raw_skills
         if s.scope.applies_to(agent_id=agent_id, persona_name=persona_name)
     ]
 
     # Collision dedup
     seen: dict[str, Skill] = {}
-    diagnostics = list(raw.diagnostics)
+    diagnostics = list(raw_diagnostics)
     for s in in_scope:
         if s.name in seen:
             diagnostics.append(
@@ -371,3 +379,31 @@ def ensure_skills_skeleton(lyre_home: Path) -> list[Path]:
             d.mkdir(parents=True, exist_ok=True)
             created.append(d)
     return created
+
+
+def _shipped_skills_dir() -> Path:
+    """``src/lyre/data/skills/`` — Lyre's packaged builtin skill library."""
+    # runtime/skills.py → ../data/skills/
+    return Path(__file__).resolve().parent.parent / "data" / "skills"
+
+
+def sync_builtin_skills(lyre_home: Path) -> list[str]:
+    """Refresh ``~/.lyre/skills/builtin/`` from the packaged skills, OVERWRITING.
+
+    Builtin skills are code-like — they track the INSTALLED Lyre version, unlike
+    copy-once shipped personas/facts (which freeze on first onboard). So this
+    runs every startup and fully replaces the ``builtin/`` mirror (wipe + recopy,
+    so a removed/renamed builtin skill doesn't linger). Owner customizations live
+    in ``approved/`` (a same-named skill shadows the builtin one — see
+    load_skills_for_context) and are NEVER touched here. Returns the synced
+    builtin skill names.
+    """
+    src_dir = _shipped_skills_dir()
+    dest = lyre_home / "skills" / "builtin"
+    if dest.exists():
+        shutil.rmtree(dest)
+    if not src_dir.is_dir():
+        dest.mkdir(parents=True, exist_ok=True)
+        return []
+    shutil.copytree(src_dir, dest)
+    return sorted(p.name for p in dest.iterdir() if p.is_dir())

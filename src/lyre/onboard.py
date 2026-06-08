@@ -32,7 +32,7 @@ from .persistence.sqlite_impl import SqliteRepositories
 from .personas.seed import ensure_user_personas, seed_default_agents
 from .runtime.identity import is_valid_agent_id
 from .runtime.memory import ensure_shipped_facts, ensure_skeleton
-from .runtime.skills import ensure_skills_skeleton
+from .runtime.skills import ensure_skills_skeleton, sync_builtin_skills
 
 # ---------------------------------------------------------------------------
 # Provider catalog
@@ -474,6 +474,8 @@ async def bootstrap_runtime(cfg: Any) -> list[str]:  # noqa: ANN401 — Config
             repos.personas, repos.agents, memory_root=cfg.memory_path,
         )
         ensure_skills_skeleton(cfg.lyre_home)
+        # Mirror the packaged builtin skill library into ~/.lyre/skills/builtin/.
+        sync_builtin_skills(cfg.lyre_home)
         return created_agents
     finally:
         await conn.close()

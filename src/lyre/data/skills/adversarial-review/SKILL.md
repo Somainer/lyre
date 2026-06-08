@@ -1,0 +1,100 @@
+---
+name: adversarial-review
+description: Run a contested or high-stakes decision/review as an adversarial debate — fan out a prosecution + a defense, each evidence-grounded, then judge. Use for irreversible or expensive calls, "should we build/merge/ship X", or any review prone to single-perspective bias or self-rationalization.
+scope: global
+---
+
+# Adversarial review (debate-then-judge)
+
+A decision procedure for **contested or high-stakes** calls. Instead of deciding
+from one perspective (which rationalizes), fan out independent agents with
+**assigned opposing stances**, make each **ground its case in evidence**, then
+**judge** by weighing both. It is how you stop a plausible-but-wrong conclusion —
+including your own — from surviving.
+
+## When to use it (gate on cost — this spends N wakeups)
+
+Use it ONLY when the decision is one or more of:
+- **irreversible / expensive** (merge, ship, delete, a costly architecture choice),
+- **contested** (reasonable people disagree; you feel a pull to rationalize),
+- **a review** of work where being wrong is costly, or
+- a claim you're tempted to accept because it's convenient.
+
+Do **NOT** use it for routine work, low-stakes calls, or anything a single
+grounded check settles — a debate is several wakeups of tokens; spend them only
+where single-perspective bias is the real risk.
+
+## The recipe (compose dispatch_task + fan_in)
+
+1. **Frame** the exact question and the **decision bar**: what concretely makes
+   the answer YES vs NO. Write it down — both sides and the judge anchor on it.
+2. **Open the barrier**: `fan_in_open(expect_replies=N, quorum=N, result_schema=<the schema below>)`.
+3. **Dispatch the legs** into the group with genuinely **opposing** stances —
+   at least one **PROSECUTION** (argue FOR) and one **DEFENSE** (argue AGAINST);
+   add a second angle per side for a hard call. Each leg's `goal` must say:
+   *"You are the {prosecution|defense}. Argue your side as strongly as you can.
+   GROUND every claim in evidence (read the code / data; cite file:line or the
+   source). Default to conceding honestly: fill the `concedes` field with what
+   you give up to the other side."* Each leg is a fresh, independent agent —
+   that independence is the point.
+4. **Each leg submits a typed result** (the schema below) — not a plain mail.
+   A leg that finishes without submitting is failed-loud and surfaced as a
+   failed leg, so the debate can't silently lose a side.
+5. **Judge** when the barrier resolves: read `fan_in_results`, weigh both sides,
+   and produce a verdict that **reflects BOTH** and states **"what evidence
+   would flip it."** Default to the **skeptical** side unless the case is
+   genuinely made. Do not just tally — name the decisive piece of evidence.
+
+## Why it works — the five mechanics (keep all of them)
+
+1. **Independent contexts**: each leg is a separate agent → real disagreement,
+   not one mind agreeing with itself.
+2. **Assigned adversarial roles**: explicitly FOR vs AGAINST, not two yes-agents.
+3. **A mandatory `concedes` field**: forcing each side to state what it gives up
+   is where the truth usually falls out.
+4. **Evidence-grounding**: every claim cites code/data, not vibes. This is what
+   catches the real defect a confident opinion misses.
+5. **A separate judge + skeptic default**: a different agent rules, must give
+   "what would change the verdict," and leans against the change unless proven.
+
+## Result schema (each leg submits this)
+
+```json
+{
+  "stance": "prosecution | defense",
+  "strongest_case": "the single strongest, specific argument",
+  "evidence": "file:line / data / source backing it — concrete, not abstract",
+  "concedes": "what you honestly grant the other side"
+}
+```
+
+Judge verdict (you produce, for the owner):
+
+```json
+{
+  "verdict": "the ruling",
+  "confidence": 0.0,
+  "decisive_evidence": "the one fact that settles it",
+  "what_would_flip_it": "the concrete observation/evidence that changes the call"
+}
+```
+
+## Caveats (read before invoking)
+
+- **Cost**: a debate is several wakeups. High-stakes only.
+- **Two sycophantic legs = theater.** The value is real adversariality + real
+  evidence. If a side can't ground its case, that itself is signal.
+- **Bias toward the status quo / the cheaper action** in the judge unless the
+  case to change is genuinely made — adding complexity should clear a bar.
+
+## Worked shape (abstract)
+
+> Question: "Should we merge change X?" Bar: merge only if it fixes a real,
+> reachable problem with no existing mitigation. → fan out PROSECUTION ("X fixes
+> a real gap, here's the reachable path + why existing guards miss it") and
+> DEFENSE ("X is over-design — the problem is already bounded / unobserved").
+> Each reads the code and cites it. Judge: weigh both; if the prosecution can't
+> show a reachable unguarded path, **don't merge** — and record what observation
+> would justify revisiting. (This procedure has killed plausible changes by
+> surfacing, from the `concedes` fields, that the change was both unneeded *and*
+> technically wrong.)
