@@ -15,6 +15,9 @@ including your own — from surviving.
 ## When to use it (gate on cost — this spends N wakeups)
 
 Use it ONLY when the decision is one or more of:
+- **the owner explicitly asks for it** — they ask for an adversarial review /
+  a red-team / a debate, or name this skill (then run it even for a lower-stakes
+  call — the owner asked),
 - **irreversible / expensive** (merge, ship, delete, a costly architecture choice),
 - **contested** (reasonable people disagree; you feel a pull to rationalize),
 - **a review** of work where being wrong is costly, or
@@ -29,21 +32,30 @@ where single-perspective bias is the real risk.
 1. **Frame** the exact question and the **decision bar**: what concretely makes
    the answer YES vs NO. Write it down — both sides and the judge anchor on it.
 2. **Open the barrier**: `fan_in_open(expect_replies=N, quorum=N, result_schema=<the schema below>)`.
-3. **Dispatch the legs** into the group with genuinely **opposing** stances —
-   at least one **PROSECUTION** (argue FOR) and one **DEFENSE** (argue AGAINST);
-   add a second angle per side for a hard call. Each leg's `goal` must say:
-   *"You are the {prosecution|defense}. Argue your side as strongly as you can.
-   GROUND every claim in evidence (read the code / data; cite file:line or the
-   source). Default to conceding honestly: fill the `concedes` field with what
-   you give up to the other side."* Each leg is a fresh, independent agent —
-   that independence is the point.
+3. **Spin up the debaters — fresh, independent agents (the independence IS the
+   point).** For EACH leg, `create_agent(persona="analyst")` then `dispatch_task`
+   it into the group. **Persona = `analyst`** (read-only: it gathers evidence +
+   argues) — use **`worker`** instead only if a leg must RUN code/tests to make
+   its case. A new agent per leg = real disagreement, not one mind agreeing with
+   itself. Give genuinely **opposing** stances: ≥1 **PROSECUTION** (argue FOR)
+   and ≥1 **DEFENSE** (argue AGAINST); a second angle per side for a hard call.
+   Each leg's `goal` must say:
+   *"You are the {prosecution|defense}. Argue your side as strongly as you can,
+   GROUNDED in evidence (read the code/data; cite file:line or the source).
+   Default to conceding honestly: fill `concedes` with what you give up. Do your
+   own digging WITHIN this wakeup (read_memory / shell / python). Do NOT
+   dispatch sub-agents — you are a leaf; the debate stays one level."*
 4. **Each leg submits a typed result** (the schema below) — not a plain mail.
    A leg that finishes without submitting is failed-loud and surfaced as a
-   failed leg, so the debate can't silently lose a side.
-5. **Judge** when the barrier resolves: read `fan_in_results`, weigh both sides,
-   and produce a verdict that **reflects BOTH** and states **"what evidence
-   would flip it."** Default to the **skeptical** side unless the case is
-   genuinely made. Do not just tally — name the decisive piece of evidence.
+   failed leg, so the debate can't silently lose a side. **The legs do NOT fan
+   out** — keep the debate flat (N sibling legs + the judge); a leg that needs
+   more digging does it inside its own wakeup, not by spawning children.
+5. **You are the judge.** When the barrier resolves, the coordinator that ran
+   this skill (**you** — `dispatcher` / `long-runner`, NOT a separately
+   dispatched agent) is auto-woken; in THAT wakeup read `fan_in_results`, weigh
+   both sides, and produce a verdict that **reflects BOTH** and states **"what
+   evidence would flip it."** Default to the **skeptical** side unless the case
+   is genuinely made. Do not just tally — name the decisive piece of evidence.
 
 ## Why it works — the five mechanics (keep all of them)
 
