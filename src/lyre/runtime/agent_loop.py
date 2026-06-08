@@ -135,6 +135,33 @@ class _StopRequest:
 
     target_status: str
     reason: str
+
+
+def _estimate_input_tokens(
+    messages: list[LyreMessage], system_prompt: str = ""
+) -> int:
+    """D1 fallback: a coarse, provider-agnostic input-token estimate (~chars/4),
+    used ONLY when an adapter emits no Usage event — so the compaction guard and
+    context_peak don't silently go to zero and let the wakeup sail past the
+    model's real context window. Deliberately rough: a floor that keeps the
+    memory-management invariants alive across provider churn, not an accurate
+    count. chars/4 carries no provider knowledge, so living in the loop (one
+    place, covers every adapter including future ones) doesn't violate law 1."""
+    chars = len(system_prompt or "")
+    for m in messages:
+        content = m.content
+        if isinstance(content, str):
+            chars += len(content)
+            continue
+        for block in content or []:
+            for attr in ("text", "tool_result", "thinking"):
+                v = getattr(block, attr, None)
+                if isinstance(v, str):
+                    chars += len(v)
+            ti = getattr(block, "tool_input", None)
+            if ti is not None:
+                chars += len(str(ti))
+    return chars // 4
 _MAX_SILENT_TURN_NUDGES = 2  # give the model 2 chances before giving up
 
 # Thrashing cap: if a wakeup compacts this many times, bail to silent_close.
@@ -324,6 +351,9 @@ class AgentLoop:
         # The scheduler wires this to a durable DB flag; tests/unconfigured
         # callers leave it None (no per-turn DB read).
         self.cancel_check = cancel_check
+        # D1: warn once per wakeup when we fall back to a client token estimate
+        # (an adapter emitted no Usage event).
+        self._usage_estimate_warned = False
         # S0: a cooperative stop requested at a turn boundary. Lives on the
         # instance (not a local) so an async setter — the A1 lease heartbeat —
         # can raise it concurrently with the loop. Reset at the top of run();
@@ -384,6 +414,7 @@ class AgentLoop:
         # in tests). The repeat-tracker fingerprints each turn's tool calls to
         # catch a wakeup spinning on the SAME call (H1).
         self._stop_request = None
+        self._usage_estimate_warned = False
         repeat_fingerprint: str | None = None
         repeat_count = 0
         repeat_nudged = False
@@ -451,6 +482,27 @@ class AgentLoop:
                 system_prompt=system_prompt,
                 fallback_events=fallback_events,
             )
+
+            # D1: an adapter that emitted no Usage this turn leaves
+            # turn_usage[0] falsy → the compaction guard never fires and
+            # context_peak stays 0 (the wakeup silently sails past the real
+            # context window). Fall back to a coarse client estimate of what we
+            # just sent. A real Usage always wins; this only fills the gap.
+            if not turn_usage[0]:
+                est = _estimate_input_tokens(messages, system_prompt)
+                if est:
+                    turn_usage = (est, turn_usage[1])
+                    if not self._usage_estimate_warned:
+                        log.warning(
+                            "usage_estimated_fallback",
+                            model=used_model_id,
+                            est_input_tokens=est,
+                        )
+                        self._usage_estimate_warned = True
+                    self.transcript.note(
+                        f"usage_estimated: ~{est} input tokens "
+                        f"(adapter sent no Usage)"
+                    )
 
             all_tool_calls.extend(tool_uses_this_turn)
             final_text = "".join(text_parts)
