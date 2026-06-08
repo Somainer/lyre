@@ -26,6 +26,7 @@ from typing import Any
 
 import click
 
+from .config import LarkConfig
 from .persistence.db import init_db
 from .persistence.sqlite_impl import SqliteRepositories
 from .personas.seed import ensure_user_personas, seed_default_agents
@@ -176,6 +177,7 @@ def write_config_toml(
     owner_email: str | None,
     models: list[ModelSpec] | None = None,
     default_model: str | None = None,
+    lark: LarkConfig | None = None,
 ) -> None:
     """Write ``~/.lyre/config.toml`` with the minimum fields onboard sets.
 
@@ -186,6 +188,13 @@ def write_config_toml(
 
     Per-persona model assignment is left to the user via ``[personas.<name>]
     model_preference = ...`` (commented example included in the output).
+
+    ``lark`` carries the owner's existing ``[integrations.lark]`` section so
+    a *re-run* preserves it. The wizard never prompts for Lark, so without
+    threading it through here an onboard re-run would silently drop the
+    channel — including ``authorized_user_id`` (the owner's app-scoped
+    open_id), which is painful to rediscover. Only the non-sensitive fields
+    are written; ``app_id`` / ``app_secret`` stay in ``.env``.
     """
     config_path.parent.mkdir(parents=True, exist_ok=True)
     lines = [
@@ -288,6 +297,24 @@ def write_config_toml(
         "#   model_preference = { prefer = [\"anthropic.claude-opus-4-7\"] }",
         "",
     ])
+
+    # Carry the owner's Lark/Feishu channel through a re-onboard. The
+    # wizard owns owner/models/default_model and rewrites the file from
+    # scratch; [integrations.lark] is owner-provisioned config it never
+    # asks about, so it must be re-emitted here or it's lost on every
+    # re-run. Emit only when the section actually holds something (enabled
+    # or an authorized_user_id) so a first run stays clean. MUST come after
+    # the [[models]] blocks: TOML binds sub-tables to the most recent
+    # header, so a top-level table after the array-of-tables is correct.
+    if lark is not None and (lark.enabled or lark.authorized_user_id):
+        lines.append("[integrations.lark]")
+        lines.append(f"enabled = {'true' if lark.enabled else 'false'}")
+        if lark.authorized_user_id:
+            lines.append(
+                f'authorized_user_id = "{_toml_escape(lark.authorized_user_id)}"'
+            )
+        lines.append("")
+
     config_path.write_text("\n".join(lines), encoding="utf-8")
 
 
@@ -611,17 +638,20 @@ def run_wizard(
             click.echo(f"    ✓ updated {identity_path}")
 
     # ---- config.toml ----
-    # Always rewrite. SSOT for what wizard owns lives in this file — we
-    # control its shape end-to-end. (Owner-added [runtime] knobs they
-    # care about persisting belong in a future "write-back unchanged"
-    # path; for now they need to re-add after onboard. Documented as a
-    # limitation.)
+    # Rewritten from scratch each run — the wizard is the SSOT for the
+    # sections it owns (owner / models / default_model) and controls their
+    # shape end-to-end. Owner-provisioned sections the wizard never prompts
+    # for must be threaded back in explicitly or they're lost on re-run:
+    # [integrations.lark] is preserved below. (Other owner-added [runtime] /
+    # [scheduler] / [coding_backends] knobs are still re-add-after-onboard;
+    # a general "write-back unchanged" path is future work.)
     write_config_toml(
         config_path,
         owner_name=owner_name,
         owner_email=owner_email,
         models=models,
         default_model=default_model,
+        lark=current_cfg.integrations.lark if current_cfg is not None else None,
     )
     click.echo(f"  ✓ wrote {config_path}")
 

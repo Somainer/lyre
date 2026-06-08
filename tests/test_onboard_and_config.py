@@ -449,6 +449,53 @@ def test_write_config_toml_minimal(tmp_path: Path) -> None:
     assert "email" not in active
     assert "[runtime]" not in active  # no model passed
     assert "[[models]]" not in active
+    assert "[integrations.lark]" not in active  # no lark passed → stays clean
+
+
+def test_write_config_toml_omits_lark_when_default(tmp_path: Path) -> None:
+    """A LarkConfig with nothing set (the default) must NOT emit a section —
+    a first-run config should not sprout an empty [integrations.lark]."""
+    from lyre.config import LarkConfig
+
+    cfg = tmp_path / "config.toml"
+    write_config_toml(
+        cfg, owner_name="Alice", owner_email=None, lark=LarkConfig(),
+    )
+    assert "[integrations.lark]" not in cfg.read_text(encoding="utf-8")
+
+
+def test_write_config_toml_preserves_lark_across_reonboard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Re-onboard must not drop the owner's [integrations.lark] section.
+
+    Regression: the wizard rewrites config.toml from scratch and never
+    prompts for Lark, so onboard used to silently erase the channel —
+    including authorized_user_id (the owner's app-scoped open_id), which
+    is painful to recover. write_config_toml now re-emits it."""
+    from lyre.config import LarkConfig
+
+    cfg = tmp_path / "config.toml"
+    write_config_toml(
+        cfg,
+        owner_name="Alice",
+        owner_email=None,
+        lark=LarkConfig(enabled=True, authorized_user_id="ou_abc123"),
+    )
+    text = cfg.read_text(encoding="utf-8")
+    assert "[integrations.lark]" in text
+    assert "enabled = true" in text
+    assert 'authorized_user_id = "ou_abc123"' in text
+
+    # Round-trips back through Config.from_env so a real `lyre serve`
+    # re-reads the preserved channel after the re-onboard.
+    monkeypatch.setenv("LYRE_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("LARK_APP_ID", raising=False)
+    monkeypatch.delenv("LARK_APP_SECRET", raising=False)
+    loaded = Config.from_env()
+    assert loaded.integrations.lark.enabled is True
+    assert loaded.integrations.lark.authorized_user_id == "ou_abc123"
 
 
 def test_write_config_toml_header_only_auth(tmp_path: Path) -> None:
