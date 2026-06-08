@@ -57,19 +57,13 @@ where single-perspective bias is the real risk.
    evidence would flip it."** Default to the **skeptical** side unless the case
    is genuinely made. Do not just tally — name the decisive piece of evidence.
 
-## Why it works — the five mechanics (keep all of them)
+## Non-negotiables (drop any one and it's theater, not a debate)
 
-1. **Independent contexts**: each leg is a separate agent → real disagreement,
-   not one mind agreeing with itself.
-2. **Assigned adversarial roles**: explicitly FOR vs AGAINST, not two yes-agents.
-3. **A mandatory `concedes` field**: forcing each side to state what it gives up
-   is where the truth usually falls out.
-4. **Evidence-grounding**: every claim cites code/data, not vibes. This is what
-   catches the real defect a confident opinion misses.
-5. **A separate judge + skeptic default**: a different agent rules, must give
-   "what would change the verdict," and leans against the change unless proven.
+Independent agents (one per leg) · assigned FOR vs AGAINST · a mandatory
+`concedes` field · every claim evidence-cited (file:line / data) · a separate
+judge that defaults skeptical and states what would flip the call.
 
-## Result schema (each leg submits this)
+## Leg result schema (typed — the fan-in barrier's contract)
 
 ```json
 {
@@ -80,16 +74,17 @@ where single-perspective bias is the real risk.
 }
 ```
 
-Judge verdict (you produce, for the owner):
+**Your verdict to the owner is structured TEXT — a `mailbox_send`, NOT JSON.**
+The owner reads prose, not a payload. Send these labelled lines:
 
-```json
-{
-  "verdict": "the ruling",
-  "confidence": 0.0,
-  "decisive_evidence": "the one fact that settles it",
-  "what_would_flip_it": "the concrete observation/evidence that changes the call"
-}
-```
+> **Verdict:** <the ruling>
+> **Confidence:** low / medium / high
+> **Decisive evidence:** <the one fact that settles it — file:line / source>
+> **What would flip it:** <the concrete observation/evidence that changes the call>
+> **Failed/missing legs:** <any leg that failed or didn't submit, + why>
+
+(Only the LEGS' results are typed JSON — that's the barrier's machine contract,
+read by you the judge via `fan_in_results`. The owner-facing verdict is prose.)
 
 ## Caveats (read before invoking)
 
