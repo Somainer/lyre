@@ -40,7 +40,24 @@ def _resolve_memory_path(ctx: ToolContext, rel_path: str) -> Path:
     root = Path(root_str).resolve()
     if not rel_path or not isinstance(rel_path, str):
         raise ToolError("rel_path required (string)")
-    if rel_path.startswith("/") or ".." in Path(rel_path).parts:
+    # Builtin skills are read DIRECTLY from the packaged skill library — a
+    # trusted, read-only, Lyre-shipped root that the skills menu points at by
+    # absolute path. Permit an absolute path that resolves under it; everything
+    # else stays relative + sandboxed (to memory_root / the ~/.lyre/skills
+    # sibling below).
+    if rel_path.startswith("/"):
+        from ..skills import shipped_skills_dir
+
+        resolved = Path(rel_path).resolve()
+        try:
+            resolved.relative_to(shipped_skills_dir().resolve())
+            return resolved
+        except ValueError:
+            raise ToolError(
+                f"rel_path must be relative and stay under memory_root; "
+                f"got {rel_path!r}"
+            ) from None
+    if ".." in Path(rel_path).parts:
         raise ToolError(
             f"rel_path must be relative and stay under memory_root; "
             f"got {rel_path!r}"

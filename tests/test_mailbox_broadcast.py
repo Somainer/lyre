@@ -516,14 +516,16 @@ def test_identity_preamble_teaches_delegation_and_progress_via_mail() -> None:
 
 
 def test_global_system_md_is_appended(tmp_path):
-    """`~/.lyre/SYSTEM.md` content is concatenated last so it acts as the
-    org-wide instruction layer."""
+    """`~/.lyre/SYSTEM.md` is the org-wide instruction layer — appended AFTER the
+    persona body. (The most-volatile sections — memory index, skills XML incl.
+    builtin skills — render after it for prompt-cache stability, so it isn't the
+    literal tail.)"""
     (tmp_path / "SYSTEM.md").write_text("ORG_RULE: always say 'hi' first")
     me = Persona(name="dispatcher", role_description="lead", system_prompt="body")
     prompt = assemble_system_prompt(me, lyre_home=tmp_path)
     assert "ORG_RULE" in prompt
-    # SYSTEM.md is the tail
-    assert prompt.rstrip().endswith("always say 'hi' first")
+    # Org layer sits after the persona body.
+    assert prompt.index("ORG_RULE") > prompt.index("body")
 
 
 def test_global_system_md_absent_is_fine(tmp_path):

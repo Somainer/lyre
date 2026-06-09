@@ -273,6 +273,7 @@ def load_skills_for_context(
     *,
     agent_id: str | None = None,
     persona_name: str | None = None,
+    include_builtin: bool = True,
 ) -> LoadResult:
     """Scan ~/.lyre/skills/ (the canonical location) for active skills.
 
@@ -285,19 +286,31 @@ def load_skills_for_context(
     iteration is sorted, deterministic).
     """
     skills_root = lyre_home / "skills"
-    approved_dir = skills_root / "approved"
-    raw = _scan_dir_for_skills(approved_dir, source="approved")
+    # approved/ is scanned FIRST so a same-named owner/agent skill SHADOWS a
+    # builtin one (first-wins below) — the override escape hatch. Builtin skills
+    # are read DIRECTLY from the packaged library (shipped_skills_dir), not
+    # mirrored into ~/.lyre — code-like, single source, always the installed
+    # version. read_memory permits that trusted read-only root, so bodies load
+    # the same way.
+    approved = _scan_dir_for_skills(skills_root / "approved", source="approved")
+    builtin = (
+        _scan_dir_for_skills(shipped_skills_dir(), source="builtin")
+        if include_builtin
+        else LoadResult([], [])
+    )
+    raw_skills = approved.skills + builtin.skills
+    raw_diagnostics = approved.diagnostics + builtin.diagnostics
 
     # Scope filter
     in_scope: list[Skill] = [
         s
-        for s in raw.skills
+        for s in raw_skills
         if s.scope.applies_to(agent_id=agent_id, persona_name=persona_name)
     ]
 
     # Collision dedup
     seen: dict[str, Skill] = {}
-    diagnostics = list(raw.diagnostics)
+    diagnostics = list(raw_diagnostics)
     for s in in_scope:
         if s.name in seen:
             diagnostics.append(
@@ -371,3 +384,15 @@ def ensure_skills_skeleton(lyre_home: Path) -> list[Path]:
             d.mkdir(parents=True, exist_ok=True)
             created.append(d)
     return created
+
+
+def shipped_skills_dir() -> Path:
+    """``src/lyre/data/skills/`` — Lyre's packaged builtin skill library.
+
+    Read DIRECTLY at runtime (no copy/mirror into ~/.lyre): builtin skills are
+    code-like and live with the install, so they track the version automatically.
+    Both the skill menu (load_skills_for_context) and read_memory (which permits
+    this trusted read-only root) resolve builtin skill bodies here.
+    """
+    # runtime/skills.py → ../data/skills/
+    return Path(__file__).resolve().parent.parent / "data" / "skills"
