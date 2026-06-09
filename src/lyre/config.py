@@ -327,6 +327,27 @@ class Config:
     # runaway. 24 matches the long-standing hardcoded default the build site used.
     # See ORCHESTRATION_ROBUSTNESS.md §5 (O3a).
     max_turns: int = 24
+    # R1 — LLM transient-error retry budget, passed to the provider SDK client
+    # (it retries 408/409/429/500/529 with backoff before raising). 2 matches the
+    # SDK default; raise it for flaky providers. Covers the connect / first-token
+    # window; a failure AFTER the first token is R2's mid-stream failover, not
+    # this. 0 disables SDK retry. See FAILURE_ROBUSTNESS.md §4 (R1).
+    llm_max_retries: int = 2
+    # C — bound how many times Phase-2 lease recovery silently re-runs a single
+    # BOOTSTRAP SINGLETON task (dispatcher etc.) before failing it and escalating
+    # to the owner. The singleton is never archived (it must stay reachable for
+    # the next mail to revive it via Phase 0). A deterministic setup failure
+    # would otherwise re-run forever with nobody notified — the observed
+    # "dispatcher wakeup failed, 没人知道" loop. 0 disables the bound. Per-task
+    # total (not a time window): singleton recoveries are ~one lease-duration
+    # apart. See FAILURE_ROBUSTNESS.md §3 (C).
+    singleton_recovery_max: int = 3
+    # R2 — per-turn mid-stream failover budget. On a mid-stream LLM failure
+    # (some output already streamed), fail over to the next candidate up to this
+    # many times instead of killing the wakeup; on exceed, stay fatal. Safe —
+    # tools dispatch only post-turn, so a discarded partial has no durable side
+    # effect. 0 keeps the old mid-stream-fatal behavior. See FAILURE_ROBUSTNESS.md §5.
+    midstream_max_retries: int = 1
 
     # ---- defaults: paths added with config.toml ----
     lyre_home: Path = field(default_factory=_default_home)
@@ -563,6 +584,42 @@ class Config:
             max_turns = 24
         if max_turns < 1:
             max_turns = 1
+        # R1 LLM SDK retry budget: env LYRE_LLM_MAX_RETRIES > [runtime]
+        # llm_max_retries > default 2. Floor at 0 (0 disables SDK retry);
+        # garbage falls back to the default.
+        llm_retries_raw = os.environ.get("LYRE_LLM_MAX_RETRIES") or runtime_raw.get(
+            "llm_max_retries"
+        )
+        try:
+            llm_max_retries = int(llm_retries_raw) if llm_retries_raw is not None else 2
+        except (ValueError, TypeError):
+            llm_max_retries = 2
+        if llm_max_retries < 0:
+            llm_max_retries = 0
+        # C bootstrap-singleton recovery bound: env LYRE_SINGLETON_RECOVERY_MAX >
+        # [runtime] singleton_recovery_max > default 3. Floor 0 (0 disables).
+        sing_rec_raw = os.environ.get(
+            "LYRE_SINGLETON_RECOVERY_MAX"
+        ) or runtime_raw.get("singleton_recovery_max")
+        try:
+            singleton_recovery_max = (
+                int(sing_rec_raw) if sing_rec_raw is not None else 3
+            )
+        except (ValueError, TypeError):
+            singleton_recovery_max = 3
+        if singleton_recovery_max < 0:
+            singleton_recovery_max = 0
+        # R2 mid-stream failover budget: env LYRE_MIDSTREAM_MAX_RETRIES >
+        # [runtime] midstream_max_retries > default 1. Floor 0 (0 = old fatal).
+        mid_raw = os.environ.get("LYRE_MIDSTREAM_MAX_RETRIES") or runtime_raw.get(
+            "midstream_max_retries"
+        )
+        try:
+            midstream_max_retries = int(mid_raw) if mid_raw is not None else 1
+        except (ValueError, TypeError):
+            midstream_max_retries = 1
+        if midstream_max_retries < 0:
+            midstream_max_retries = 0
         dashboard_port_raw = os.environ.get("LYRE_DASHBOARD_PORT") or runtime_raw.get(
             "default_dashboard_port", 8765
         )
@@ -737,6 +794,9 @@ class Config:
             wakeup_wall_budget_s=wakeup_wall_budget_s,
             max_tokens=max_tokens,
             max_turns=max_turns,
+            llm_max_retries=llm_max_retries,
+            singleton_recovery_max=singleton_recovery_max,
+            midstream_max_retries=midstream_max_retries,
             lyre_home=home,
             user_md_path=user_md_path,
             env_path=env_path,

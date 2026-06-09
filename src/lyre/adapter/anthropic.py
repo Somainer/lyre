@@ -48,6 +48,7 @@ class AnthropicAdapter:
         timeout: float = 600.0,
         extra_headers: dict[str, str] | None = None,
         blob_store: BlobStore | None = None,
+        max_retries: int | None = None,
     ):
         kwargs: dict[str, Any] = {"api_key": api_key, "timeout": timeout}
         if base_url:
@@ -57,6 +58,12 @@ class AnthropicAdapter:
         # from `api_key`. The SDK applies these to every request.
         if extra_headers:
             kwargs["default_headers"] = extra_headers
+        # R1: explicit, tunable transient-error retry. The SDK retries
+        # 408/409/429/500/529 with backoff before raising; making it explicit
+        # lets the owner raise it past the SDK default for flaky providers.
+        # None → leave the SDK default in place.
+        if max_retries is not None:
+            kwargs["max_retries"] = max_retries
         self.client = AsyncAnthropic(**kwargs)
         # Multimodal: resolves blob_id → bytes at send-time. None means
         # the adapter raises if it encounters an image/document block —

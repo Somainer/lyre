@@ -74,6 +74,7 @@ class OpenAIAdapter:
         timeout: float = 600.0,
         extra_headers: dict[str, str] | None = None,
         blob_store: BlobStore | None = None,
+        max_retries: int | None = None,
     ):
         kwargs: dict[str, Any] = {"api_key": api_key, "timeout": timeout}
         if base_url:
@@ -84,6 +85,9 @@ class OpenAIAdapter:
         # token, etc.).
         if extra_headers:
             kwargs["default_headers"] = extra_headers
+        # R1: explicit, tunable transient-error retry (see AnthropicAdapter).
+        if max_retries is not None:
+            kwargs["max_retries"] = max_retries
         self.client = AsyncOpenAI(**kwargs)
         self._blob_store = blob_store
 
