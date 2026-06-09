@@ -541,6 +541,52 @@ async def test_dispatch_task_rejects_unknown_persona(ctx: ToolContext) -> None:
 
 
 @pytest.mark.asyncio
+async def test_dispatch_task_max_turns_rides_tier_overrides(ctx: ToolContext) -> None:
+    """O3a: an explicit per-task turn budget lands in the (until now unused)
+    tier_overrides bag, where the scheduler resolves it at the AgentLoop
+    build site."""
+    result = await DISPATCH_TASK.handler(
+        ctx,
+        {
+            "persona": "worker",
+            "goal": "deep research",
+            "acceptance": "spec written",
+            "max_turns": 40,
+        },
+    )
+    child = await ctx.repos.tasks.get(result["task_id"])
+    assert child is not None
+    assert child.tier_overrides == {"max_turns": 40}
+
+
+@pytest.mark.asyncio
+async def test_dispatch_task_without_max_turns_leaves_tier_overrides_unset(
+    ctx: ToolContext,
+) -> None:
+    result = await DISPATCH_TASK.handler(
+        ctx,
+        {"persona": "worker", "goal": "g", "acceptance": "a"},
+    )
+    child = await ctx.repos.tasks.get(result["task_id"])
+    assert child is not None
+    assert child.tier_overrides is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", [0, -1, "40", 3.5, True])
+async def test_dispatch_task_rejects_non_positive_int_max_turns(
+    ctx: ToolContext, bad: object,
+) -> None:
+    """No silent drop: a non-positive / non-int max_turns (incl. bool, an int
+    subclass in Python) is a loud ToolError, not an ignored over-budget intent."""
+    with pytest.raises(ToolError):
+        await DISPATCH_TASK.handler(
+            ctx,
+            {"persona": "worker", "goal": "g", "acceptance": "a", "max_turns": bad},
+        )
+
+
+@pytest.mark.asyncio
 async def test_query_task_status_returns_state(ctx: ToolContext) -> None:
     result = await QUERY_TASK_STATUS.handler(ctx, {"task_id": ctx.task_id})
     assert result["id"] == ctx.task_id

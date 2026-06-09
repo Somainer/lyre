@@ -23,6 +23,7 @@ All env vars are optional unless noted. Set them in your shell or a
 | `LYRE_DEFAULT_MODEL` | Fallback if a persona doesn't specify a `model_preference`. | `claude-sonnet-4-6` |
 | `LYRE_COMPACT_THRESHOLD` | Fraction of context window above which auto-compaction fires. Must be `0 < x < 1`. | `0.7` |
 | `LYRE_MAX_TOKENS` | Per-turn output cap on a single assistant message (NOT a lifetime budget). Sized to the biggest single tool-call argument an agent writes — worker-maintainer producing code via `python_exec` is the hot path. Lower it only to box in a runaway worker. Min clamp 256. | `32768` |
+| `LYRE_MAX_TURNS` | Default per-wakeup **turn** budget — the number of model↔tool-loop iterations a wakeup may run before it's honestly truncated to `needs_continuation` (distinct from `LYRE_MAX_TOKENS`, which caps one message). An orchestrator can raise it per-task via `dispatch_task(max_turns=…)` for work it expects to need many steps (e.g. a deep-research leg). Min clamp 1. | `24` |
 
 ### Scheduler
 

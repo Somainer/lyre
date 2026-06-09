@@ -318,6 +318,15 @@ class Config:
     # overshooting is low. Set lower if you specifically want to box
     # in a runaway worker.
     max_tokens: int = 32768
+    # O3a per-wakeup TURN budget — the number of model↔tool-loop iterations a
+    # single wakeup may run before it's honestly truncated to needs_continuation
+    # (distinct from max_tokens above, which caps ONE assistant message). This is
+    # the default; a dispatch can raise it per-task via `dispatch_task(max_turns=)`
+    # (stored in task.tier_overrides, resolved at the AgentLoop build site). No
+    # ceiling — only trusted orchestrators dispatch, and H1/A1 still bound a
+    # runaway. 24 matches the long-standing hardcoded default the build site used.
+    # See ORCHESTRATION_ROBUSTNESS.md §5 (O3a).
+    max_turns: int = 24
 
     # ---- defaults: paths added with config.toml ----
     lyre_home: Path = field(default_factory=_default_home)
@@ -542,6 +551,18 @@ class Config:
             wakeup_wall_budget_s = 0
         if wakeup_wall_budget_s < 0:
             wakeup_wall_budget_s = 0
+        # O3a per-wakeup turn budget: env LYRE_MAX_TURNS > [runtime] max_turns >
+        # default 24. Floor at 1 (a wakeup needs at least one turn); garbage
+        # falls back to the default rather than wedging at 0 turns.
+        max_turns_raw = os.environ.get("LYRE_MAX_TURNS") or runtime_raw.get(
+            "max_turns"
+        )
+        try:
+            max_turns = int(max_turns_raw) if max_turns_raw is not None else 24
+        except (ValueError, TypeError):
+            max_turns = 24
+        if max_turns < 1:
+            max_turns = 1
         dashboard_port_raw = os.environ.get("LYRE_DASHBOARD_PORT") or runtime_raw.get(
             "default_dashboard_port", 8765
         )
@@ -715,6 +736,7 @@ class Config:
             loop_repeat_threshold=loop_repeat_threshold,
             wakeup_wall_budget_s=wakeup_wall_budget_s,
             max_tokens=max_tokens,
+            max_turns=max_turns,
             lyre_home=home,
             user_md_path=user_md_path,
             env_path=env_path,
