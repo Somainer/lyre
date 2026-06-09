@@ -239,7 +239,9 @@ def serve_cmd(
                 repos, cfg,
                 poll_interval_s=poll_interval,
                 spawn_subprocess=use_subprocess,
-                adapter_factory=AdapterFactory(blob_store=blob_store),
+                adapter_factory=AdapterFactory(
+                    blob_store=blob_store, max_retries=cfg.llm_max_retries
+                ),
             )
             # Build the external-channel registry from cfg.integrations.
             # Channels register themselves into the registry; the outbox
@@ -606,7 +608,9 @@ def run_task_cmd(task_id: str) -> None:
                 poll_interval_s=1.0,
                 spawn_subprocess=False,  # we ARE the subprocess
                 adapter_for_test=adapter_for_test,
-                adapter_factory=AdapterFactory(blob_store=blob_store),
+                adapter_factory=AdapterFactory(
+                    blob_store=blob_store, max_retries=cfg.llm_max_retries
+                ),
             )
             await scheduler._run_task_inline(task_id)
         finally:

@@ -13,6 +13,7 @@ from lyre.adapter.llm_adapter import (
     LyreMessage,
     LyreToolSpec,
     StreamEvent,
+    ToolUseComplete,
     TurnComplete,
 )
 from lyre.runtime.agent_loop import AgentLoop, AllCandidatesFailedError
@@ -140,20 +141,123 @@ async def test_skips_unhealthy_candidate_before_call(object_store: Path) -> None
     assert any(ev["reason"] == "circuit_open" for ev in result.fallback_events)
 
 
+# ---------------------------------------------------------------------------
+# R2: a mid-stream failure is no longer fatal — it fails over to the next
+# candidate, bounded by max_midstream_retries. Safe because tools dispatch only
+# AFTER a turn returns, so a discarded partial leaves no durable side effect.
+# (Replaces the old test_midstream_error_propagates_and_no_retry.)
+# ---------------------------------------------------------------------------
+
+
 @pytest.mark.asyncio
-async def test_midstream_error_propagates_and_no_retry(object_store: Path) -> None:
-    bad = _MidStreamRaisingAdapter()
+async def test_midstream_error_falls_back_to_next_candidate(
+    object_store: Path,
+) -> None:
+    bad = _MidStreamRaisingAdapter()  # yields "partial" then raises
     healthy = FakeAdapter()
-    healthy.push_turn([ContentDelta(text="never"), TurnComplete(stop_reason="end_turn")])
+    healthy.push_turn([ContentDelta(text="ok"), TurnComplete(stop_reason="end_turn")])
     adapters = {"a": bad, "b": healthy}
     candidates = [fake_entry(id="a"), fake_entry(id="b")]
 
-    transcript = TranscriptWriter(object_store, "wakeup-mid")
+    transcript = TranscriptWriter(object_store, "wakeup-mid-fo")
+    loop = AgentLoop(  # default max_midstream_retries=1
+        candidates=candidates,
+        adapter_for=lambda e: adapters[e.id],
+        model_name_for=lambda e: e.id,
+        transcript=transcript,
+    )
+    result = await loop.run("", [_user_msg()])
+    transcript.close()
+
+    assert result.status == "completed"
+    assert result.model_id == "b"
+    # The discarded partial ("partial") never leaked into the result — only b's.
+    assert result.text == "ok"
+    assert any(ev["reason"] == "midstream_error" for ev in result.fallback_events)
+
+
+@pytest.mark.asyncio
+async def test_midstream_cap_bounds_failover_independent_of_candidate_count(
+    object_store: Path,
+) -> None:
+    """max_midstream_retries=1 → at most ONE mid-stream failover, so a third
+    candidate is never reached even though it's healthy. a (attempt 1 →
+    failover) → b (attempt 2 → exceed → raise); c is never called."""
+    a = _MidStreamRaisingAdapter()
+    b = _MidStreamRaisingAdapter()
+    c = _RaisingAdapter(RuntimeError("should not reach c"))
+    adapters: dict[str, object] = {"a": a, "b": b, "c": c}
+    candidates = [fake_entry(id="a"), fake_entry(id="b"), fake_entry(id="c")]
+
+    transcript = TranscriptWriter(object_store, "wakeup-mid-cap")
     loop = AgentLoop(
         candidates=candidates,
         adapter_for=lambda e: adapters[e.id],
         model_name_for=lambda e: e.id,
         transcript=transcript,
+    )
+    with pytest.raises(RuntimeError, match="mid-stream"):
+        await loop.run("", [_user_msg()])
+    transcript.close()
+    assert c.called == 0  # the cap stopped failover before reaching 'c'
+
+
+@pytest.mark.asyncio
+async def test_midstream_partial_tool_use_is_never_dispatched(
+    object_store: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The safety invariant the whole design rests on: a tool_use that was
+    FULLY streamed before the stream died is discarded with the partial — it
+    must NEVER be dispatched (tools run strictly post-turn)."""
+
+    class _ToolThenRaise:
+        async def stream_turn(self, **kwargs) -> AsyncIterator[StreamEvent]:
+            yield ToolUseComplete(id="t1", name="danger", input={})
+            raise RuntimeError("mid-stream after a complete tool_use")
+
+    healthy = FakeAdapter()
+    healthy.push_turn([ContentDelta(text="ok"), TurnComplete(stop_reason="end_turn")])
+    adapters: dict[str, object] = {"a": _ToolThenRaise(), "b": healthy}
+    candidates = [fake_entry(id="a"), fake_entry(id="b")]
+
+    transcript = TranscriptWriter(object_store, "wakeup-mid-tool")
+    loop = AgentLoop(
+        candidates=candidates,
+        adapter_for=lambda e: adapters[e.id],
+        model_name_for=lambda e: e.id,
+        transcript=transcript,
+    )
+    dispatched: list[str] = []
+
+    async def _spy(name, tool_use_id, tool_input):  # type: ignore[no-untyped-def]
+        dispatched.append(name)
+        return ("", False, [])
+
+    monkeypatch.setattr(loop, "_dispatch_tool", _spy)
+    result = await loop.run("", [_user_msg()])
+    transcript.close()
+
+    assert result.model_id == "b" and result.text == "ok"  # failed over cleanly
+    assert dispatched == []  # the partial tool_use from 'a' was NEVER run
+
+
+@pytest.mark.asyncio
+async def test_midstream_max_retries_zero_keeps_fatal(object_store: Path) -> None:
+    """0 disables R2 → the old behavior: a mid-stream failure is fatal and does
+    NOT fall over (b is never tried)."""
+    bad = _MidStreamRaisingAdapter()
+    healthy = FakeAdapter()
+    healthy.push_turn([ContentDelta(text="ok"), TurnComplete(stop_reason="end_turn")])
+    adapters = {"a": bad, "b": healthy}
+    candidates = [fake_entry(id="a"), fake_entry(id="b")]
+
+    transcript = TranscriptWriter(object_store, "wakeup-mid-zero")
+    loop = AgentLoop(
+        candidates=candidates,
+        adapter_for=lambda e: adapters[e.id],
+        model_name_for=lambda e: e.id,
+        transcript=transcript,
+        max_midstream_retries=0,
     )
     with pytest.raises(RuntimeError, match="mid-stream"):
         await loop.run("", [_user_msg()])

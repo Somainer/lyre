@@ -190,3 +190,87 @@ async def test_phase2_non_ephemeral_task_is_not_bounded(
 
     assert await sched._ephemeral_recovery_exceeded(task) is False  # ordinary recovery
     assert await repos.supervision.get("worker-1") is None          # never bumped
+
+
+# --------------------------------------------------------------------------
+# (C) Phase-2 recovery bound for BOOTSTRAP SINGLETONS (dispatcher etc.,
+# parent_agent_id NULL). A deterministic setup failure would otherwise re-run
+# forever, silently. On exceed: fail + escalate to OWNER, but NEVER archive —
+# the singleton must stay reachable for the next mail to revive it (Phase 0).
+# --------------------------------------------------------------------------
+async def _singleton_task(repos: SqliteRepositories) -> str:
+    # owner must exist so the no-parent fallback can route the escalation.
+    await repos.agents.create("owner", "owner", parent_agent_id=None)
+    await repos.agents.create("dispatcher-1", "dispatcher", parent_agent_id=None)
+    tid = await repos.tasks.create(
+        TaskSpec(agent_id="dispatcher-1", goal="g", acceptance="a")
+    )
+    # Mimic the dangling-lease recovery state: a started wakeup holds the lease.
+    wk = await repos.wakeups.start(tid, "dispatcher", agent_id="dispatcher-1")
+    await repos.tasks.claim_lease(tid, wk, duration_sec=1)
+    return tid
+
+
+@pytest.mark.asyncio
+async def test_singleton_recovery_within_budget_allows_rerun(
+    repos: SqliteRepositories, tmp_path: Path
+) -> None:
+    tid = await _singleton_task(repos)
+    task = await repos.tasks.get(tid)
+    sched = _scheduler(repos, tmp_path)  # default singleton_recovery_max=3
+
+    for _ in range(3):
+        assert await sched._singleton_recovery_exceeded(task) is False
+    t = await repos.tasks.get(tid)
+    assert t is not None and t.status == "in_progress"  # not failed within budget
+    assert (t.metadata or {}).get("_recovery_attempts") == 3
+    assert (await repos.agents.get("dispatcher-1")).status != "archived"
+
+
+@pytest.mark.asyncio
+async def test_singleton_recovery_exceeded_escalates_to_owner_no_archive(
+    repos: SqliteRepositories, tmp_path: Path
+) -> None:
+    tid = await _singleton_task(repos)
+    task = await repos.tasks.get(tid)
+    sched = _scheduler(repos, tmp_path)
+
+    results = [await sched._singleton_recovery_exceeded(task) for _ in range(4)]
+    assert results == [False, False, False, True]  # cap=3 → escalate on the 4th
+
+    t = await repos.tasks.get(tid)
+    assert t is not None and t.status == "failed"  # terminal → no more recovery
+    # CRITICAL: the dispatcher is NOT archived — unlike the ephemeral path. It
+    # must stay reachable so the owner's next mail re-wakes it via Phase 0.
+    agent = await repos.agents.get("dispatcher-1")
+    assert agent is not None and agent.status != "archived"
+    # The failure escalates to the owner (no-parent fallback) via task_terminated.
+    rows = await repos.outbox.dequeue_batch(limit=10)
+    esc = [
+        r for r in rows
+        if (r.payload.get("metadata") or {}).get("kind") == "task_terminated"
+    ]
+    assert len(esc) == 1
+    assert esc[0].payload["recipient"] == "owner"
+    assert (
+        esc[0].payload["metadata"]["failure_reason"] == "singleton_recovery_exceeded"
+    )
+
+
+@pytest.mark.asyncio
+async def test_singleton_recovery_skips_non_bootstrap_agent(
+    repos: SqliteRepositories, tmp_path: Path
+) -> None:
+    # parent_agent_id set → spawned child, NOT a bootstrap singleton → unbounded
+    # here (ordinary chaos recovery, exactly like a worker).
+    await repos.agents.create(
+        "worker-1", "worker", parent_agent_id="dispatcher-1"
+    )
+    tid = await repos.tasks.create(
+        TaskSpec(agent_id="worker-1", goal="g", acceptance="a")
+    )
+    task = await repos.tasks.get(tid)
+    sched = _scheduler(repos, tmp_path)
+    assert await sched._singleton_recovery_exceeded(task) is False
+    t = await repos.tasks.get(tid)
+    assert (t.metadata or {}).get("_recovery_attempts") is None  # never bumped

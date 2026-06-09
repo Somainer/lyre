@@ -66,8 +66,14 @@ class AdapterFactory:
     content (most unit tests).
     """
 
-    def __init__(self, blob_store: BlobStore | None = None) -> None:
+    def __init__(
+        self, blob_store: BlobStore | None = None, max_retries: int | None = None
+    ) -> None:
         self._blob_store = blob_store
+        # R1: forwarded to every adapter → the provider SDK client's retry
+        # budget for transient errors (429/529/500/timeout). None leaves the
+        # SDK default in place.
+        self._max_retries = max_retries
 
     def make(self, entry: ModelEntry) -> LLMAdapter:
         # Two auth modes; either or both can be configured per entry:
@@ -108,6 +114,7 @@ class AdapterFactory:
                 base_url=entry.endpoint.base_url,
                 extra_headers=extra_headers or None,
                 blob_store=self._blob_store,
+                max_retries=self._max_retries,
             )
         if entry.provider == "openai":
             # Within the OpenAI family the `endpoint.api` field picks
@@ -120,6 +127,7 @@ class AdapterFactory:
                 "base_url": entry.endpoint.base_url,
                 "extra_headers": extra_headers or None,
                 "blob_store": self._blob_store,
+                "max_retries": self._max_retries,
             }
             if entry.endpoint.api == "responses":
                 return OpenAIResponsesAdapter(**common_kwargs)

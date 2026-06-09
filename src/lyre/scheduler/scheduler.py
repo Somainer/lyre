@@ -364,6 +364,11 @@ class Scheduler:
                 # is failed + escalated + reclaimed here instead of re-run.
                 if await self._ephemeral_recovery_exceeded(t):
                     continue
+                # C: a bootstrap singleton (dispatcher) whose setup keeps failing
+                # would re-run here forever, silently. Bound it + escalate to
+                # owner on exceed (without archiving — it must stay reachable).
+                if await self._singleton_recovery_exceeded(t):
+                    continue
                 log.info("scheduler_recovering_expired_lease", task_id=t.id)
                 await self._run_task(t.id)
                 slots = self._available_slots()
@@ -896,6 +901,59 @@ class Scheduler:
         )
         return True
 
+    async def _singleton_recovery_exceeded(self, task: Task) -> bool:
+        """C: bound Phase-2 lease recovery for a BOOTSTRAP SINGLETON (dispatcher
+        etc., parent_agent_id NULL). A deterministic setup failure (e.g. the
+        observed 'wakeup failed' with empty ctx) re-raises, leaves the lease
+        dangling, and find_expired_leases re-runs it — forever and silently,
+        because the reaper only bounds ephemerals (the path above). Here we cap
+        the re-runs of a SINGLE task and, on exceed, fail it + escalate to the
+        OWNER — but NEVER archive the singleton: it is the owner's only entry
+        point and must stay reachable so the next mail re-wakes it via Phase 0.
+        A transient failure that recovers within the cap never escalates. Returns
+        True iff handled (caller skips the re-run)."""
+        cap = self.config.singleton_recovery_max
+        if cap <= 0 or task.agent_id is None:
+            return False
+        agent = await self.repos.agents.get(task.agent_id)
+        # Bootstrap singletons are the owner-facing seeds: parent_agent_id NULL
+        # and not ephemeral (the reaper owns ephemerals via _ephemeral_recovery_
+        # exceeded, which already returned False for this non-ephemeral task).
+        if agent is None or agent.parent_agent_id is not None:
+            return False
+        if (agent.metadata or {}).get("supervision", {}).get("ephemeral"):
+            return False
+        attempts = await self.repos.tasks.bump_recovery_attempt(task.id)
+        if attempts <= cap:
+            return False  # within budget — let the normal recovery re-run proceed
+        # Exceeded: stop the silent loop. Fail the task (so find_expired_leases
+        # stops returning it) and escalate to the owner via the task_terminated
+        # path (A makes auto-dispatched failures reach the owner) — but DO NOT
+        # archive: the singleton must remain dispatchable.
+        async with self.repos.transaction():
+            still = await self.repos.tasks.update_status(task.id, "failed")
+            if still:
+                await self.repos.wakeups.close_orphans_for_task(task.id)
+                await self._emit_task_terminated_mail(
+                    task,
+                    wakeup_id=task.lease_holder or "",
+                    task_status="failed",
+                    summary=(
+                        f"{task.agent_id} failed its wakeup setup and could not "
+                        f"recover after {cap} attempts; not re-run. The agent "
+                        f"stays live — your next message will re-wake it."
+                    ),
+                    failure_reason="singleton_recovery_exceeded",
+                    transcript_uri=None,
+                )
+        log.warning(
+            "scheduler_singleton_recovery_exceeded",
+            task_id=task.id,
+            agent_id=task.agent_id,
+            attempts=attempts,
+        )
+        return True
+
     async def _resolve_supervisor_for_agent(self, agent: Agent) -> str | None:
         """The supervisor of an ephemeral ``agent``: its spawner
         (``parent_agent_id``) if live and not archived, else ``owner``."""
@@ -1045,7 +1103,17 @@ class Scheduler:
         if task is None or task_status not in _TERMINAL_TASK_STATUSES:
             return
         meta = task.metadata or {}
-        if meta.get("fan_in_group") is not None or meta.get("auto_dispatched"):
+        if meta.get("fan_in_group") is not None:
+            # fan-in legs: the barrier aggregates their results as low-urgency
+            # mail; a normal-urgency notice here would prematurely auto-wake the
+            # coordinator on the first child.
+            return
+        if meta.get("auto_dispatched") and task_status != "failed":
+            # A routine 'check inbox' COMPLETION is internal bookkeeping — not
+            # worth pinging the owner. But a FAILED auto-dispatched inbox task
+            # means the owner's own request processing died silently: exactly
+            # the "dispatcher wakeup failed, 没人知道" gap (A). Let failures
+            # escalate; only completions/cancellations stay suppressed.
             return
         if task.parent_task_id is None and task_status != "failed":
             return
@@ -1673,6 +1741,8 @@ class Scheduler:
                 # default. Until now this build site never passed max_turns, so
                 # every wakeup silently took AgentLoop's hardcoded 24.
                 max_turns=_effective_max_turns(task, self.config.max_turns),
+                # R2: bounded mid-stream failover instead of a fatal wakeup.
+                max_midstream_retries=self.config.midstream_max_retries,
                 health=self.health,
                 blocker_watcher=blocker_watcher,
                 kill_switch=self.kill_switch,

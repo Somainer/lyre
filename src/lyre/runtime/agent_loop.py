@@ -320,6 +320,7 @@ class AgentLoop:
         compact_threshold: float = 0.7,
         compact_keep_last_k: int = 3,
         loop_repeat_threshold: int = 0,
+        max_midstream_retries: int = 1,
         cancel_check: Callable[[], Awaitable[str | None]] | None = None,
     ):
         if not candidates:
@@ -346,6 +347,12 @@ class AgentLoop:
         # once, then cooperative-stop. 0 disables. Set from config by the
         # scheduler; defaults off so unconfigured callers (tests) are unaffected.
         self.loop_repeat_threshold = loop_repeat_threshold
+        # R2: on a mid-stream LLM failure (some events already streamed) fail
+        # over to the next candidate up to this many times per turn instead of
+        # killing the wakeup. Safe because tools dispatch only AFTER a turn
+        # returns, so a discarded partial has no durable side effect (see
+        # FAILURE_ROBUSTNESS.md §5). 0 keeps the old mid-stream-fatal behavior.
+        self.max_midstream_retries = max_midstream_retries
         # B2: optional per-turn-boundary check for an operator cancel. Returns a
         # reason string (possibly empty) if cancel was requested, else None.
         # The scheduler wires this to a durable DB flag; tests/unconfigured
@@ -1066,6 +1073,8 @@ class AgentLoop:
         """
         tool_specs = self._tool_specs()
         last_exc: Exception | None = None
+        # R2: count mid-stream failovers across this one turn (per-turn budget).
+        midstream_attempts = 0
 
         for candidate in self.candidates:
             if self.health and not self.health.is_available(candidate.id):
@@ -1212,12 +1221,43 @@ class AgentLoop:
                     )
                     last_exc = exc
                     continue
-                log.error(
-                    "agent_turn_midstream_error",
-                    model=candidate.id,
-                    error=str(exc),
+                # R2: mid-stream failure — some events already streamed. No
+                # durable side effect landed: tools dispatch only AFTER this turn
+                # returns, and the partial (text/tool_uses/thinking) lives in
+                # locals that reset at the top of the next candidate iteration;
+                # `messages` is untouched. So a bounded NEXT-candidate failover is
+                # safe (reviewed: midstream-fallback-safety-review). Don't retry
+                # the SAME candidate — R1's SDK max_retries already covers the
+                # same-endpoint transient window before stream_turn ever raises.
+                midstream_attempts += 1
+                last_exc = exc
+                fallback_events.append(
+                    {
+                        "model_id": candidate.id,
+                        "reason": "midstream_error",
+                        "error": f"{type(exc).__name__}: {exc}",
+                        "attempt": midstream_attempts,
+                    }
                 )
-                raise
+                if midstream_attempts > self.max_midstream_retries:
+                    # Cap hit (or disabled with 0): preserve the old fatal
+                    # behavior so a persistently-down provider still surfaces.
+                    log.error(
+                        "agent_turn_midstream_exhausted",
+                        model=candidate.id,
+                        error=str(exc),
+                        attempts=midstream_attempts,
+                    )
+                    raise
+                # Note BEFORE discarding the partial so a dashboard / `tail`
+                # reader attributes the re-streamed content to a re-run rather
+                # than reading it as duplicate output.
+                self.transcript.note(
+                    f"model_midstream_failover: {candidate.id} died mid-stream "
+                    f"({type(exc).__name__}); discarding partial, attempt "
+                    f"{midstream_attempts} → next candidate"
+                )
+                continue
 
             if self.health:
                 self.health.mark_success(candidate.id)

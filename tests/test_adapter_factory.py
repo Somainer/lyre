@@ -323,6 +323,35 @@ def test_factory_openai_responses_header_only(monkeypatch) -> None:
     assert adapter.client.default_headers.get("Authorization") == "Bearer abc"
 
 
+# ---------------------------------------------------------------------------
+# R1: tunable transient-error retry budget, threaded factory → adapter → SDK
+# client. The SDK retries 429/529/500/timeout with backoff before raising.
+# ---------------------------------------------------------------------------
+
+
+def test_factory_threads_max_retries_to_anthropic_client(monkeypatch) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-fake")
+    entry = fake_entry(provider="anthropic", auth_env="ANTHROPIC_API_KEY")
+    adapter = AdapterFactory(max_retries=7).make(entry)
+    assert adapter.client.max_retries == 7
+
+
+def test_factory_threads_max_retries_to_openai_client(monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-fake")
+    entry = fake_entry(provider="openai", auth_env="OPENAI_API_KEY")
+    adapter = AdapterFactory(max_retries=5).make(entry)
+    assert adapter.client.max_retries == 5
+
+
+def test_factory_default_leaves_sdk_retry_default(monkeypatch) -> None:
+    """No max_retries → the adapter doesn't override → the SDK's own default
+    (2) stands, so behavior is unchanged unless the owner opts in."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-fake")
+    entry = fake_entry(provider="anthropic", auth_env="ANTHROPIC_API_KEY")
+    adapter = AdapterFactory().make(entry)
+    assert adapter.client.max_retries == 2
+
+
 def test_endpoint_api_field_validates_value() -> None:
     """ModelEndpoint.from_dict must reject unknown `api` values up-front
     so config typos surface at startup, not on first request."""

@@ -163,7 +163,7 @@ async def test_fan_in_member_is_suppressed(
 
 
 @pytest.mark.asyncio
-async def test_auto_dispatched_task_is_suppressed(
+async def test_auto_dispatched_completion_is_suppressed(
     repos: SqliteRepositories, tmp_path: Path
 ) -> None:
     await _team(repos)
@@ -171,11 +171,30 @@ async def test_auto_dispatched_task_is_suppressed(
         repos, parent_task=None, metadata={"auto_dispatched": True}
     )
     sched = _scheduler(repos, tmp_path)
-    # Even on failure: an auto inbox-check task is internal bookkeeping.
+    # A routine 'check inbox' COMPLETION is internal bookkeeping — no owner ping.
+    await sched._emit_task_terminated_mail(
+        child, wk, "completed", summary="x", failure_reason=None, transcript_uri=None
+    )
+    assert await repos.outbox.dequeue_batch(limit=10) == []
+
+
+@pytest.mark.asyncio
+async def test_auto_dispatched_failure_escalates_to_owner(
+    repos: SqliteRepositories, tmp_path: Path
+) -> None:
+    await _team(repos)
+    child, wk = await _child(
+        repos, parent_task=None, metadata={"auto_dispatched": True}
+    )
+    sched = _scheduler(repos, tmp_path)
+    # A FAILED auto inbox-check means the owner's own request processing died
+    # silently — the "dispatcher wakeup failed, 没人知道" gap (A). It MUST escalate,
+    # routed to owner via the no-parent fallback. Only completions stay quiet.
     await sched._emit_task_terminated_mail(
         child, wk, "failed", summary="x", failure_reason="E", transcript_uri=None
     )
-    assert await repos.outbox.dequeue_batch(limit=10) == []
+    await OutboxDispatcher(repos).tick()
+    assert len(await _terminated_mail(repos, "owner")) == 1
 
 
 @pytest.mark.asyncio

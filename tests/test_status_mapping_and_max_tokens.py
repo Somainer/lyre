@@ -406,6 +406,89 @@ def test_effective_max_turns_ignores_malformed_override(bad: object) -> None:
     assert _effective_max_turns(_task({"max_turns": bad}), 24) == 24
 
 
+# ---------------------------------------------------------------------------
+# R1: LLM transient-error retry budget (llm_max_retries) — config knob.
+# ---------------------------------------------------------------------------
+
+
+def test_llm_max_retries_defaults_to_2_when_unset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """2 matches the provider SDK default, so the default behavior is unchanged
+    — but now it's explicit and tunable."""
+    monkeypatch.setenv("LYRE_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("LYRE_LLM_MAX_RETRIES", raising=False)
+    assert Config.from_env().llm_max_retries == 2
+
+
+def test_llm_max_retries_reads_from_runtime_toml(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LYRE_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("LYRE_LLM_MAX_RETRIES", raising=False)
+    (tmp_path / "config.toml").write_text(
+        '[owner]\nname = "o"\n\n[runtime]\nllm_max_retries = 4\n',
+        encoding="utf-8",
+    )
+    assert Config.from_env().llm_max_retries == 4
+
+
+def test_llm_max_retries_env_overrides_toml(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LYRE_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("LYRE_LLM_MAX_RETRIES", "6")
+    (tmp_path / "config.toml").write_text(
+        '[owner]\nname = "o"\n\n[runtime]\nllm_max_retries = 4\n',
+        encoding="utf-8",
+    )
+    assert Config.from_env().llm_max_retries == 6
+
+
+def test_llm_max_retries_floors_at_0_for_negative(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Negative is meaningless; clamp to 0 (disables SDK retry)."""
+    monkeypatch.setenv("LYRE_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("LYRE_LLM_MAX_RETRIES", "-3")
+    assert Config.from_env().llm_max_retries == 0
+
+
+# ---------------------------------------------------------------------------
+# C + R2: singleton recovery bound + mid-stream failover budget — config knobs.
+# ---------------------------------------------------------------------------
+
+
+def test_singleton_recovery_max_default_and_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LYRE_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("LYRE_SINGLETON_RECOVERY_MAX", raising=False)
+    assert Config.from_env().singleton_recovery_max == 3
+    monkeypatch.setenv("LYRE_SINGLETON_RECOVERY_MAX", "5")
+    assert Config.from_env().singleton_recovery_max == 5
+    monkeypatch.setenv("LYRE_SINGLETON_RECOVERY_MAX", "-1")
+    assert Config.from_env().singleton_recovery_max == 0  # floor / disable
+
+
+def test_midstream_max_retries_default_and_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LYRE_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("LYRE_MIDSTREAM_MAX_RETRIES", raising=False)
+    assert Config.from_env().midstream_max_retries == 1
+    monkeypatch.setenv("LYRE_MIDSTREAM_MAX_RETRIES", "2")
+    assert Config.from_env().midstream_max_retries == 2
+    monkeypatch.setenv("LYRE_MIDSTREAM_MAX_RETRIES", "-5")
+    assert Config.from_env().midstream_max_retries == 0  # floor / old fatal
+
+
 def test_phantom_delegation_ignores_peer_directed_mail(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

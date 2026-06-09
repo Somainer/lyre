@@ -689,6 +689,33 @@ class SqliteTaskRepository:
             return None
         return row["reason"] or ""
 
+    async def bump_recovery_attempt(self, task_id: str) -> int:
+        """C: count Phase-2 lease recoveries of THIS task and return the new
+        total. Used to bound a bootstrap singleton's silent setup-failure
+        retry-loop: each recovery bumps `metadata.$._recovery_attempts`; past the
+        configured cap the scheduler escalates instead of re-running. A simple
+        total (not a sliding window) because singleton recoveries are ~one
+        lease-duration apart — a window would keep resetting and never bound
+        them. Kill-safe: the counter is a durable row, so a crash between bump
+        and re-run just re-reads the same count next tick."""
+        async with self.conn.execute(
+            """
+            UPDATE tasks
+            SET metadata = json_set(
+                    coalesce(metadata, '{}'),
+                    '$._recovery_attempts',
+                    coalesce(json_extract(metadata, '$._recovery_attempts'), 0) + 1
+                ),
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+            WHERE id = ?
+            RETURNING json_extract(metadata, '$._recovery_attempts') AS n
+            """,
+            (task_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        await _commit(self.conn)
+        return int(row["n"]) if row and row["n"] is not None else 0
+
     async def find_resumable(self, limit: int = 20) -> list[Task]:
         """Parked tasks whose resume flag is set — Phase 0.7 flips these back
         to 'pending'. Oldest-first so a backlog drains FIFO."""
