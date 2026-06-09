@@ -49,8 +49,9 @@ def test_ensure_skeleton_creates_all_canonical_dirs(tmp_path: Path) -> None:
     created = ensure_skeleton(tmp_path)
     paths = {p.relative_to(tmp_path).as_posix() for p in created}
     # Skills live in ~/.lyre/skills/, owner identity in ~/.lyre/user.md;
-    # memory/ now holds only agent-authored knowledge files.
-    assert paths == {"facts"}
+    # memory/ holds agent-authored knowledge files + the archive subdir where
+    # superseded facts are mv'd out of the menu (still grep/read_memory-able).
+    assert paths == {"facts", "facts/archive"}
     # Idempotent: 2nd call creates nothing new.
     assert ensure_skeleton(tmp_path) == []
 
@@ -174,6 +175,57 @@ def test_format_index_skips_empty_groups(tmp_path: Path) -> None:
     assert "### Facts" in out
     assert "### Persona profiles" not in out
     assert "### Skills" not in out
+
+
+def test_format_index_flat_when_one_type(tmp_path: Path) -> None:
+    """Self-scaling: a single type (or all untyped) is a no-op — no `**type**`
+    subheaders, just the old flat list. Grouping only appears at 2+ types."""
+    ensure_skeleton(tmp_path)
+    _write_md(tmp_path / "facts" / "a.md", {"description": "A", "type": "spec"}, "")
+    _write_md(tmp_path / "facts" / "b.md", {"description": "B", "type": "spec"}, "")
+    out = format_memory_index(scan_memory_dir(tmp_path))
+    assert "### Facts" in out
+    assert "`facts/a.md` — A" in out
+    assert "`facts/b.md` — B" in out
+    assert "**spec**" not in out  # one type → no subheader
+
+
+def test_format_index_groups_facts_by_type(tmp_path: Path) -> None:
+    """The `type` frontmatter field (already written by fact authors) groups
+    the menu once there's more than one type; the untyped bucket renders LAST
+    under a neutral 'other' label."""
+    ensure_skeleton(tmp_path)
+    _write_md(tmp_path / "facts" / "s.md", {"description": "S", "type": "spec"}, "")
+    _write_md(
+        tmp_path / "facts" / "c.md",
+        {"description": "C", "type": "review_checklist"}, "",
+    )
+    _write_md(tmp_path / "facts" / "loose.md", {"description": "L"}, "")  # untyped
+    out = format_memory_index(scan_memory_dir(tmp_path))
+    assert "**spec**" in out
+    assert "**review_checklist**" in out
+    assert "**other**" in out  # untyped bucket
+    # The untyped 'other' bucket is always last, after the typed groups.
+    assert out.index("**spec**") < out.index("**other**")
+    assert out.index("**review_checklist**") < out.index("**other**")
+    assert "`facts/s.md` — S" in out
+    assert "`facts/loose.md` — L" in out
+
+
+def test_format_index_excludes_archive_subdir(tmp_path: Path) -> None:
+    """The facts/archive/ convention: an archived fact is INVISIBLE to the
+    injected menu (the non-recursive scan skips subdirs) yet stays on disk for
+    grep / read_memory. This is the zero-code, semantic 'eviction'."""
+    ensure_skeleton(tmp_path)
+    _write_md(tmp_path / "facts" / "live.md", {"description": "live"}, "")
+    _write_md(
+        tmp_path / "facts" / "archive" / "old.md", {"description": "archived"}, "",
+    )
+    out = format_memory_index(scan_memory_dir(tmp_path))
+    assert "`facts/live.md`" in out
+    assert "old.md" not in out  # archived → out of the menu
+    # ...but still on disk, reachable by grep / read_memory.
+    assert (tmp_path / "facts" / "archive" / "old.md").exists()
 
 
 # ---------------------------------------------------------------------------

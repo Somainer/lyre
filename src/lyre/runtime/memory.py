@@ -79,6 +79,14 @@ class MemoryEntry:
         s = self.frontmatter.get("scope")
         return str(s) if s else None
 
+    @property
+    def type(self) -> str | None:
+        """The `type` frontmatter field (e.g. 'spec', 'review_checklist',
+        'agent_notes'). Already written by every fact author; the index groups
+        by it so the menu stays scannable as facts accumulate. None when unset."""
+        t = self.frontmatter.get("type")
+        return str(t).strip() if t and str(t).strip() else None
+
     def applies_to(self, *, agent_id: str | None, persona_name: str | None) -> bool:
         """Whether this fact's scope makes it relevant to the given agent.
 
@@ -263,10 +271,33 @@ def format_memory_index(
     if groups["fact"]:
         lines.append("")
         lines.append("### Facts")
-        for e in groups["fact"]:
-            lines.append(_format_line(e))
+        lines.extend(_format_fact_lines(groups["fact"]))
 
     return "\n".join(lines)
+
+
+def _format_fact_lines(facts: list[MemoryEntry]) -> list[str]:
+    """Render the facts list, GROUPED by the `type` frontmatter field so the
+    menu stays scannable as facts accumulate. The field is already written by
+    every fact author (analyst specs, shipped checklists, agent notes) — until
+    now the renderer discarded it. Self-scaling: with a single type (or all
+    untyped) this degrades to exactly the old flat list, so it's a no-op at low
+    volume; the grouping only appears once there's more than one type to
+    separate. No new field, no write path, no lifecycle — pure presentation."""
+    by_type: dict[str, list[MemoryEntry]] = {}
+    for e in facts:
+        by_type.setdefault(e.type or "", []).append(e)
+    # One bucket → flat (no subheaders): all-same-type or all-untyped.
+    if len(by_type) <= 1:
+        return [_format_line(e) for e in facts]
+    out: list[str] = []
+    # Typed groups first (alphabetical, stable); the untyped bucket ("") last
+    # under a neutral label so it never jumps to the top by sort order.
+    ordered = sorted(k for k in by_type if k) + ([""] if "" in by_type else [])
+    for k in ordered:
+        out.append(f"**{k or 'other'}**")
+        out.extend(_format_line(e) for e in by_type[k])
+    return out
 
 
 def _format_line(e: MemoryEntry) -> str:
@@ -316,6 +347,11 @@ SKELETON_SUBDIRS = (
     # Skills live in ~/.lyre/skills/ (see runtime.skills);
     # Owner identity lives in ~/.lyre/user.md (user-only-writable).
     "facts",
+    # facts/archive/ — where an agent `mv`s superseded facts. Subdirs are skipped
+    # by the non-recursive scan, so archived facts drop out of the injected menu
+    # while staying grep/read_memory-able. Pre-created so `mv` just works (the
+    # zero-code "eviction" the design intentionally keeps semantic, not mechanical).
+    "facts/archive",
 )
 
 
