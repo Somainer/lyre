@@ -136,6 +136,19 @@ async def _dispatch_task(ctx: ToolContext, args: dict[str, Any]) -> dict[str, An
     except (TypeError, ValueError):
         raise ToolError(f"lease_duration_s must be an integer (got {raw_lease!r})") from None
 
+    # O3a: optional per-task turn budget. Rides the existing (until now unused)
+    # tier_overrides bag; the scheduler resolves it at the AgentLoop build site.
+    # No ceiling — only trusted orchestrators dispatch, and H1/A1 still bound a
+    # runaway. Reject non-positive / non-int loudly (bool is an int subclass in
+    # Python, so a JSON `true` must be excluded explicitly) rather than silently
+    # dropping an over-budget intent.
+    tier_overrides: dict[str, Any] | None = None
+    raw_max_turns = args.get("max_turns")
+    if raw_max_turns is not None:
+        if isinstance(raw_max_turns, bool) or not isinstance(raw_max_turns, int) or raw_max_turns < 1:
+            raise ToolError(f"max_turns must be a positive integer (got {raw_max_turns!r})")
+        tier_overrides = {"max_turns": raw_max_turns}
+
     spec = TaskSpec(
         agent_id=resolved_agent_id,
         persona_name=resolved_persona,
@@ -146,6 +159,7 @@ async def _dispatch_task(ctx: ToolContext, args: dict[str, Any]) -> dict[str, An
         deadline=None,
         metadata=metadata,
         git_context=git_ctx,
+        tier_overrides=tier_overrides,
     )
     if fan_in_slot is not None:
         # Atomic: the child task and its roster slot land together. Both
@@ -259,6 +273,16 @@ DISPATCH_TASK = Tool(
                 "description": "Verifiable acceptance criteria — what 'done' means.",
             },
             "lease_duration_s": {"type": "integer", "default": 1800},
+            "max_turns": {
+                "type": "integer",
+                "description": (
+                    "Optional per-wakeup turn budget for this task (model↔tool "
+                    "loop iterations before honest truncation). Omit to use the "
+                    "runtime default (24). Raise it for tasks you expect to need "
+                    "many steps — e.g. a deep-research leg — so they don't get "
+                    "truncated mid-work. Must be a positive integer."
+                ),
+            },
             "metadata": {"type": "object"},
             "fan_in": {
                 "type": "object",

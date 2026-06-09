@@ -28,11 +28,11 @@ from pathlib import Path
 import pytest
 
 from lyre.config import Config
-from lyre.persistence.models import TaskStatus
+from lyre.persistence.models import Task, TaskStatus
 from lyre.runtime.agent_loop import AgentLoop
 from lyre.runtime.health_tracker import HealthTracker
 from lyre.runtime.transcript import TranscriptWriter
-from lyre.scheduler.scheduler import _wakeup_status_to_task_status
+from lyre.scheduler.scheduler import _effective_max_turns, _wakeup_status_to_task_status
 
 from .helpers import fake_entry
 
@@ -308,6 +308,102 @@ def test_phantom_delegation_silent_when_owner_mail_is_legit_ack(
 
     captured = capsys.readouterr()
     assert "phantom_delegation_suspected" not in captured.out
+
+
+# ---------------------------------------------------------------------------
+# O3a: per-task TURN budget (max_turns) — config knob + build-site resolution
+# ---------------------------------------------------------------------------
+
+
+def test_max_turns_defaults_to_24_when_unset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """24 is the long-standing default the AgentLoop build site silently used
+    when nothing passed max_turns. Lifting it into Config keeps that default
+    while making it tunable."""
+    monkeypatch.setenv("LYRE_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("LYRE_MAX_TURNS", raising=False)
+    assert Config.from_env().max_turns == 24
+
+
+def test_max_turns_reads_from_runtime_toml(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LYRE_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("LYRE_MAX_TURNS", raising=False)
+    (tmp_path / "config.toml").write_text(
+        '[owner]\nname = "o"\n\n[runtime]\nmax_turns = 40\n',
+        encoding="utf-8",
+    )
+    assert Config.from_env().max_turns == 40
+
+
+def test_max_turns_env_overrides_toml(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LYRE_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("LYRE_MAX_TURNS", "50")
+    (tmp_path / "config.toml").write_text(
+        '[owner]\nname = "o"\n\n[runtime]\nmax_turns = 40\n',
+        encoding="utf-8",
+    )
+    assert Config.from_env().max_turns == 50
+
+
+def test_max_turns_floors_at_1_for_zero_or_negative(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A misconfigured ``max_turns=0`` would wedge every wakeup at zero
+    turns — clamp to a functional floor of 1."""
+    monkeypatch.setenv("LYRE_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("LYRE_MAX_TURNS", raising=False)
+    (tmp_path / "config.toml").write_text(
+        '[owner]\nname = "o"\n\n[runtime]\nmax_turns = 0\n',
+        encoding="utf-8",
+    )
+    assert Config.from_env().max_turns == 1
+
+
+def test_max_turns_garbage_falls_back_to_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LYRE_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("LYRE_MAX_TURNS", "not-a-number")
+    assert Config.from_env().max_turns == 24
+
+
+def _task(tier_overrides: dict[str, object] | None) -> Task:
+    return Task(
+        id="t1",
+        persona_name="analyst",
+        goal="g",
+        acceptance="a",
+        status="in_progress",
+        tier_overrides=tier_overrides,
+    )
+
+
+def test_effective_max_turns_uses_per_task_override() -> None:
+    """A dispatch that raised the budget (dispatch_task max_turns=) wins over
+    the config default — this is the consumer that makes tier_overrides live."""
+    assert _effective_max_turns(_task({"max_turns": 40}), 24) == 40
+
+
+def test_effective_max_turns_falls_back_to_default_without_override() -> None:
+    assert _effective_max_turns(_task(None), 24) == 24
+    assert _effective_max_turns(_task({}), 24) == 24
+
+
+@pytest.mark.parametrize("bad", [0, -1, "40", 3.5, True])
+def test_effective_max_turns_ignores_malformed_override(bad: object) -> None:
+    """A non-int / non-positive override (incl. bool, an int subclass) is
+    ignored in favour of the default rather than wedging the wakeup."""
+    assert _effective_max_turns(_task({"max_turns": bad}), 24) == 24
 
 
 def test_phantom_delegation_ignores_peer_directed_mail(

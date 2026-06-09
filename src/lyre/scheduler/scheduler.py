@@ -117,6 +117,20 @@ def _metadata_without_cancel(metadata: dict[str, Any] | None) -> dict[str, Any] 
     return stripped or None
 
 
+def _effective_max_turns(task: Task, default: int) -> int:
+    """O3a per-task turn budget. A dispatch may raise a task's per-wakeup turn
+    budget via ``dispatch_task(max_turns=)`` (written into ``tier_overrides``);
+    otherwise the runtime default applies. This is the one consumer that makes
+    the previously-dormant ``tier_overrides`` column live. No ceiling — only
+    trusted orchestrators dispatch, and H1/A1 still bound a runaway. A malformed
+    override (non-int, bool, or < 1) is ignored in favour of the default rather
+    than wedging the wakeup."""
+    override = (task.tier_overrides or {}).get("max_turns")
+    if isinstance(override, int) and not isinstance(override, bool) and override >= 1:
+        return override
+    return default
+
+
 # task_terminated mail (OTP `monitor`/DOWN analogue): only a TERMINAL task
 # warrants notifying its supervisor; pending/in_progress/needs_input are still
 # in-flight. Failure rides urgency=high so MailWatcher surfaces it mid-wakeup
@@ -1654,6 +1668,11 @@ class Scheduler:
                 tool_context=tool_ctx,
                 allowed_tools=list(persona.allowed_lyre_tools or []),
                 max_tokens=self.config.max_tokens,
+                # O3a: resolve the per-task turn budget (a dispatch may have
+                # raised it via dispatch_task(max_turns=)); else the config
+                # default. Until now this build site never passed max_turns, so
+                # every wakeup silently took AgentLoop's hardcoded 24.
+                max_turns=_effective_max_turns(task, self.config.max_turns),
                 health=self.health,
                 blocker_watcher=blocker_watcher,
                 kill_switch=self.kill_switch,
