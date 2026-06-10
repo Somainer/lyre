@@ -613,6 +613,15 @@ class ScheduledMailRepository(Protocol):
         self, mail_id: int, reason: str
     ) -> None: ...
 
+    async def record_delivery_failure(
+        self, mail_id: int, error: str, quarantine_after: int
+    ) -> bool:
+        """Count a Phase −1 delivery attempt that raised; at
+        ``quarantine_after`` consecutive failures flip the row to the
+        terminal 'quarantined' status (find_ready stops returning it).
+        Returns True when this call quarantined the row."""
+        ...
+
 
 class SkillRepository(Protocol):
     async def get_by_name(self, name: str) -> Skill | None: ...

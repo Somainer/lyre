@@ -1988,6 +1988,44 @@ class SqliteScheduledMailRepository:
             )
         await _commit(self.conn)
 
+    async def record_delivery_failure(
+        self, mail_id: int, error: str, quarantine_after: int
+    ) -> bool:
+        """Phase −1 poison-row guard: count a delivery attempt that raised.
+        On reaching `quarantine_after` consecutive failures the row flips
+        to status='quarantined' — terminal, excluded by find_ready's
+        status='pending' filter — so one corrupt row can't consume a
+        delivery slot every tick forever. Returns True when THIS call
+        quarantined the row. The triggering error is preserved in
+        bounce_reason for the operator."""
+        await self.conn.execute(
+            """
+            UPDATE scheduled_mail
+            SET delivery_failure_count = delivery_failure_count + 1,
+                status = CASE
+                    WHEN delivery_failure_count + 1 >= ? THEN 'quarantined'
+                    ELSE status
+                END,
+                bounce_reason = CASE
+                    WHEN delivery_failure_count + 1 >= ? THEN ?
+                    ELSE bounce_reason
+                END
+            WHERE id = ? AND status='pending'
+            """,
+            (
+                quarantine_after,
+                quarantine_after,
+                f"quarantined after {quarantine_after} delivery failures: {error[:500]}",
+                mail_id,
+            ),
+        )
+        await _commit(self.conn)
+        async with self.conn.execute(
+            "SELECT status FROM scheduled_mail WHERE id = ?", (mail_id,)
+        ) as cur:
+            row = await cur.fetchone()
+        return bool(row and row["status"] == "quarantined")
+
     async def mark_cancelled(
         self,
         mail_id: int,
@@ -2057,6 +2095,10 @@ class SqliteScheduledMailRepository:
             ),
             max_no_progress=(
                 row["max_no_progress"] if "max_no_progress" in keys else None
+            ),
+            delivery_failure_count=(
+                row["delivery_failure_count"]
+                if "delivery_failure_count" in keys else 0
             ),
             created_at=row["created_at"],
             created_by_agent=row["created_by_agent"],
