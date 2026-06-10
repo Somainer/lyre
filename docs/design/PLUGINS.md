@@ -1,13 +1,13 @@
 # Lyre — Plugin System
 
-> **Status: PARKED (proposed, not scheduled)** — owner decision 2026-06-10 (see
-> `DEEP_REVIEW_2026-06.md` §F7). Merged from branch `spec/plugin-system` so the
-> only fully-specced future arc is visible from main; **no implementation is
-> scheduled**. Revival condition: owner explicitly endorses the plugin arc after
-> the current repair/canon/H2/observability rounds land. Two side-effects of
-> that future decision are pre-recorded: (a) it would answer whether the
-> Unix-socket gateway from FOUNDATION 铁律二 revives (this spec supersedes it
-> with in-process hooks if adopted); (b) it shifts new design docs to English.
+> **Status: PARKED (proposed, not scheduled)** — owner decision 2026-06-10.
+> Merged from branch `spec/plugin-system` so the only fully-specced future arc
+> is visible from main; **no implementation is scheduled**. Revival condition:
+> owner explicitly endorses the plugin arc after the current repair/canon/
+> H2/observability rounds land. Two side-effects of that future decision are
+> pre-recorded: (a) it would answer whether the Unix-socket gateway from
+> FOUNDATION 铁律二 revives (this spec supersedes it with in-process hooks if
+> adopted); (b) it shifts new design docs to English.
 
 > **Scope**: Defines Lyre's plugin system — letting agents extend runtime behavior **without modifying `src/lyre/`**. Designed in the spirit of [pi's hooks design](https://github.com/earendil-works/pi/blob/main/packages/agent/docs/hooks.md) and [Claude Code's marketplace model](https://anthropic.com/claude-code/marketplace.schema.json), while honoring Lyre's five iron laws.
 > **See also**: [`FOUNDATION.md`](./FOUNDATION.md) (the five laws), [`AGENT_RUNTIME.md`](./AGENT_RUNTIME.md) (agent loop internals), [`AGENT_CONTRACT.md`](./AGENT_CONTRACT.md) (tool contract).
