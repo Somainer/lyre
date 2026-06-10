@@ -1,5 +1,15 @@
 # Lyre — 持久层 Schema
 
+> **STATUS (2026-06-10): historical (v0.x plan) — the schema SSOT is
+> [`migrations/0001_initial.sql`](../../migrations/0001_initial.sql), a single re-runnable
+> baseline edited in place (no migration chain; the owner nukes the local DB on schema change).**
+> For the current tables read that SQL file, not this doc: the DDL below diverges (the
+> "Migration 0005/0006" notes refer to history that was folded into the single baseline — those
+> files do not exist), and the Postgres/BIGSERIAL dual-backend plan (`-- PG:` annotations,
+> `PostgresRepositories`, §7 migration path) was never built — SQLite via aiosqlite is the only
+> implementation. Note: the `skills` / `artifacts` / `local_hot` tables exist in the baseline but
+> have zero runtime callers and are pending deletion per `DEEP_REVIEW_2026-06.md` §E2.
+
 > **文档定位**：定义 Lyre 持久层的物理实现、表 schema、并发与事务策略、后端可替换性。MVP 走 SQLite（runtime state）+ 文件系统（global = soul / memory / skills / personas / config）+ 本地文件系统（cold-archive object store）；保留 SQLite → Postgres 迁移路径作为 scaling 出口。**没有向量库**——facts / soul / skills 全是 markdown 文件，agent 用 grep / shell_exec 自管理。
 > **相关**：[`FOUNDATION.md §3.5`](./FOUNDATION.md#35-铁律四持久层按作用域分三档) 三档持久层；[`FOUNDATION.md §3.7`](./FOUNDATION.md#37-五层架构整体分层) 五层架构第二层；[`AGENT_CONTRACT.md`](./AGENT_CONTRACT.md)；[`TRANSACTION_BOUNDARIES.md`](./TRANSACTION_BOUNDARIES.md)。
 

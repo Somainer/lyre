@@ -1,6 +1,6 @@
 ---
 name: review-checklist-skill
-description: Skill 草案评审清单——reviewer 审 ~/.lyre/memory/skills/proposed/<name>/SKILL.md 时按此走
+description: Skill 草案评审清单——reviewer 审 ~/.lyre/skills/proposed/<name>/SKILL.md 时按此走
 type: review_checklist
 artifact: skill_proposal
 ---
@@ -23,7 +23,7 @@ artifact: skill_proposal
 - 假设的输入 / 输出明确？
 
 ## 3. 不重复
-`shell_exec ls ~/.lyre/memory/skills/approved/` 看是否已经有同义品。
+`shell_exec ls ~/.lyre/skills/approved/` 看是否已经有同义品。
 - 已存在同名 / 同主题 skill → **拒**（让 worker 改进既有 skill 而不是新增）
 - 部分重叠 → **回打**，让 worker 把差异点说清楚或合并到既有 skill
 
@@ -44,13 +44,13 @@ body 不应包含：
 
 ### approve
 ```bash
-shell_exec mv ~/.lyre/memory/skills/proposed/<name> ~/.lyre/memory/skills/approved/<name>
+shell_exec mv ~/.lyre/skills/proposed/<name> ~/.lyre/skills/approved/<name>
 mailbox_send to=<proposing-worker> body="approved skill <name>"
 ```
 
 ### reject
 ```bash
-shell_exec rm -rf ~/.lyre/memory/skills/proposed/<name>
+shell_exec rm -rf ~/.lyre/skills/proposed/<name>
 mailbox_send to=<proposing-worker> body="rejected skill <name>: <理由 1-2 句>"
 ```
 

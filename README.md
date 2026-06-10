@@ -49,7 +49,7 @@ uv run lyre serve                 # scheduler + dispatcher + dashboard
 In another terminal:
 
 ```bash
-uv run lyre send leader "Hi leader, reply with pong and tell me what model you're on."
+uv run lyre send dispatcher "Hi dispatcher, reply with pong and tell me what model you're on."
 uv run lyre mailbox owner --unread-only      # see the reply
 open http://127.0.0.1:8765                   # or browse the dashboard
 ```
