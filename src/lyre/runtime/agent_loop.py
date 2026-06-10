@@ -122,6 +122,17 @@ _LOOP_REPEAT_NUDGE_TEMPLATE = (
 )
 
 
+def _is_truncated_tool_args(tool_input: dict[str, Any]) -> bool:
+    """The adapter sentinel for unparseable tool-call arguments: exactly
+    ``{"_raw": <str>}``. ``_raw`` alongside other keys is a legitimate
+    field name and must NOT match."""
+    return (
+        len(tool_input) == 1
+        and "_raw" in tool_input
+        and isinstance(tool_input["_raw"], str)
+    )
+
+
 @dataclass
 class _StopRequest:
     """A cooperative stop asked of the wakeup loop at a turn boundary (S0).
@@ -556,7 +567,8 @@ class AgentLoop:
                     tool_result_blocks: list[LyreContentBlock] = []
                     for tu in tool_uses_this_turn:
                         result, is_error, view_blocks = await self._dispatch_tool(
-                            tu["name"], tu["id"], tu["input"]
+                            tu["name"], tu["id"], tu["input"],
+                            stop_reason=stop_reason,
                         )
                         tool_outcomes.append(is_error)
                         tool_result_blocks.append(
@@ -670,7 +682,8 @@ class AgentLoop:
                 # JSON the model reads. We append them as their own
                 # LyreContentBlock entries on the same user message.
                 result, is_error, view_blocks = await self._dispatch_tool(
-                    tu["name"], tu["id"], tu["input"]
+                    tu["name"], tu["id"], tu["input"],
+                    stop_reason=stop_reason,
                 )
                 tool_outcomes.append(is_error)
                 tool_result_blocks.append(
@@ -709,10 +722,21 @@ class AgentLoop:
             # cooperative-stop via the S0 seam (needs_continuation → failed →
             # re-dispatchable), instead of burning every remaining turn.
             if self.loop_repeat_threshold > 0 and tool_uses_this_turn:
+                # Truncated-args retries (the `_raw` sentinel) regenerate the
+                # payload each turn, so the bytes jitter and exact identity
+                # never matches — yet semantically it's the same failing call
+                # cut at the same budget. Collapse them to (tool, sentinel) so
+                # the guard still trips. (2026-06 field incident: 13
+                # consecutive ~10KB truncated writes sailed past the guard.)
                 fp = "|".join(
                     sorted(
                         _json.dumps(
-                            {"n": tu["name"], "i": tu["input"]},
+                            {
+                                "n": tu["name"],
+                                "i": "<truncated-args>"
+                                if _is_truncated_tool_args(tu["input"])
+                                else tu["input"],
+                            },
                             sort_keys=True,
                             default=str,
                         )
@@ -1297,7 +1321,11 @@ class AgentLoop:
         return None
 
     async def _dispatch_tool(
-        self, name: str, tool_use_id: str, tool_input: dict[str, Any]
+        self,
+        name: str,
+        tool_use_id: str,
+        tool_input: dict[str, Any],
+        stop_reason: str | None = None,
     ) -> tuple[str, bool, list[LyreContentBlock]]:
         # Third element: multimodal view blocks drained from a dict result.
         # They MUST be popped off the result dict BEFORE it is serialized,
@@ -1316,30 +1344,46 @@ class AgentLoop:
         if tool is None:
             return (f"Unknown tool '{name}'.", True, [])
         # Adapters that couldn't parse the model's tool-call arguments
-        # JSON (e.g. truncated by max_tokens mid-emit) fall back to
-        # ``{"_raw": <partial-json-string>}``. The per-tool handler then
-        # sees a payload missing every required key and returns the
-        # generic "provide 'code'" / "provide 'to'" error — the model
-        # then re-tries the same malformed call, burns turns, and the
-        # task dies at max_turns. Surfacing the truncation directly
-        # lets the model break out of that loop on the next turn.
-        if (
-            len(tool_input) == 1
-            and "_raw" in tool_input
-            and isinstance(tool_input["_raw"], str)
-        ):
+        # JSON fall back to ``{"_raw": <partial-json-string>}``. The
+        # per-tool handler would then see a payload missing every
+        # required key and return the generic "provide 'code'" /
+        # "provide 'to'" error — the model re-tries the same malformed
+        # call, burns turns, and the task dies at max_turns. Surfacing
+        # the truncation with a MEASURED diagnosis (the turn's
+        # stop_reason, not a guess) lets the model break out of that
+        # loop on the next turn. (2026-06 field incident: the previous
+        # hardcoded "probably max_tokens" wording happened to be right,
+        # but only by luck — diagnose from data.)
+        if _is_truncated_tool_args(tool_input):
             raw = tool_input["_raw"]
+            log.warning(
+                "tool_args_truncated",
+                tool=name,
+                raw_len=len(raw),
+                stop_reason=stop_reason,
+            )
+            if stop_reason == "max_tokens":
+                diagnosis = (
+                    f"this turn hit its output-token budget "
+                    f"(max_tokens={self.max_tokens}) while emitting them, so "
+                    f"the argument stream was cut off mid-emission"
+                )
+            else:
+                diagnosis = (
+                    f"they arrived truncated or malformed from the provider "
+                    f"(turn stop_reason={stop_reason!r})"
+                )
             return (
                 f"Tool '{name}' was called with malformed arguments — "
-                f"the JSON could not be parsed and was probably "
-                f"truncated by the per-turn output budget "
-                f"(max_tokens={self.max_tokens}). "
-                f"Do NOT retry the same call. Either shrink the "
-                f"arguments (split a large input across multiple "
-                f"calls, omit verbose inline content, paste-link "
-                f"instead of inlining), or skip this tool for now and "
-                f"continue the task differently. "
-                f"Raw bytes received ({len(raw)} chars): {raw[:200]!r}…",
+                f"the JSON could not be parsed: {diagnosis}. "
+                f"Received {len(raw)} chars of an incomplete payload. "
+                f"Do NOT retry the same call — it will be cut at the same "
+                f"point again. Split the large payload across multiple "
+                f"smaller calls (e.g. a large literal such as file content: "
+                f"write the first part, then append the rest in later "
+                f"calls), omit verbose inline content, or skip this tool "
+                f"for now and continue the task differently. "
+                f"First bytes received: {raw[:200]!r}…",
                 True,
                 [],
             )

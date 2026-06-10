@@ -56,6 +56,44 @@ async def test_repeated_identical_tool_call_nudges_then_bails(
 
 
 @pytest.mark.asyncio
+async def test_jittering_truncated_args_retries_still_trip_guard(
+    object_store: Path,
+) -> None:
+    """The 2026-06 field incident: a model whose tool args are cut by the
+    output budget regenerates the payload every retry, so the ``_raw``
+    bytes jitter by a few chars and exact-identity fingerprinting never
+    matches — 13 consecutive ~10KB truncated writes sailed past the
+    guard to max_turns. The fingerprint must collapse the ``_raw``
+    sentinel to (tool, <truncated-args>) so this class still trips."""
+    adapter = FakeAdapter()
+    for i in range(8):
+        adapter.push_turn(
+            [
+                ToolUseComplete(
+                    id="t",
+                    name="python_exec",
+                    # Same failing call, jittering bytes — like regenerated
+                    # code cut at a slightly different offset each turn.
+                    input={"_raw": '{"code": "' + "spec text " * 3 + "x" * i},
+                ),
+                TurnComplete(stop_reason="max_tokens"),
+            ]
+        )
+    transcript = TranscriptWriter(object_store, "wakeup-raw-jitter")
+    loop = build_single_candidate_loop(
+        adapter, transcript, max_turns=20, loop_repeat_threshold=3
+    )
+
+    result = await loop.run(system_prompt="", initial_messages=[_user("go")])
+    transcript.close()
+
+    assert result.turns == 4
+    assert result.status == "needs_continuation"
+    assert "loop_repeat_nudge_injected" in transcript.path.read_text()
+    assert "loop_repeat_bail" in transcript.path.read_text()
+
+
+@pytest.mark.asyncio
 async def test_distinct_args_each_turn_do_not_trigger_guard(
     object_store: Path,
 ) -> None:

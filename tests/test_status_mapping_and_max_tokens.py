@@ -132,25 +132,17 @@ def test_max_tokens_floors_at_256_for_garbage_input(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_dispatch_tool_detects_raw_fallback(tmp_path: Path) -> None:
-    """When the adapter couldn't parse the model's tool-call arguments
-    (truncation by max_tokens, malformed JSON, etc.) it returns
-    ``{"_raw": <partial-string>}``. The agent loop must NOT pass this
-    through to the per-tool handler — that just produces a generic
-    "provide 'code'" error and the model keeps re-issuing the same
-    malformed call until max_turns. Instead surface a specific error
-    so the model knows to shrink the call."""
+def _raw_dispatch_loop(tmp_path: Path, name: str) -> tuple[AgentLoop, TranscriptWriter]:
+    """A loop wired just far enough to exercise ``_dispatch_tool``.
+    ``repos=None`` would be a type error in handlers, but the ``_raw``
+    sentinel must short-circuit BEFORE any handler is invoked."""
     from lyre.runtime.tools import ToolContext, ToolRegistry
     from lyre.runtime.tools.builtin import build_default_registry
 
     object_store = tmp_path / "objstore"
-    object_store.mkdir()
-    transcript = TranscriptWriter(object_store, "wakeup-truncated")
+    object_store.mkdir(exist_ok=True)
+    transcript = TranscriptWriter(object_store, name)
     registry: ToolRegistry = build_default_registry()
-    # ToolContext below stays unused because the dispatch should fail
-    # BEFORE the handler is invoked. ``repos=None`` would be a type
-    # error in handlers, but we never reach them.
     ctx = ToolContext(
         repos=None,  # type: ignore[arg-type]
         task_id="t-unused", wakeup_id="w-unused",
@@ -167,11 +159,28 @@ async def test_dispatch_tool_detects_raw_fallback(tmp_path: Path) -> None:
         max_tokens=4096,
         health=HealthTracker(),
     )
+    return loop, transcript
+
+
+@pytest.mark.asyncio
+async def test_dispatch_tool_detects_raw_fallback_cut_by_max_tokens(
+    tmp_path: Path,
+) -> None:
+    """When the adapter couldn't parse the model's tool-call arguments it
+    returns ``{"_raw": <partial-string>}``. The agent loop must NOT pass
+    this through to the per-tool handler — that just produces a generic
+    "provide 'code'" error and the model keeps re-issuing the same
+    malformed call until max_turns. With the turn's measured
+    stop_reason=max_tokens, the error must name the output budget as the
+    cause and tell the model to split the payload (the 2026-06 field
+    incident: 10KB whole-file writes cut mid-emission, 13 retries)."""
+    loop, transcript = _raw_dispatch_loop(tmp_path, "wakeup-truncated")
 
     out, is_error, _view = await loop._dispatch_tool(
         name="python_exec",
         tool_use_id="tu_truncated",
         tool_input={"_raw": '{"code": "print(\\"hello'},  # truncated JSON
+        stop_reason="max_tokens",
     )
 
     transcript.close()
@@ -179,8 +188,39 @@ async def test_dispatch_tool_detects_raw_fallback(tmp_path: Path) -> None:
     assert "malformed arguments" in out
     assert "max_tokens=4096" in out
     # The model should be told NOT to retry the same call — that
-    # advice is the loop-break.
+    # advice is the loop-break — and HOW to proceed instead.
     assert "Do NOT retry" in out
+    assert "append the rest" in out
+
+
+@pytest.mark.asyncio
+async def test_dispatch_tool_raw_fallback_without_max_tokens_blames_provider(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Same sentinel but the turn did NOT stop on max_tokens: the error
+    must not assert the output-budget theory (the old hardcoded
+    "probably truncated by max_tokens" misdiagnosed provider-side
+    truncation) — it reports the measured stop_reason instead. The
+    WARNING log line is the operator-facing half of the same diagnosis
+    (structlog writes to stdout in this project, so capsys not caplog)."""
+    loop, transcript = _raw_dispatch_loop(tmp_path, "wakeup-provider-trunc")
+
+    out, is_error, _view = await loop._dispatch_tool(
+        name="python_exec",
+        tool_use_id="tu_truncated",
+        tool_input={"_raw": '{"code": "print(\\"hello'},
+        stop_reason="tool_use",
+    )
+
+    transcript.close()
+    assert is_error is True
+    assert "truncated or malformed from the provider" in out
+    assert "stop_reason='tool_use'" in out
+    assert "max_tokens=4096" not in out
+    assert "Do NOT retry" in out
+    captured = capsys.readouterr()
+    assert "tool_args_truncated" in captured.out
 
 
 @pytest.mark.asyncio
