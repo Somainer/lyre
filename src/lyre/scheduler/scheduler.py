@@ -731,10 +731,16 @@ class Scheduler:
             limit=20, ttl_cutoff=ttl_cutoff
         )
         open_ids = {g.id for g in open_groups}
-        # Hygiene: drop failure counters for groups no longer open (they
-        # resolved or were cancelled through some other path).
-        for gone in set(self._fanin_failures) - open_ids:
-            del self._fanin_failures[gone]
+        # Hygiene: drop failure counters for groups that went terminal
+        # through some other path. Checked by STATUS, not by page
+        # membership — find_open returns one limit-sized page, and a
+        # poisoned group paged out under load would otherwise lose its
+        # counter every tick and never quarantine. The dict only ever
+        # holds currently-failing groups, so the per-id get is cheap.
+        for gid in [g for g in self._fanin_failures if g not in open_ids]:
+            stale = await self.repos.fan_in.get(gid)
+            if stale is None or stale.status != "open":
+                del self._fanin_failures[gid]
         for g in open_groups:
             try:
                 await self._resolve_one_fan_in_group(g, now, max_age)

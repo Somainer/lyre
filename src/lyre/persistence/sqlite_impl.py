@@ -1965,7 +1965,8 @@ class SqliteScheduledMailRepository:
                 SET status='completed',
                     last_delivery_id = ?,
                     last_delivered_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
-                    occurrence_count = occurrence_count + 1{npc_set}
+                    occurrence_count = occurrence_count + 1{npc_set},
+                    delivery_failure_count = 0
                 WHERE id = ?
                 """,
                 tuple(params),
@@ -1981,7 +1982,8 @@ class SqliteScheduledMailRepository:
                 SET last_delivery_id = ?,
                     last_delivered_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
                     occurrence_count = occurrence_count + 1{npc_set},
-                    scheduled_for = ?
+                    scheduled_for = ?,
+                    delivery_failure_count = 0
                 WHERE id = ?
                 """,
                 tuple(params),
@@ -2491,7 +2493,7 @@ class SqliteFanInRepository:
         """
         if ttl_cutoff is None:
             async with self.conn.execute(
-                "SELECT * FROM fan_in_groups WHERE status = 'open' ORDER BY deadline LIMIT ?",
+                "SELECT * FROM fan_in_groups WHERE status = 'open' ORDER BY deadline, id LIMIT ?",
                 (limit,),
             ) as cur:
                 rows = await cur.fetchall()
@@ -2502,11 +2504,11 @@ class SqliteFanInRepository:
                 WHERE status = 'open' AND (
                   id IN (
                     SELECT id FROM fan_in_groups WHERE status = 'open'
-                    ORDER BY deadline LIMIT ?
+                    ORDER BY deadline, id LIMIT ?
                   )
                   OR created_at < ?
                 )
-                ORDER BY deadline
+                ORDER BY deadline, id
                 """,
                 (limit, _iso(ttl_cutoff)),
             ) as cur:

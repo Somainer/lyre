@@ -299,12 +299,12 @@ CREATE TABLE IF NOT EXISTS scheduled_mail (
   -- the capping delivery is the FINAL wake and the row stops re-arming.
   no_progress_count INTEGER NOT NULL DEFAULT 0,
   max_no_progress   INTEGER,
-  -- Poison-row quarantine (F2): consecutive Phase −1 delivery attempts that
-  -- raised. Reset implicitly by a successful delivery never happening (a row
-  -- either delivers — and the counter is moot — or keeps failing); at the
-  -- quarantine threshold the row flips to status='quarantined' (terminal,
-  -- excluded by the status='pending' filter in find_ready) so one corrupt
-  -- row can't consume a delivery slot every tick forever.
+  -- Poison-row quarantine (F2): CONSECUTIVE Phase −1 delivery attempts that
+  -- raised — mark_delivered resets it to 0, so transient blips spread over a
+  -- recurring row's lifetime never accumulate. At the quarantine threshold
+  -- the row flips to status='quarantined' (terminal, excluded by the
+  -- status='pending' filter in find_ready) so one corrupt row can't consume
+  -- a delivery slot every tick forever.
   delivery_failure_count INTEGER NOT NULL DEFAULT 0,
   created_at        TEXT NOT NULL
                     DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
