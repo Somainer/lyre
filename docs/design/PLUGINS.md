@@ -3,8 +3,7 @@
 > **Status: PARKED (proposed, not scheduled)** — owner decision 2026-06-10.
 > Merged from branch `spec/plugin-system` so the only fully-specced future arc
 > is visible from main; **no implementation is scheduled**. Revival condition:
-> owner explicitly endorses the plugin arc after the current repair/canon/
-> H2/observability rounds land. Two side-effects of that future decision are
+> owner explicitly endorses the plugin arc. Two side-effects of that future decision are
 > pre-recorded: (a) it would answer whether the Unix-socket gateway from
 > FOUNDATION 铁律二 revives (this spec supersedes it with in-process hooks if
 > adopted); (b) it shifts new design docs to English.

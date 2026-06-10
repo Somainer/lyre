@@ -1,14 +1,14 @@
 # Lyre — Dashboard 设计
 
 > **STATUS (2026-06-10): substantially stale — for the real surface read
-> `src/lyre/dashboard/routes/` (deep review 2026-06, finding [40]).** What shipped diverges from
+> `src/lyre/dashboard/routes/` .** What shipped diverges from
 > this doc on every major axis: the tab IA is Home `/` / Activity / Agents / Mail / Runs (Inbox +
 > Feed merged into `/mail`, Tasks + Wakeups merged into `/runs`); the only write endpoints are
 > `POST /send` and `POST /tasks/{id}/cancel` — `/mailbox/reply`, `/dispatch` and the `/approvals/*`
 > surface were never built (no approvals UI exists); the primary live-update mechanism is
 > `/sse/dashboard` HTML-fragment push driven by `DashboardBroadcaster`
 > (`dashboard_broadcaster.py`), with `/sse/mailbox` as a secondary stream; the CSRF token promised
-> in §3/§8 was **never implemented** (finding [38], still open); and the §7 env vars are wrong —
+> in §3/§8 was **never implemented** (still open); and the §7 env vars are wrong —
 > `LYRE_DASHBOARD_HOST` / `LYRE_DASHBOARD_ENABLED` do not exist, and `LYRE_DASHBOARD_PORT` is
 > parsed but never consumed (the port comes from the `--dashboard-port` / `--port` CLI flags,
 > default 8765).
