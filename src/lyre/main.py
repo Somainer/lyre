@@ -39,10 +39,14 @@ def _setup_logging() -> None:
     configure_logging(log_dir=None)
 
 
-def _configure_process_logging(cfg: Config, *, rotate: bool) -> None:
-    """File + console logging for a long-lived process. ``rotate=False``
-    for wakeup subprocesses — only the serve/dashboard process may
-    rotate the shared file (see logging_setup module docstring)."""
+def _configure_process_logging(
+    cfg: Config, *, rotate: bool, announce: bool = True
+) -> None:
+    """File + console logging for a long-lived process. ``rotate=True``
+    for `lyre serve` ONLY — exactly one process may rotate the shared
+    file (two RotatingFileHandlers double-rename at rollover); the
+    standalone dashboard and wakeup subprocesses follow rotation via
+    WatchedFileHandler (see logging_setup module docstring)."""
     from .logging_setup import configure_logging
 
     path = configure_logging(
@@ -52,9 +56,9 @@ def _configure_process_logging(cfg: Config, *, rotate: bool) -> None:
         backup_count=cfg.log_backup_count,
         rotate=rotate,
     )
-    if path is not None and rotate:
-        # Only the rotating owner announces — one line per serve start,
-        # not one per wakeup subprocess.
+    if path is not None and announce:
+        # One line per operator-facing process start — wakeup
+        # subprocesses stay quiet (announce=False).
         click.echo(f"logging to {path} (level={cfg.log_level})", err=True)
 
 
@@ -605,7 +609,7 @@ def run_task_cmd(task_id: str) -> None:
         cfg = Config.from_env()
         # rotate=False: this subprocess appends to the shared log file
         # but must never rotate it — that's the serve process's job.
-        _configure_process_logging(cfg, rotate=False)
+        _configure_process_logging(cfg, rotate=False, announce=False)
         conn = await init_db(cfg.db_path)
         try:
             repos = SqliteRepositories(
@@ -661,7 +665,9 @@ def dashboard_cmd(host: str, port: int) -> None:
         from .runtime.model_registry import load_registry_for_config
 
         cfg = Config.from_env()
-        _configure_process_logging(cfg, rotate=True)
+        # A standalone dashboard often runs ALONGSIDE lyre serve — it must
+        # not be a second rotating owner of the same file.
+        _configure_process_logging(cfg, rotate=False)
         registry = load_registry_for_config(cfg)
         ctx_windows = {
             e.id: e.context_window
