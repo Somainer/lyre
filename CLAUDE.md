@@ -218,6 +218,7 @@ Set in shell or `.env` (auto-loaded). Main knobs in `docs/configuration.md`
 | `LYRE_MODEL_OVERRIDE` | Force every wakeup to one `model_id` (testing) |
 | `LYRE_DEFAULT_MODEL` | Parsed but **not consumed** by the runtime — there is no fallback; personas must declare `model_preference` (the scheduler raises otherwise). Implement-or-delete decision pending |
 | `LYRE_COMPACT_THRESHOLD` | Compaction trigger as fraction of context window (default `0.7`) |
+| `LYRE_LOG_LEVEL` / `LYRE_LOG_DIR` | Structured JSONL logs for serve/dashboard/run-task processes (default `INFO`, `~/.lyre/logs/`); `jq` the file for incidents |
 | `LYRE_HOME` / `LYRE_DB_PATH` / `LYRE_OBJECT_STORE` / `LYRE_MEMORY_PATH` | Storage paths |
 
 ## Internal design docs

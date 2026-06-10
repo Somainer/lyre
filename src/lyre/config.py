@@ -348,6 +348,18 @@ class Config:
     # tools dispatch only post-turn, so a discarded partial has no durable side
     # effect. 0 keeps the old mid-stream-fatal behavior. See FAILURE_ROBUSTNESS.md §5.
     midstream_max_retries: int = 1
+    # F2 observability — structured logs to a rotating file under
+    # <lyre_home>/logs/ in addition to the console. log_level filters BOTH
+    # sinks; log_to_file=False keeps the pre-F2 console-only behavior.
+    # The file is JSONL (one structlog event per line) so incidents are a
+    # grep/jq away instead of "whatever scrolled past in the terminal" —
+    # and wakeup SUBPROCESSES append to the same file, whose stdout was
+    # previously discarded save a 512-byte stderr tail.
+    log_level: str = "INFO"
+    log_to_file: bool = True
+    log_dir: Path = field(default_factory=lambda: lyre_home() / "logs")
+    log_max_bytes: int = 10 * 1024 * 1024
+    log_backup_count: int = 5
 
     # ---- defaults: paths added with config.toml ----
     lyre_home: Path = field(default_factory=_default_home)
@@ -735,6 +747,48 @@ class Config:
         if maintenance_interval_s < 60:
             maintenance_interval_s = 60
 
+        # ---- logging ----
+        # [logging] section; env wins per the env-beats-toml convention.
+        # Defensive parsing throughout — a garbage logging config must not
+        # crash every CLI command inside Config.from_env().
+        logging_raw = raw.get("logging", {}) or {}
+        log_level = str(
+            os.environ.get("LYRE_LOG_LEVEL")
+            or logging_raw.get("level")
+            or "INFO"
+        ).upper()
+        if log_level not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
+            log_level = "INFO"
+        log_to_file_raw = os.environ.get("LYRE_LOG_TO_FILE")
+        if log_to_file_raw is not None:
+            log_to_file = log_to_file_raw.lower() in ("1", "true", "yes", "on")
+        else:
+            log_to_file = bool(logging_raw.get("to_file", True))
+        log_dir_raw = os.environ.get("LYRE_LOG_DIR") or logging_raw.get("dir")
+        log_dir = (
+            Path(log_dir_raw).expanduser() if log_dir_raw else home / "logs"
+        )
+        try:
+            log_max_bytes = int(
+                os.environ.get("LYRE_LOG_MAX_BYTES")
+                or logging_raw.get("max_bytes")
+                or 10 * 1024 * 1024
+            )
+        except (ValueError, TypeError):
+            log_max_bytes = 10 * 1024 * 1024
+        if log_max_bytes < 1024:
+            log_max_bytes = 1024
+        try:
+            log_backup_count = int(
+                os.environ.get("LYRE_LOG_BACKUPS")
+                or logging_raw.get("backup_count")
+                or 5
+            )
+        except (ValueError, TypeError):
+            log_backup_count = 5
+        if log_backup_count < 0:
+            log_backup_count = 0
+
         # ---- coding-agent credential bundles ----
         # [coding_backends.<name>] auth_env = "..." [allowed_personas = [...]].
         # Each entry needs an auth_env; entries missing it are skipped with a
@@ -814,6 +868,11 @@ class Config:
             retention_days=retention_days,
             maintenance_interval_s=maintenance_interval_s,
             coding_backends=coding_backends,
+            log_level=log_level,
+            log_to_file=log_to_file,
+            log_dir=log_dir,
+            log_max_bytes=log_max_bytes,
+            log_backup_count=log_backup_count,
         )
 
     @property
