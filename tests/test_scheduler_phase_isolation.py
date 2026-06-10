@@ -146,6 +146,38 @@ async def test_poison_scheduled_mail_quarantined_after_threshold(
     assert "QUARANTINED" in notices[0].body
 
 
+@pytest.mark.asyncio
+async def test_successful_delivery_resets_the_failure_count(
+    repos: SqliteRepositories,
+) -> None:
+    """The counter means CONSECUTIVE failures: a healthy recurring row hit
+    by transient blips spread over its lifetime must never accumulate to
+    quarantine (review finding: the counter originally counted lifetime
+    failures — three DB-lock blips months apart silently killed a daily
+    standup mail)."""
+    await _seed_agents(repos)
+    row_id = await repos.scheduled_mail.create(_due_mail("dispatcher"))
+
+    for _ in range(_SCHEDMAIL_QUARANTINE_AFTER - 1):
+        quarantined = await repos.scheduled_mail.record_delivery_failure(
+            row_id, "transient blip", _SCHEDMAIL_QUARANTINE_AFTER
+        )
+        assert quarantined is False
+    # A successful delivery (recurring re-arm) resets the streak.
+    await repos.scheduled_mail.mark_delivered(
+        mail_id=row_id, delivered_msg_id=0,
+        next_scheduled_for="2999-01-01T00:00:00Z", completed=False,
+    )
+    quarantined = await repos.scheduled_mail.record_delivery_failure(
+        row_id, "another blip", _SCHEDMAIL_QUARANTINE_AFTER
+    )
+    assert quarantined is False
+    rows = await repos.scheduled_mail.list_filtered(status="all", limit=10)
+    row = next(r for r in rows if r.id == row_id)
+    assert row.status == "pending"
+    assert row.delivery_failure_count == 1
+
+
 # ---------------------------------------------------------------------------
 # Tick-level: a failing phase never blocks the phases behind it
 # ---------------------------------------------------------------------------
