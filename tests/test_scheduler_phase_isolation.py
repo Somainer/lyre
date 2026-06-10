@@ -164,8 +164,15 @@ async def test_successful_delivery_resets_the_failure_count(
         )
         assert quarantined is False
     # A successful delivery (recurring re-arm) resets the streak.
+    # last_delivery_id is FK-protected — use a real delivered message.
+    msg_id = await repos.mailbox.insert_message(
+        MailboxMessage(
+            recipient="dispatcher", external_id="delivered-ok",
+            sender="worker-1", urgency="normal", body="hello",
+        )
+    )
     await repos.scheduled_mail.mark_delivered(
-        mail_id=row_id, delivered_msg_id=0,
+        mail_id=row_id, delivered_msg_id=msg_id,
         next_scheduled_for="2999-01-01T00:00:00Z", completed=False,
     )
     quarantined = await repos.scheduled_mail.record_delivery_failure(
