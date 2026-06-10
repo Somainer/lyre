@@ -8,7 +8,6 @@ import os
 import signal
 import sys
 from datetime import UTC
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import click
@@ -1281,12 +1280,17 @@ def tail_cmd(
     """
     import textwrap
     import time as _time
-    from pathlib import Path as _P
+
+    from .runtime.transcript import transcript_path
+    from .transcript_tail import TranscriptTailer
 
     async def _find_target(
         conn: aiosqlite.Connection,
-    ) -> tuple[str, str, bool] | None:
-        """Return (wakeup_id, transcript_path, is_active) or None."""
+    ) -> tuple[str, bool] | None:
+        """Return (wakeup_id, is_active) or None. The transcript path is
+        derived from the id — wakeups.transcript_uri is only written at
+        end-of-wakeup, so for the active wakeups this command exists to
+        follow, the column is still NULL."""
         clauses = []
         params: list[Any] = []
         if active_only:
@@ -1317,10 +1321,8 @@ def tail_cmd(
                     return None
             else:
                 return None
-        uri = row["transcript_uri"] or ""
-        path = uri.removeprefix("file://")
         is_active = row["ended_at"] is None
-        return row["id"], path, is_active
+        return row["id"], is_active
 
     def _render(evt: dict[str, Any]) -> str | None:
         t = evt.get("type")
@@ -1364,8 +1366,7 @@ def tail_cmd(
         conn = await init_db(cfg.db_path)
         try:
             current_id: str | None = None
-            offset = 0
-            buffer = ""
+            tailer: TranscriptTailer | None = None
             click.echo(
                 "lyre tail — Ctrl-C to stop. "
                 f"persona={persona or 'any'} active_only={active_only}"
@@ -1376,7 +1377,7 @@ def tail_cmd(
                     click.echo("(no matching wakeup yet, waiting…)", err=True)
                     await asyncio.sleep(poll * 4)
                     continue
-                wid, path, is_active = target
+                wid, is_active = target
                 if wid != current_id:
                     if current_id is not None:
                         click.echo(
@@ -1389,39 +1390,19 @@ def tail_cmd(
                             f"(active={is_active}) ---"
                         )
                     current_id = wid
-                    offset = 0
-                    buffer = ""
-                p = _P(path)
-                if p.exists():
-                    size = p.stat().st_size
-                    if size > offset:
-                        chunk = await asyncio.to_thread(
-                            _read_slice, p, offset, size
-                        )
-                        offset = size
-                        buffer += chunk
-                        while "\n" in buffer:
-                            line, buffer = buffer.split("\n", 1)
-                            line = line.strip()
-                            if not line:
-                                continue
-                            if as_json:
-                                # Verbatim pass-through. Operator can
-                                # jq it / save / replay. We still validate
-                                # JSON parses to skip corrupted lines.
-                                try:
-                                    json.loads(line)
-                                except json.JSONDecodeError:
-                                    continue
-                                click.echo(line)
-                                continue
-                            try:
-                                evt = json.loads(line)
-                            except json.JSONDecodeError:
-                                continue
-                            rendered = _render(evt)
-                            if rendered:
-                                click.echo(rendered)
+                    tailer = TranscriptTailer(
+                        transcript_path(cfg.object_store_path, wid)
+                    )
+                assert tailer is not None
+                for evt in await asyncio.to_thread(tailer.poll):
+                    if as_json:
+                        # Verbatim-equivalent pass-through (re-serialized).
+                        # Operator can jq it / save / replay.
+                        click.echo(json.dumps(evt, ensure_ascii=False))
+                        continue
+                    rendered = _render(evt)
+                    if rendered:
+                        click.echo(rendered)
                 if not is_active and not follow:
                     click.echo("--- wakeup ended, --no-follow specified, exiting ---")
                     break
@@ -1433,14 +1414,6 @@ def tail_cmd(
         asyncio.run(_run())
     except KeyboardInterrupt:
         click.echo("\n(stopped)", err=True)
-
-
-def _read_slice(path: Path, start: int, end: int) -> str:
-    """Read [start, end) bytes of path; for tail file polling."""
-    with path.open("rb") as fp:
-        fp.seek(start)
-        chunk = fp.read(end - start)
-    return chunk.decode("utf-8", errors="replace")
 
 
 # ----------------------------------------------------------------------

@@ -13,13 +13,21 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def transcript_path(object_store_root: Path, wakeup_id: str) -> Path:
+    """Canonical transcript location for a wakeup. Readers (lyre tail, the
+    dashboard live stream) must derive the path from the wakeup_id via this
+    function: the wakeups.transcript_uri column is only written at
+    end-of-wakeup, so it is NULL exactly when a live reader needs the path."""
+    return object_store_root / "wakeups" / wakeup_id / "transcript.jsonl"
+
+
 class TranscriptWriter:
     """Append-only JSONL writer for one wakeup's transcript."""
 
     def __init__(self, object_store_root: Path, wakeup_id: str):
-        self.dir = object_store_root / "wakeups" / wakeup_id
+        self.path = transcript_path(object_store_root, wakeup_id)
+        self.dir = self.path.parent
         self.dir.mkdir(parents=True, exist_ok=True)
-        self.path = self.dir / "transcript.jsonl"
         self._fp = self.path.open("a", encoding="utf-8")
 
     def _write(self, obj: dict[str, Any]) -> None:
