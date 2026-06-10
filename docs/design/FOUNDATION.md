@@ -2,7 +2,7 @@
 
 > **文档定位**：Lyre 架构的稳定参照。"架构内核"小节（铁律一至五、三档持久层、三类 global 条目）为**定论**（status: settled），其它设计文档以本文为依据。
 >
-> **Status note (2026-06-10, deep-review E1)**: 架构内核的**五条铁律本身仍为定论**。但 §3.3 的 enforcement model（subprocess sandbox + Unix-socket gateway）与 §3.7 的五层架构表描述的是 v0.x 计划，不是建成的运行时——see the correction note in §3.3. For the as-built runtime read `RUNTIME_CURRENT.md` (living doc, added in this canon-alignment round). Findings & owner rulings: `DEEP_REVIEW_2026-06.md` (§2.1, §F7).
+> **Status note (2026-06-10, deep-review E1)**: 架构内核的**五条铁律本身仍为定论**。但 §3.3 的 enforcement model（subprocess sandbox + Unix-socket gateway）与 §3.7 的五层架构表描述的是 v0.x 计划，不是建成的运行时——see the correction note in §3.3. For the as-built runtime read `RUNTIME_CURRENT.md` (living doc, added in this canon-alignment round).
 
 ---
 
@@ -195,7 +195,7 @@ Owner 不是系统外的用户，是"背后有人的 actor"，与其它 actor **
 
 **没有 `type`**。两端都是智能体（LLM 或人），自然语言足够表达。`type` 是为大流量预设统计与路由优化预留的设计，地基阶段是负债不是资产。统计需求出现时由 LLM 临时分类。
 
-**修订：系统元数据协议（2026-06-10，owner 决议，见 `DEEP_REVIEW_2026-06.md` §F7-2）**："没有 `type`"条款管的是 **agent↔agent 语义层，仍然成立**——智能体之间不引入消息类型系统，自然语言足够。与此同时，邮件与任务 `metadata` 下的 `kind`、`fan_in`（含 `fan_in.group_id` / `leg_key` / `result`）、`thread_id`、`auto_dispatched`、`broadcast_id` 等键是 **runtime 保留命名空间**：仅由 runtime / 工具层写入，仅系统生成的邮件依赖它们路由（fan-in barrier 计数、thread 历史、supervision / `task_terminated` 标记、auto-wake 抑制）。Agent 永远不需要自己读写这些键——需要时通过工具参数（如 `mailbox_send(result_for=…, thread_id=…)`）由工具层代为打标。实现零改动，此为对既成事实的正典承认与划界。
+**修订：系统元数据协议（2026-06-10，owner 决议）**："没有 `type`"条款管的是 **agent↔agent 语义层，仍然成立**——智能体之间不引入消息类型系统，自然语言足够。与此同时，邮件与任务 `metadata` 下的 `kind`、`fan_in`（含 `fan_in.group_id` / `leg_key` / `result`）、`thread_id`、`auto_dispatched`、`broadcast_id` 等键是 **runtime 保留命名空间**：仅由 runtime / 工具层写入，仅系统生成的邮件依赖它们路由（fan-in barrier 计数、thread 历史、supervision / `task_terminated` 标记、auto-wake 抑制）。Agent 永远不需要自己读写这些键——需要时通过工具参数（如 `mailbox_send(result_for=…, thread_id=…)`）由工具层代为打标。实现零改动，此为对既成事实的正典承认与划界。
 
 **Urgency 四档**：
 
@@ -339,7 +339,6 @@ Skills 是 know-how，需要质量把关：agent 干完任务判断"值得复用
 | [`BUILTIN_SKILLS.md`](./BUILTIN_SKILLS.md) | 出厂技能库机制（直接读 package），**已落地** |
 | [`OWNER_AS_CHAT_PARTNER.md`](./OWNER_AS_CHAT_PARTNER.md) | Owner 异步聊天界面（Lark 通道）设计 |
 | [`PLUGINS.md`](./PLUGINS.md) | 插件系统 spec，**parked**（owner 决议 2026-06-10；gateway 类接缝若复活走此弧线） |
-| [`DEEP_REVIEW_2026-06.md`](./DEEP_REVIEW_2026-06.md) | 2026-06 全库深度 review：145 findings + 五铁律审计 + 熵减/迭代计划 + owner 决议（§F7） |
 
 ---
 

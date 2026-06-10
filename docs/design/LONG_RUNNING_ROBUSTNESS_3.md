@@ -8,7 +8,7 @@
 >
 > **owner 对齐**:2026-06-08,选定本轮做 **D1 + C4 + H2(3 PR)**,先文档后实现。沿用 MVP 约束:不设硬美元预算;反失控只靠 harness 强制停。
 >
-> **状态**:**D1+C4 已落地**(PR #49,commit `abeeba9`);**H2 设计已定稿、未实现**——零代码(`no_progress` 在 src/migrations/tests 全无命中,2026-06-10 验证),planned as **F1** in `DEEP_REVIEW_2026-06.md`。(§9 两处决策已拍:C4 自动+手动都给、H2 work-AND-no-output。)本轮叠在 LR2(PR #48)之上。PR 路线见 §6。
+> **状态**:**D1+C4 已落地**(PR #49,commit `abeeba9`);**H2 设计已定稿、未实现**——零代码(`no_progress` 在 src/migrations/tests 全无命中,2026-06-10 验证),planned next（owner 排序 D1→C4→O1→O2→H2→O3 中唯一剩余项）。(§9 两处决策已拍:C4 自动+手动都给、H2 work-AND-no-output。)本轮叠在 LR2(PR #48)之上。PR 路线见 §6。
 
 ---
 

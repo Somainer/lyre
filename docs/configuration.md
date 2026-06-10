@@ -20,7 +20,7 @@ All env vars are optional unless noted. Set them in your shell or a
 | Variable | Purpose | Default |
 |---|---|---|
 | `LYRE_MODEL_OVERRIDE` | Force every wakeup to this specific `model_id`, ignoring persona routing. Useful for testing one provider. | unset (per-persona routing) |
-| `LYRE_DEFAULT_MODEL` | **Parsed but not consumed** — the documented fallback does not exist; every persona must declare `model_preference` (the scheduler raises otherwise). Implement-or-delete pending (DEEP_REVIEW E5). | unset |
+| `LYRE_DEFAULT_MODEL` | **Parsed but not consumed** — the documented fallback does not exist; every persona must declare `model_preference` (the scheduler raises otherwise). Implement-or-delete decision pending. | unset |
 | `LYRE_COMPACT_THRESHOLD` | Fraction of context window above which auto-compaction fires. Must be `0 < x < 1`. | `0.7` |
 | `LYRE_MAX_TOKENS` | Per-turn output cap on a single assistant message (NOT a lifetime budget). Sized to the biggest single tool-call argument an agent writes — worker-maintainer producing code via `python_exec` is the hot path. Lower it only to box in a runaway worker. Min clamp 256. | `32768` |
 | `LYRE_MAX_TURNS` | Default per-wakeup **turn** budget — the number of model↔tool-loop iterations a wakeup may run before it's honestly truncated to `needs_continuation` (distinct from `LYRE_MAX_TOKENS`, which caps one message). An orchestrator can raise it per-task via `dispatch_task(max_turns=…)` for work it expects to need many steps (e.g. a deep-research leg). Min clamp 1. | `24` |
