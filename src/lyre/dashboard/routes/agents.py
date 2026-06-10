@@ -11,8 +11,13 @@ from starlette.templating import _TemplateResponse
 
 from ...persistence.models import Agent, Wakeup
 from ...persistence.repositories import Repositories
-from ..activity import build_activity, list_active_wakeups
-from . import repos_from, templates_from
+from ..activity import build_activity_context, list_active_wakeups
+from . import (
+    live_folders_from,
+    object_store_root_from,
+    repos_from,
+    templates_from,
+)
 
 router = APIRouter()
 
@@ -179,11 +184,16 @@ async def agent_detail(
             status_code=404, detail=f"agent {agent_id!r} not found"
         )
 
-    events = await build_activity(
-        repos, minutes_back=minutes, agent_id=agent_id, include_transcript=True,
+    ctx = await build_activity_context(
+        repos,
+        minutes_back=minutes,
+        agent_id=agent_id,
+        include_transcript=True,
         model_context_windows=getattr(
             request.app.state, "model_context_windows", None
         ),
+        object_store_root=object_store_root_from(request),
+        live_folders=live_folders_from(request),
     )
     active = await list_active_wakeups(repos)
     busy_exact, busy_legacy = _busy_sets(active)
@@ -208,13 +218,7 @@ async def agent_detail(
         {
             "tab": "agent_detail",
             "agent": agent_view,
-            "events": events,
-            "active_wakeups": [
-                w for w in active
-                if (w.agent_id == agent_id)
-                or (w.agent_id is None and w.persona_name == agent_id)
-            ],
-            "window_minutes": minutes,
+            **ctx,
             "in_flight_count": in_flight.get(agent_id, 0),
             "in_flight_by_child": in_flight,
             "children": children_views,
@@ -239,22 +243,17 @@ async def agent_timeline_partial(
         raise HTTPException(
             status_code=404, detail=f"agent {agent_id!r} not found"
         )
-    events = await build_activity(
-        repos, minutes_back=minutes, agent_id=agent_id, include_transcript=True,
+    ctx = await build_activity_context(
+        repos,
+        minutes_back=minutes,
+        agent_id=agent_id,
+        include_transcript=True,
         model_context_windows=getattr(
             request.app.state, "model_context_windows", None
         ),
+        object_store_root=object_store_root_from(request),
+        live_folders=live_folders_from(request),
     )
-    active = [
-        w for w in await list_active_wakeups(repos)
-        if (w.agent_id == agent_id)
-        or (w.agent_id is None and w.persona_name == agent_id)
-    ]
     return templates_from(request).TemplateResponse(
-        request, "partials/activity_body.html",
-        {
-            "events": events,
-            "active_wakeups": active,
-            "window_minutes": minutes,
-        },
+        request, "partials/activity_body.html", ctx,
     )

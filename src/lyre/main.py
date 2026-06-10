@@ -358,6 +358,7 @@ def serve_cmd(
                             model_context_windows=ctx_windows,
                             owner_name=cfg.owner.name,
                             blob_store=blob_store,
+                            object_store_root=cfg.object_store_path,
                         ),
                         name="dashboard",
                     )
@@ -662,6 +663,7 @@ def dashboard_cmd(host: str, port: int) -> None:
                 model_context_windows=ctx_windows,
                 owner_name=cfg.owner.name,
                 blob_store=BlobStore(cfg.object_store_path),
+                object_store_root=cfg.object_store_path,
             )
         finally:
             await conn.close()

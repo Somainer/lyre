@@ -168,7 +168,7 @@ def test_activity_aggregates_thinking_delta_into_one_event(
     path.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
 
     events = _tail_transcript_events(
-        transcript_uri=f"file://{path}",
+        path=path,
         wakeup_id="test-wk",
         persona="worker",
         task_id="task-1",
@@ -330,7 +330,7 @@ def test_activity_distinguishes_thinking_from_assistant_text(
     ]
     path.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
     events = _tail_transcript_events(
-        transcript_uri=f"file://{path}",
+        path=path,
         wakeup_id="test-wk2",
         persona="worker",
         task_id="task-1",

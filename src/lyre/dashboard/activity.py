@@ -16,13 +16,14 @@ from __future__ import annotations
 import asyncio
 import json
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from ..persistence.models import Agent, MailboxMessage, Task, Wakeup
 from ..persistence.repositories import Repositories
+from ..runtime.transcript import transcript_path
 
 
 @dataclass(frozen=True)
@@ -302,24 +303,222 @@ def _ts_to_iso(ts_ms: Any, fallback: str) -> str:
     return fallback
 
 
+class LiveTranscriptFolder:
+    """Folds raw transcript JSONL rows into ActivityEvents, incrementally.
+
+    content_delta / thinking_delta on their own are super noisy (one
+    event per stream chunk), so consecutive deltas glue into one
+    assistant_text / thinking event; a run terminates at the next
+    non-matching row. Unlike the batch tail this keeps its fold state
+    BETWEEN ingest() calls, so the dashboard broadcaster can feed it the
+    few new rows of each poll tick instead of re-reading the whole file.
+
+    `snapshot()` returns the folded events PLUS the still-open delta run
+    rendered as an in-progress event (``detail.streaming=True``) — that
+    open run growing tick over tick is the "text being typed" effect.
+
+    Bounds: `max_events` caps the folded deque (a live card shows recent
+    activity, not the full history — that's the audit view's job) and
+    `max_open_chars` caps the open-run accumulators (keeping the TAIL,
+    which is the part being typed).
+    """
+
+    def __init__(
+        self,
+        wakeup_id: str,
+        persona: str,
+        task_id: str,
+        started_at: str,
+        max_events: int | None = 120,
+        max_open_chars: int = 4000,
+    ):
+        self.wakeup_id = wakeup_id
+        self.persona = persona
+        self.task_id = task_id
+        self.started_at = started_at
+        self.max_open_chars = max_open_chars
+        self._events: deque[ActivityEvent] = deque(maxlen=max_events)
+        self._text_buf = ""
+        self._text_first_ts: str | None = None
+        self._think_buf = ""
+        self._think_first_ts: str | None = None
+
+    def _delta_event(self, kind: str, text: str, at: str, streaming: bool) -> ActivityEvent:
+        verb = "thinking" if kind == "thinking" else "said"
+        preview = text if len(text) <= 200 else text[:200] + "…"
+        return ActivityEvent(
+            at=at,
+            kind=kind,
+            severity="info",
+            headline=f"{self.persona} {verb}: {preview}",
+            detail={
+                "wakeup_id": self.wakeup_id,
+                "task_id": self.task_id,
+                "persona": self.persona,
+                "text": text,
+                "streaming": streaming,
+            },
+        )
+
+    def _flush_assistant_text(self) -> None:
+        full = self._text_buf.strip()
+        if full:
+            self._events.append(
+                self._delta_event(
+                    "assistant_text", full,
+                    self._text_first_ts or self.started_at, streaming=False,
+                )
+            )
+        self._text_buf = ""
+        self._text_first_ts = None
+
+    def _flush_thinking(self) -> None:
+        full = self._think_buf.strip()
+        if full:
+            self._events.append(
+                self._delta_event(
+                    "thinking", full,
+                    self._think_first_ts or self.started_at, streaming=False,
+                )
+            )
+        self._think_buf = ""
+        self._think_first_ts = None
+
+    def _clip_open(self, buf: str) -> str:
+        if len(buf) <= self.max_open_chars:
+            return buf
+        return "…" + buf[-self.max_open_chars:]
+
+    def ingest(self, rows: list[dict[str, Any]]) -> None:
+        for obj in rows:
+            kind = obj.get("type")
+            at = _ts_to_iso(obj.get("ts"), self.started_at)
+
+            if kind == "content_delta":
+                # A text delta closes any open thinking run (model
+                # switched from reasoning to "out-loud"), then opens /
+                # extends the text run.
+                self._flush_thinking()
+                if not self._text_buf:
+                    self._text_first_ts = at
+                self._text_buf = self._clip_open(
+                    self._text_buf + obj.get("text", "")
+                )
+                continue
+
+            if kind == "thinking_delta":
+                self._flush_assistant_text()
+                if not self._think_buf:
+                    self._think_first_ts = at
+                self._think_buf = self._clip_open(
+                    self._think_buf + obj.get("text", "")
+                )
+                continue
+
+            # Any non-delta event terminates BOTH delta runs.
+            self._flush_assistant_text()
+            self._flush_thinking()
+
+            if kind == "tool_use":
+                name = obj.get("name", "?")
+                inp = obj.get("input") or {}
+                inp_preview = ""
+                for key in ("argv", "code", "to", "body", "kind", "msg_id", "rel_path"):
+                    if key in inp:
+                        v = inp[key]
+                        if isinstance(v, list):
+                            v = " ".join(str(x) for x in v[:3])
+                            if len(inp.get(key, [])) > 3:
+                                v += " …"
+                        inp_preview = f"{key}={str(v)[:60]}"
+                        break
+                # Full input shown in the expanded view — useful for
+                # debugging "what did the model actually pass to shell_exec".
+                try:
+                    inp_pretty = json.dumps(inp, ensure_ascii=False, indent=2)
+                except (TypeError, ValueError):
+                    inp_pretty = str(inp)
+                self._events.append(
+                    ActivityEvent(
+                        at=at,
+                        kind="tool_use",
+                        severity="info",
+                        headline=f"{self.persona} → {name}({inp_preview})",
+                        detail={
+                            "wakeup_id": self.wakeup_id,
+                            "task_id": self.task_id,
+                            "persona": self.persona,
+                            "tool": name,
+                            "tool_input_preview": inp_preview,
+                            "tool_input_full": inp_pretty,
+                        },
+                    )
+                )
+            elif kind == "note":
+                note_text = obj.get("text", "")
+                sev = "warn" if any(
+                    k in note_text.lower() for k in ("interrupt", "fallback", "kill", "nudge")
+                ) else "info"
+                self._events.append(
+                    ActivityEvent(
+                        at=at,
+                        kind="note",
+                        severity=sev,
+                        headline=f"note ({self.persona}): {note_text[:140]}",
+                        detail={
+                            "wakeup_id": self.wakeup_id,
+                            "task_id": self.task_id,
+                            "persona": self.persona,
+                            "text": note_text,
+                        },
+                    )
+                )
+            # turn_end events were noise: each one was a lifecycle marker
+            # without standalone signal. The relevant cases (silent wakeup,
+            # ended with status) surface through wakeup_end and through
+            # the silent-turn nudge / silent-close notes. Dropped.
+            elif kind == "turn_end":
+                continue
+
+    def snapshot(self, mark_open_as_streaming: bool = True) -> list[ActivityEvent]:
+        """Folded events plus the open delta runs. For a LIVE wakeup the
+        open run is the text currently being emitted (streaming=True →
+        the template shows a typing cursor); for an ENDED transcript the
+        open run is just the final unterminated burst — a normal event."""
+        out = list(self._events)
+        text = self._text_buf.strip()
+        if text:
+            out.append(
+                self._delta_event(
+                    "assistant_text", text,
+                    self._text_first_ts or self.started_at,
+                    streaming=mark_open_as_streaming,
+                )
+            )
+        think = self._think_buf.strip()
+        if think:
+            out.append(
+                self._delta_event(
+                    "thinking", think,
+                    self._think_first_ts or self.started_at,
+                    streaming=mark_open_as_streaming,
+                )
+            )
+        return out
+
+
 def _tail_transcript_events(
-    transcript_uri: str | None,
+    path: Path,
     wakeup_id: str,
     persona: str,
     task_id: str,
     started_at: str,
     max_lines: int = 5000,
+    max_events: int | None = None,
+    mark_open_as_streaming: bool = False,
 ) -> list[ActivityEvent]:
-    """Read up to the LAST `max_lines` of a wakeup's transcript JSONL and
-    surface:
-      - tool_use events (one per call)
-      - note events (one per write_note)
-      - assistant_text events — content_delta chunks aggregated per turn
-      - thinking events — thinking_delta chunks aggregated per burst
-
-    content_delta / thinking_delta on their own are super noisy (one
-    event per token), so we glue consecutive deltas together. The
-    accumulated text terminates at the next non-matching event / EOF.
+    """Batch wrapper over LiveTranscriptFolder: read up to the LAST
+    `max_lines` of a transcript JSONL and fold them in one pass.
 
     Default 5000 lines is enough to capture an entire 11-minute
     reasoning-heavy wakeup (~1500 lines empirically) without truncating
@@ -327,9 +526,6 @@ def _tail_transcript_events(
     footprint stays modest; we still cap so a runaway transcript can't
     OOM the dashboard.
     """
-    if not transcript_uri or not transcript_uri.startswith("file://"):
-        return []
-    path = Path(transcript_uri[len("file://"):])
     if not path.exists():
         return []
     try:
@@ -339,65 +535,7 @@ def _tail_transcript_events(
             raw_lines = list(deque(f, maxlen=max_lines))
     except OSError:
         return []
-
-    events: list[ActivityEvent] = []
-    # Two parallel rolling accumulators: plain text deltas (the
-    # model's "out-loud" text — also never delivered, but the model
-    # treats it as visible) and thinking deltas (private reasoning,
-    # only the operator should see).
-    text_buf: list[str] = []
-    text_first_ts: str | None = None
-    think_buf: list[str] = []
-    think_first_ts: str | None = None
-
-    def _flush_assistant_text() -> None:
-        nonlocal text_first_ts
-        if not text_buf:
-            return
-        full = "".join(text_buf).strip()
-        if full:
-            preview = full if len(full) <= 200 else full[:200] + "…"
-            events.append(
-                ActivityEvent(
-                    at=text_first_ts or started_at,
-                    kind="assistant_text",
-                    severity="info",
-                    headline=f"{persona} said: {preview}",
-                    detail={
-                        "wakeup_id": wakeup_id,
-                        "task_id": task_id,
-                        "persona": persona,
-                        "text": full,
-                    },
-                )
-            )
-        text_buf.clear()
-        text_first_ts = None
-
-    def _flush_thinking() -> None:
-        nonlocal think_first_ts
-        if not think_buf:
-            return
-        full = "".join(think_buf).strip()
-        if full:
-            preview = full if len(full) <= 200 else full[:200] + "…"
-            events.append(
-                ActivityEvent(
-                    at=think_first_ts or started_at,
-                    kind="thinking",
-                    severity="info",
-                    headline=f"{persona} thinking: {preview}",
-                    detail={
-                        "wakeup_id": wakeup_id,
-                        "task_id": task_id,
-                        "persona": persona,
-                        "text": full,
-                    },
-                )
-            )
-        think_buf.clear()
-        think_first_ts = None
-
+    rows: list[dict[str, Any]] = []
     for raw in raw_lines:
         if not raw.strip():
             continue
@@ -405,96 +543,37 @@ def _tail_transcript_events(
             obj = json.loads(raw)
         except json.JSONDecodeError:
             continue
-        kind = obj.get("type")
-        at = _ts_to_iso(obj.get("ts"), started_at)
+        if isinstance(obj, dict):
+            rows.append(obj)
+    folder = LiveTranscriptFolder(
+        wakeup_id=wakeup_id, persona=persona, task_id=task_id,
+        started_at=started_at, max_events=max_events,
+    )
+    folder.ingest(rows)
+    return folder.snapshot(mark_open_as_streaming=mark_open_as_streaming)
 
-        if kind == "content_delta":
-            # A text delta closes any open thinking run (model
-            # switched from reasoning to "out-loud"), then opens / extends
-            # the text run.
-            _flush_thinking()
-            if not text_buf:
-                text_first_ts = at
-            text_buf.append(obj.get("text", ""))
-            continue
 
-        if kind == "thinking_delta":
-            _flush_assistant_text()
-            if not think_buf:
-                think_first_ts = at
-            think_buf.append(obj.get("text", ""))
-            continue
+def wakeup_matches_agent(w: Wakeup, agent_id: str) -> bool:
+    """Match on agent_id when the column is populated (post-A3), falling
+    back to persona_name for legacy rows."""
+    return (
+        (w.agent_id == agent_id)
+        or (w.agent_id is None and w.persona_name == agent_id)
+    )
 
-        # Any non-delta event terminates BOTH delta runs.
-        _flush_assistant_text()
-        _flush_thinking()
 
-        if kind == "tool_use":
-            name = obj.get("name", "?")
-            inp = obj.get("input") or {}
-            inp_preview = ""
-            for key in ("argv", "code", "to", "body", "kind", "msg_id", "rel_path"):
-                if key in inp:
-                    v = inp[key]
-                    if isinstance(v, list):
-                        v = " ".join(str(x) for x in v[:3])
-                        if len(inp.get(key, [])) > 3:
-                            v += " …"
-                    inp_preview = f"{key}={str(v)[:60]}"
-                    break
-            # Full input shown in the expanded view — useful for
-            # debugging "what did the model actually pass to shell_exec".
-            try:
-                inp_pretty = json.dumps(inp, ensure_ascii=False, indent=2)
-            except (TypeError, ValueError):
-                inp_pretty = str(inp)
-            events.append(
-                ActivityEvent(
-                    at=at,
-                    kind="tool_use",
-                    severity="info",
-                    headline=f"{persona} → {name}({inp_preview})",
-                    detail={
-                        "wakeup_id": wakeup_id,
-                        "task_id": task_id,
-                        "persona": persona,
-                        "tool": name,
-                        "tool_input_preview": inp_preview,
-                        "tool_input_full": inp_pretty,
-                    },
-                )
-            )
-        elif kind == "note":
-            note_text = obj.get("text", "")
-            sev = "warn" if any(
-                k in note_text.lower() for k in ("interrupt", "fallback", "kill", "nudge")
-            ) else "info"
-            events.append(
-                ActivityEvent(
-                    at=at,
-                    kind="note",
-                    severity=sev,
-                    headline=f"note ({persona}): {note_text[:140]}",
-                    detail={
-                        "wakeup_id": wakeup_id,
-                        "task_id": task_id,
-                        "persona": persona,
-                        "text": note_text,
-                    },
-                )
-            )
-        # turn_end events were noise: each one was a lifecycle marker
-        # without standalone signal. The relevant cases (silent wakeup,
-        # ended with status) now surface through wakeup_end and through
-        # the silent-turn nudge / silent-close notes. Dropped from the
-        # feed.
-        elif kind == "turn_end":
-            continue
-
-    # Final flush in case the tail ends mid-delta (still streaming).
-    _flush_assistant_text()
-    _flush_thinking()
-    return events
+def _transcript_path_for(
+    w: Wakeup, object_store_root: Path | None
+) -> Path | None:
+    """Derive the transcript path from the wakeup id (works for ACTIVE
+    wakeups, whose transcript_uri column is still NULL). Fall back to
+    the uri for callers that don't know the object-store root (tests /
+    minimal embeddings)."""
+    if object_store_root is not None:
+        return transcript_path(object_store_root, w.id)
+    if w.transcript_uri and w.transcript_uri.startswith("file://"):
+        return Path(w.transcript_uri[len("file://"):])
+    return None
 
 
 async def build_activity(
@@ -504,6 +583,7 @@ async def build_activity(
     agent_id: str | None = None,
     include_transcript: bool = False,
     model_context_windows: dict[str, int] | None = None,
+    object_store_root: Path | None = None,
 ) -> list[ActivityEvent]:
     """Assemble the audit timeline over the last `minutes_back` minutes.
 
@@ -517,8 +597,13 @@ async def build_activity(
     **Per-agent view** (`agent_id` set, `include_transcript=True`):
       Same coarse events FILTERED to events involving this agent
       (actor / sender / recipient), PLUS the transcript-derived events
-      from this agent's wakeups (so you can drill in and read what the
-      model said, what tools it called, where it went silent).
+      from this agent's ENDED wakeups (so you can drill in and read what
+      the model said, what tools it called, where it went silent).
+
+    ACTIVE wakeups' transcript content is deliberately NOT in the
+    timeline in either mode — it lives in the live cards
+    (`build_live_cards`), which update incrementally over SSE instead of
+    re-rendering the whole feed every second.
     """
     cutoff = iso_minutes_ago(minutes_back)
     tasks = await repos.tasks.find_recently_changed(cutoff, limit=100)
@@ -567,16 +652,20 @@ async def build_activity(
     )
 
     if include_transcript:
-        # Tail transcripts for ALL wakeups (already filtered to this
-        # agent if agent_id was set) so the owner can read what the
+        # Tail transcripts for the ENDED wakeups (already filtered to
+        # this agent if agent_id was set) so the owner can read what the
         # model actually said + which tools fired + where turns went
         # silent. The most common troubleshooting question
-        # ("why didn't the agent reply?") is answered here.
+        # ("why didn't the agent reply?") is answered here. Active
+        # wakeups are excluded — their content streams via live cards.
         seen: set[str] = set()
         for w in wakeups:
-            if w.id in seen:
+            if w.id in seen or not w.ended_at:
                 continue
             seen.add(w.id)
+            path = _transcript_path_for(w, object_store_root)
+            if path is None:
+                continue
             started_iso = (
                 w.started_at.isoformat()
                 if isinstance(w.started_at, datetime)
@@ -588,36 +677,7 @@ async def build_activity(
                 # event loop alongside the scheduler/dispatcher.
                 await asyncio.to_thread(
                     _tail_transcript_events,
-                    transcript_uri=w.transcript_uri,
-                    wakeup_id=w.id,
-                    persona=w.persona_name,
-                    task_id=w.task_id,
-                    started_at=started_iso,
-                    max_lines=transcript_lookback_lines,
-                )
-            )
-        # Plus any still-active wakeup whose row didn't show up in
-        # list_since (started before window, still going).
-        active = await repos.wakeups.list_active()
-        if agent_id is not None:
-            active = [
-                w for w in active
-                if (w.agent_id == agent_id)
-                or (w.agent_id is None and w.persona_name == agent_id)
-            ]
-        for w in active:
-            if w.id in seen:
-                continue
-            seen.add(w.id)
-            started_iso = (
-                w.started_at.isoformat()
-                if isinstance(w.started_at, datetime)
-                else (w.started_at or "")
-            )
-            events.extend(
-                await asyncio.to_thread(
-                    _tail_transcript_events,
-                    transcript_uri=w.transcript_uri,
+                    path=path,
                     wakeup_id=w.id,
                     persona=w.persona_name,
                     task_id=w.task_id,
@@ -638,3 +698,111 @@ async def build_activity(
 async def list_active_wakeups(repos: Repositories) -> list[Wakeup]:
     """Convenience for the header strip / agent-status indicator."""
     return await repos.wakeups.list_active()
+
+
+@dataclass
+class LiveCard:
+    """One in-flight wakeup's streaming view: recent folded events plus
+    the open delta run (streaming=True). Rendered as a card pinned at
+    the bottom of the timeline, replaced per-card over SSE."""
+
+    wakeup_id: str
+    who: str            # agent_id when populated, else persona_name
+    persona: str
+    task_id: str
+    events: list[ActivityEvent] = field(default_factory=list)
+
+
+def _card_from(w: Wakeup, events: list[ActivityEvent]) -> LiveCard:
+    return LiveCard(
+        wakeup_id=w.id,
+        who=w.agent_id or w.persona_name,
+        persona=w.persona_name,
+        task_id=w.task_id,
+        events=events,
+    )
+
+
+async def build_live_cards(
+    repos: Repositories,
+    object_store_root: Path | None,
+    live_folders: dict[str, LiveTranscriptFolder] | None = None,
+    agent_id: str | None = None,
+    fallback_max_lines: int = 800,
+) -> list[LiveCard]:
+    """One LiveCard per active wakeup (optionally agent-scoped).
+
+    Content comes from the broadcaster's incremental folders when
+    available (the cheap path — no file I/O here). The file-tail
+    fallback covers the windows where no folder exists yet: the first
+    page render after `lyre serve`/`lyre dashboard` starts (the
+    broadcaster only polls while someone is subscribed) and apps
+    embedded without a broadcaster."""
+    active = await repos.wakeups.list_active()
+    if agent_id is not None:
+        active = [w for w in active if wakeup_matches_agent(w, agent_id)]
+    cards: list[LiveCard] = []
+    folders = live_folders or {}
+    for w in active:
+        folder = folders.get(w.id)
+        if folder is not None:
+            cards.append(_card_from(w, folder.snapshot()))
+            continue
+        path = _transcript_path_for(w, object_store_root)
+        if path is None:
+            cards.append(_card_from(w, []))
+            continue
+        started_iso = (
+            w.started_at.isoformat()
+            if isinstance(w.started_at, datetime)
+            else (w.started_at or "")
+        )
+        events = await asyncio.to_thread(
+            _tail_transcript_events,
+            path=path,
+            wakeup_id=w.id,
+            persona=w.persona_name,
+            task_id=w.task_id,
+            started_at=started_iso,
+            max_lines=fallback_max_lines,
+            max_events=120,
+            mark_open_as_streaming=True,
+        )
+        cards.append(_card_from(w, events))
+    return cards
+
+
+async def build_activity_context(
+    repos: Repositories,
+    *,
+    minutes_back: int,
+    agent_id: str | None,
+    include_transcript: bool,
+    model_context_windows: dict[str, int] | None,
+    object_store_root: Path | None,
+    live_folders: dict[str, LiveTranscriptFolder] | None,
+) -> dict[str, Any]:
+    """The shared template context for everything that renders
+    partials/activity_body.html (page routes, legacy partials, the SSE
+    activity renderer) — one place to assemble timeline + active strip
+    + live cards instead of four hand-rolled copies."""
+    events = await build_activity(
+        repos,
+        minutes_back=minutes_back,
+        agent_id=agent_id,
+        include_transcript=include_transcript,
+        model_context_windows=model_context_windows,
+        object_store_root=object_store_root,
+    )
+    active = await list_active_wakeups(repos)
+    if agent_id is not None:
+        active = [w for w in active if wakeup_matches_agent(w, agent_id)]
+    cards = await build_live_cards(
+        repos, object_store_root, live_folders, agent_id=agent_id
+    )
+    return {
+        "events": events,
+        "active_wakeups": active,
+        "live_cards": cards,
+        "window_minutes": minutes_back,
+    }

@@ -1561,3 +1561,12 @@ a.mail-row { display: grid; }
   .stats { grid-template-columns: 1fr; }
   .nav-tabs { display: none; }
 }
+
+/* Live wakeup cards — streaming view of in-flight wakeups. */
+.live-card { margin-top: var(--s-3); }
+.stream-cursor {
+  display: inline-block;
+  margin-left: 1px;
+  animation: stream-blink 1s steps(2, start) infinite;
+}
+@keyframes stream-blink { to { visibility: hidden; } }

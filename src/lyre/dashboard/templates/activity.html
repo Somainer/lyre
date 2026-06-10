@@ -90,13 +90,17 @@
       scrollToBottom(s);
       s.addEventListener("scroll", () => { stickToBottom = isNearBottom(s); });
     });
+    // Both the full-timeline swap (#activity-stream-inner) and the
+    // per-wakeup live-card swaps (any sse-swap target inside the
+    // stream) preserve folds + sticky bottom-scroll.
+    const inStream = (t) => t && t.closest && t.closest("#activity-stream");
     document.body.addEventListener("htmx:beforeSwap", (e) => {
-      if (e.detail.target.id === "activity-stream-inner") {
+      if (inStream(e.detail.target)) {
         snapshotOpenFolds(e.detail.target);
       }
     });
     document.body.addEventListener("htmx:afterSwap", (e) => {
-      if (e.detail.target.id === "activity-stream-inner") {
+      if (inStream(e.detail.target)) {
         restoreOpenFolds(e.detail.target);
         if (stickToBottom) scrollToBottom(streamEl());
       }

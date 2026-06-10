@@ -26,15 +26,27 @@ import structlog
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 
-from ..activity import build_activity, list_active_wakeups
+from ..activity import (
+    build_activity_context,
+    list_active_wakeups,
+    wakeup_matches_agent,
+)
 from ..dashboard_broadcaster import (
+    CARD_EVENT_PREFIX,
     EVENT_ACTIVITY,
     EVENT_AGENT_STATUS,
     EVENT_HEALTH,
     EVENT_STATS,
 )
 from ..routes.home import _home_card_context
-from . import broadcaster_from, dashboard_broadcaster_from, repos_from, templates_from
+from . import (
+    broadcaster_from,
+    dashboard_broadcaster_from,
+    live_folders_from,
+    object_store_root_from,
+    repos_from,
+    templates_from,
+)
 
 router = APIRouter()
 log = structlog.get_logger()
@@ -126,25 +138,32 @@ async def _render_activity(
     """Re-render the activity timeline fragment (global or per-agent)."""
     repos = repos_from(request)
     mcw = getattr(request.app.state, "model_context_windows", None)
-    events = await build_activity(
+    ctx = await build_activity_context(
         repos,
         minutes_back=minutes,
         agent_id=agent_id,
         include_transcript=agent_id is not None,
         model_context_windows=mcw,
+        object_store_root=object_store_root_from(request),
+        live_folders=live_folders_from(request),
     )
-    active = await list_active_wakeups(repos)
-    if agent_id is not None:
-        active = [
-            w for w in active
-            if (w.agent_id == agent_id)
-            or (w.agent_id is None and w.persona_name == agent_id)
-        ]
     html = templates_from(request).get_template(
         "partials/activity_body.html"
-    ).render(
-        events=events, active_wakeups=active, window_minutes=minutes,
-    )
+    ).render(ctx)
+    return str(html)
+
+
+def _render_live_card(request: Request, wakeup_id: str) -> str | None:
+    """Render one wakeup's live card INNER fragment from broadcaster
+    state. None when the wakeup is no longer live (raced its own end —
+    the EVENT_ACTIVITY of the same tick replaces the card anyway)."""
+    bc = dashboard_broadcaster_from(request)
+    lw = bc.live_wakeup(wakeup_id) if bc is not None else None
+    if lw is None:
+        return None
+    html = templates_from(request).get_template(
+        "partials/wakeup_live_card.html"
+    ).render(card_events=lw.folder.snapshot())
     return str(html)
 
 
@@ -333,6 +352,32 @@ async def sse_dashboard(
                         # client is gone, even if we still had events
                         # queued — those renders would just be wasted.
                         return
+                    if event.startswith(CARD_EVENT_PREFIX):
+                        # Per-wakeup live cards ride with the activity
+                        # subscription — pages that show the timeline
+                        # show the cards; agent-scoped pages only get
+                        # their own agent's cards.
+                        if EVENT_ACTIVITY not in wanted:
+                            continue
+                        wid = event[len(CARD_EVENT_PREFIX):]
+                        lw = bc.live_wakeup(wid)
+                        if lw is None:
+                            continue
+                        if agent_id is not None and not wakeup_matches_agent(
+                            lw.wakeup, agent_id
+                        ):
+                            continue
+                        try:
+                            card_html = _render_live_card(request, wid)
+                        except Exception as exc:  # noqa: BLE001
+                            log.warning(
+                                "sse_card_render_failed",
+                                wakeup_id=wid, error=str(exc),
+                            )
+                            continue
+                        if card_html is not None:
+                            yield _sse_format(event, card_html)
+                        continue
                     if event not in wanted:
                         # Page didn't subscribe to this event kind —
                         # skip the render so we don't burn DB queries
