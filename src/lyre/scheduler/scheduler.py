@@ -28,6 +28,7 @@ import os
 import sys
 import time
 from collections.abc import Callable
+from datetime import UTC, datetime
 from typing import Any
 
 import structlog
@@ -143,6 +144,28 @@ _TASK_OUTCOME_URGENCY: dict[str, str] = {
     "failed": "high",
     "cancelled": "normal",
 }
+
+
+def _iso_ms(dt: datetime) -> str:
+    """Millisecond-precision ISO string matching the DB's canonical
+    strftime('%Y-%m-%dT%H:%M:%fZ') format. future_mail.iso() is
+    second-precision, and lexicographic SQL comparison between the two
+    formats is wrong ('.': 0x2E sorts BELOW 'Z'), silently excluding
+    same-second events from the H2 window."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    dt = dt.astimezone(UTC)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S") + f".{dt.microsecond // 1000:03d}Z"
+
+
+# H2 work floor: below BOTH thresholds a round counts as a waiting heartbeat
+# (wake, peek at the inbox, sleep — typically 1-2 tool calls and a short
+# text), not a thrashing round. Above either, the round burned real model
+# work and "no outward output" becomes meaningful. Module constants rather
+# than config knobs on purpose: the per-loop API surface is max_no_progress;
+# the floor is a heuristic internal that should stay uniform system-wide.
+_H2_WORK_FLOOR_TOOL_CALLS = 3
+_H2_WORK_FLOOR_OUTPUT_TOKENS = 1500
 
 
 class _LeaseUnclaimed(Exception):
@@ -812,10 +835,16 @@ class Scheduler:
             if latest is not None and _should_restart(policy, outcome):
                 max_r = int(sup.get("max_restarts", 3))
                 max_s = int(sup.get("max_seconds", 60))
+                # Cumulative lifetime cap: wakeup-paced failures (minutes per
+                # retry) always outlive the sliding window, so the window
+                # alone never escalates them. Default 10 ≈ generous for a
+                # legitimately flaky leg, finite for a structural failure.
+                max_t = int(sup.get("max_restarts_total", 10))
                 restarted = False
                 async with self.repos.transaction():
                     within = await self.repos.supervision.bump_and_check_intensity(
-                        agent.id, max_r, max_s, now, reason=outcome
+                        agent.id, max_r, max_s, now, reason=outcome,
+                        max_total=max_t,
                     )
                     if within:
                         await self.repos.tasks.create(
@@ -887,6 +916,7 @@ class Scheduler:
             int(sup.get("max_seconds", 60)),
             now,
             reason="lease_expired",
+            max_total=int(sup.get("max_restarts_total", 10)),
         )
         if within:
             return False
@@ -991,7 +1021,9 @@ class Scheduler:
             detail = (
                 f"Agent {agent.id} (persona {agent.persona_name}) hit its restart "
                 f"limit (max_restarts={sup.get('max_restarts', 3)} within "
-                f"{sup.get('max_seconds', 60)}s); reclaimed without further restart. "
+                f"{sup.get('max_seconds', 60)}s, or "
+                f"{sup.get('max_restarts_total', 10)} lifetime restarts); "
+                f"reclaimed without further restart. "
                 f"Last outcome: {last_status}. Decide: re-plan, re-spec, or drop "
                 f"this leg."
             )
@@ -1242,7 +1274,13 @@ class Scheduler:
                 sched.max_occurrences is not None
                 and sched.occurrence_count + 1 >= sched.max_occurrences
             )
-            urgency = "high" if loop_final else sched.urgency
+            # H2: the count budget alone lets a loop spin uselessly inside
+            # its allowance ("沿无意义路径继续"). Evaluate the thread's
+            # progress since the previous occurrence and stop the loop after
+            # max_no_progress consecutive worked-but-silent rounds — same
+            # stop path as loop_final, distinct wrap-up note.
+            np_count, np_final = await self._evaluate_no_progress(sched)
+            urgency = "high" if (loop_final or np_final) else sched.urgency
             body = sched.body
             if loop_final:
                 body = (
@@ -1250,6 +1288,16 @@ class Scheduler:
                     f"{sched.max_occurrences} iterations — this is your LAST "
                     f"scheduled wake on this thread. Finish up or escalate; "
                     f"you will NOT be auto-woken again.]\n\n" + sched.body
+                )
+            elif np_final:
+                body = (
+                    f"[no-progress gate reached: {np_count} consecutive "
+                    f"rounds did real work but produced nothing outward on "
+                    f"this thread (no mail to others, no child task, no "
+                    f"checkpoint, no completion). This is your LAST "
+                    f"scheduled wake — wrap up with a result or escalate to "
+                    f"your supervisor; you will NOT be auto-woken again.]"
+                    f"\n\n" + sched.body
                 )
 
             external_id = f"sched:{sched.id}:{sched.occurrence_count}"
@@ -1285,8 +1333,8 @@ class Scheduler:
                 after=now,
                 recur_until=sched.recur_until,
             )
-            if loop_final:
-                next_fire = None  # budget exhausted → stop re-arming
+            if loop_final or np_final:
+                next_fire = None  # budget / progress gate exhausted → stop
             # sched was loaded from a persisted row — its id is always set
             # by the time it lands in the delivery loop.
             assert sched.id is not None  # noqa: S101 — narrows for mypy
@@ -1295,6 +1343,7 @@ class Scheduler:
                 delivered_msg_id=delivered_msg_id,
                 next_scheduled_for=iso(next_fire) if next_fire else None,
                 completed=(next_fire is None),
+                no_progress_count=np_count if sched.max_no_progress else None,
             )
             log.info(
                 "scheduled_mail_delivered",
@@ -1304,6 +1353,69 @@ class Scheduler:
                 next_fire=iso(next_fire) if next_fire else None,
                 occurrence=sched.occurrence_count + 1,
             )
+
+    async def _evaluate_no_progress(
+        self, sched: ScheduledMail
+    ) -> tuple[int, bool]:
+        """H2 work-AND-no-output evaluation for one recurring delivery.
+
+        Returns ``(new_count, capped)``. Measures the window since the
+        PREVIOUS occurrence (``last_delivered_at``) on the loop's thread:
+
+        - outward output appeared (non-self thread mail; a task created /
+          completed / checkpointed) → progress → count resets to 0;
+        - no output AND real work happened (tool calls / output tokens above
+          the floor) → one more silent round → count + 1;
+        - no output and no real work (a waiting heartbeat that woke, peeked,
+          and slept) → count unchanged — waiters must not be killed, but a
+          thrasher alternating heavy and idle rounds must not get its slate
+          wiped by the idle ones either.
+
+        Crash-safety: the count rides ``mark_delivered`` (same row update as
+        the occurrence bump). A kill between mailbox insert and mark means
+        re-delivery re-evaluates the SAME window (``last_delivered_at``
+        unchanged) and recomputes the same answer — never double-counted.
+        """
+        cap = sched.max_no_progress or 0
+        if cap <= 0:
+            return (sched.no_progress_count, False)
+        if sched.last_delivered_at is None:
+            # First occurrence: no window to measure yet.
+            return (sched.no_progress_count, False)
+        thread_id = (sched.metadata or {}).get("thread_id")
+        if not isinstance(thread_id, str) or not thread_id:
+            # No thread linkage → signals are unmeasurable; never guess an
+            # agent into a forced stop. (mailbox_send mints thread ids for
+            # recurring self-mail, so this is a legacy/edge shape.)
+            return (sched.no_progress_count, False)
+
+        since = _iso_ms(sched.last_delivered_at)
+        progressed = await self.repos.mailbox.thread_has_nonself_message_since(
+            thread_id, since, sched.recipient
+        ) or await self.repos.tasks.thread_activity_since(thread_id, since)
+        if progressed:
+            return (0, False)
+
+        tool_calls, out_tokens = await self.repos.wakeups.thread_work_since(
+            thread_id, since
+        )
+        worked = (
+            tool_calls >= _H2_WORK_FLOOR_TOOL_CALLS
+            or out_tokens >= _H2_WORK_FLOOR_OUTPUT_TOKENS
+        )
+        if not worked:
+            return (sched.no_progress_count, False)
+        new_count = sched.no_progress_count + 1
+        if new_count >= cap:
+            log.warning(
+                "scheduled_mail_no_progress_capped",
+                scheduled_id=sched.id,
+                recipient=sched.recipient,
+                thread_id=thread_id,
+                count=new_count,
+                cap=cap,
+            )
+        return (new_count, new_count >= cap)
 
     async def _bounce_scheduled_mail(
         self, sched: ScheduledMail, reason: str

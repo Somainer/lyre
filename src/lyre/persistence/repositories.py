@@ -153,6 +153,11 @@ class TaskRepository(Protocol):
     async def update_checkpoint(
         self, task_id: str, checkpoint: dict[str, Any], holder_wakeup_id: str
     ) -> None: ...
+    async def thread_activity_since(self, thread_id: str, since_iso: str) -> bool:
+        """H2 progress: a task on this thread was created, reached terminal,
+        or had its checkpoint advanced since ``since_iso``. NOT keyed on
+        updated_at (lease churn pollutes it)."""
+        ...
     async def update_status(
         self, task_id: str, status: str, holder_wakeup_id: str | None = None
     ) -> bool: ...
@@ -264,6 +269,15 @@ class WakeupRepository(Protocol):
 
     async def list_active(self) -> list[Wakeup]:
         """Wakeups still in flight (ended_at IS NULL)."""
+        ...
+
+    async def thread_work_since(
+        self, thread_id: str, since_iso: str
+    ) -> tuple[int, int]:
+        """Largest single-wakeup (tool calls, output tokens) among this
+        thread's wakeups started since ``since_iso`` — the H2 work-floor
+        input. MAX, not SUM: several light waiter peeks must never sum
+        past the floor."""
         ...
 
     async def has_active_for_agent(self, agent_id: str) -> bool:
@@ -390,6 +404,13 @@ class MailboxRepository(Protocol):
         `participant` narrows to mail this agent sent or received. Powers
         thread-scoped context injection (T3): a wakeup sees its main-line's
         back-and-forth without the (stateless) agent hunting for it."""
+        ...
+
+    async def thread_has_nonself_message_since(
+        self, thread_id: str, since_iso: str, self_actor: str
+    ) -> bool:
+        """H2 progress: any thread mail since ``since_iso`` that is not the
+        loop agent talking to itself (outward send OR inbound reply)."""
         ...
 
     # --- Internal listing helpers (system-side, not agent-facing) --------
@@ -568,10 +589,13 @@ class ScheduledMailRepository(Protocol):
         delivered_msg_id: int,
         next_scheduled_for: str | None,
         completed: bool,
+        no_progress_count: int | None = None,
     ) -> None:
         """One-shot: completed=True, next_scheduled_for=None.
         Recurring with more occurrences: completed=False, next_scheduled_for=iso.
         Recurring past recur_until: completed=True, next_scheduled_for=None.
+        ``no_progress_count``: H2 gate value computed for this delivery
+        (None = leave the stored counter unchanged; 0 is a deliberate reset).
         """
         ...
 
@@ -663,10 +687,13 @@ class SupervisionRepository(Protocol):
         max_seconds: int,
         now: datetime,
         reason: str | None = None,
+        max_total: int | None = None,
     ) -> bool:
         """Record one restart; return True iff within ``max_restarts`` per a
-        sliding ``max_seconds`` window. Over-count is fail-safe (earlier
-        escalation, never a missed bound)."""
+        sliding ``max_seconds`` window AND (when ``max_total`` is set) within
+        the agent's lifetime total. The window alone cannot bound
+        wakeup-paced failure loops — each retry opens a fresh window. The
+        over-count is fail-safe (earlier escalation, never a missed bound)."""
         ...
     async def mark_escalated(self, agent_id: str, now: datetime) -> None: ...
 

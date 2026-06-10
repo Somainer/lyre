@@ -54,9 +54,18 @@ async def _validate_fan_in_result(
     group = await ctx.repos.fan_in.get(group_id)
     if group is None:
         raise ToolError(f"fan-in group {group_id!r} not found")
-    if group.status != "open":
+    # Late results to an already-resolved (quorum_met/expired) group are
+    # ACCEPTED, not rejected. Rejecting them created a burn loop: a
+    # straggler leg finished its work, couldn't submit, completed "without
+    # a typed result", got downgraded to failed by the leg-contract check,
+    # and a transient restart re-ran the whole wakeup — late again, forever
+    # (each retry outlives the sliding intensity window). The result mail
+    # is idempotent and low-urgency; a coordinator that already aggregated
+    # simply ignores it. Only a cancelled group still refuses — its
+    # coordinator asked the legs to stand down.
+    if group.status == "cancelled":
         raise ToolError(
-            f"fan-in group {group_id!r} is {group.status}, not open — result rejected"
+            f"fan-in group {group_id!r} is cancelled — result rejected"
         )
     member = await ctx.repos.fan_in.get_member(group_id, leg_key)
     if member is None:
@@ -338,6 +347,17 @@ async def _schedule_future_mail(
     max_occ = args.get("max_occurrences")
     if max_occ is not None and (not isinstance(max_occ, int) or max_occ < 1):
         raise ToolError("max_occurrences must be a positive integer if provided")
+    # No-progress gate (H2): stop the loop after this many consecutive
+    # worked-but-silent rounds, independent of how many occurrences remain.
+    # Scheduler-enforced like max_occurrences.
+    max_np = args.get("max_no_progress")
+    if max_np is not None and (not isinstance(max_np, int) or max_np < 1):
+        raise ToolError("max_no_progress must be a positive integer if provided")
+    if max_np is not None and recur_every is None and recur_cron is None:
+        raise ToolError(
+            "max_no_progress only applies to recurring mail (recur_every / "
+            "recur_cron) — a one-shot delivery has no loop to gate"
+        )
 
     if recur_every is not None and recur_cron is not None:
         raise ToolError("pass at most one of recur_every / recur_cron")
@@ -431,6 +451,7 @@ async def _schedule_future_mail(
             recur_value=recur_value,
             recur_until=recur_until,
             max_occurrences=max_occ,
+            max_no_progress=max_np,
             created_by_agent=ctx.self_mailbox,
             created_by_task=ctx.task_id,
         )
@@ -903,6 +924,20 @@ MAILBOX_SEND = Tool(
                     "can't re-arm forever. Omit for an open-ended recurrence."
                 ),
             },
+            "max_no_progress": {
+                "type": "integer",
+                "description": (
+                    "No-progress gate for a recurring loop: stop after this "
+                    "many CONSECUTIVE rounds that burned real work (tool "
+                    "calls / output tokens above a floor) yet produced no "
+                    "outward result on the thread (no mail to others, no "
+                    "child task, no checkpoint, no task completion). "
+                    "Waiting-style heartbeats that wake, peek, and sleep "
+                    "don't count against it; any visible progress resets it. "
+                    "Scheduler-enforced like max_occurrences. Suggested: 3. "
+                    "Omit to disable."
+                ),
+            },
         },
         "required": ["to", "body"],
     },
@@ -1088,6 +1123,9 @@ async def _list_scheduled_mail(
                 "recur_kind": r.recur_kind,
                 "recur_value": r.recur_value,
                 "occurrence_count": r.occurrence_count,
+                "max_occurrences": r.max_occurrences,
+                "no_progress_count": r.no_progress_count,
+                "max_no_progress": r.max_no_progress,
                 "status": r.status,
             }
             for r in rows
