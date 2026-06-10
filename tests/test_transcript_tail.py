@@ -75,6 +75,39 @@ def test_multibyte_utf8_split_across_polls_does_not_corrupt(
     assert events[0]["text"] == "中文流式输出"
 
 
+def test_initial_tail_bytes_bounds_the_backlog_read(tmp_path: Path) -> None:
+    """A tailer attaching to an already-large transcript (subscriber
+    connects mid-wakeup) must NOT materialize the whole backlog — it
+    starts near the end and drops the first partial line."""
+    path = tmp_path / "transcript.jsonl"
+    lines = [
+        f'{{"type": "note", "text": "{i:04d}"}}'.encode() + b"\n"
+        for i in range(100)
+    ]
+    path.write_bytes(b"".join(lines))
+
+    tailer = TranscriptTailer(path, initial_tail_bytes=120)
+    events = tailer.poll()
+    # Only events from the last ~120 bytes; the first sliced line is
+    # partial and must be dropped, not garbled into a parse attempt.
+    assert 0 < len(events) <= 4
+    assert events[-1]["text"] == "0099"
+    assert all(e["text"].isdigit() for e in events)
+
+    # Steady state afterwards: only new bytes.
+    with path.open("ab") as fp:
+        fp.write(b'{"type": "note", "text": "new"}\n')
+    assert [e["text"] for e in tailer.poll()] == ["new"]
+
+
+def test_path_becoming_unreadable_is_a_non_event(tmp_path: Path) -> None:
+    """stat() succeeding but open() failing (racing object-store cleanup,
+    or a directory at the path) must return [] — one bad wakeup must not
+    blow up the broadcaster tick. A directory reproduces the OSError."""
+    tailer = TranscriptTailer(tmp_path)  # a directory: stat ok, open fails
+    assert tailer.poll() == []
+
+
 def test_missing_file_and_corrupt_lines(tmp_path: Path) -> None:
     tailer = TranscriptTailer(tmp_path / "not-yet-created.jsonl")
     assert tailer.poll() == []  # writer hasn't created the file yet

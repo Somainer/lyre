@@ -362,6 +362,13 @@ async def sse_dashboard(
                         wid = event[len(CARD_EVENT_PREFIX):]
                         lw = bc.live_wakeup(wid)
                         if lw is None:
+                            # Tombstone: the wakeup ended last tick. Fire
+                            # the event with an empty payload anyway —
+                            # htmx's sse.js only releases a listener when
+                            # its event fires while the element is gone,
+                            # and the timeline re-render already removed
+                            # the card.
+                            yield _sse_format(event, "")
                             continue
                         if agent_id is not None and not wakeup_matches_agent(
                             lw.wakeup, agent_id

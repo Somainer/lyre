@@ -457,7 +457,8 @@ class LiveTranscriptFolder:
             elif kind == "note":
                 note_text = obj.get("text", "")
                 sev = "warn" if any(
-                    k in note_text.lower() for k in ("interrupt", "fallback", "kill", "nudge")
+                    k in note_text.lower()
+                    for k in ("interrupt", "fallback", "failover", "kill", "nudge")
                 ) else "info"
                 self._events.append(
                     ActivityEvent(
