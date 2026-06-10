@@ -126,11 +126,24 @@ async def test_fan_in_leg_submitted_result_validation(
 
 
 def _fake_sched(repos: SqliteRepositories) -> SimpleNamespace:
-    fake = SimpleNamespace(repos=repos, config=SimpleNamespace(fanin_max_age_s=0))
-    # _resolve_fan_in_barriers calls self._reconcile_fan_in_failed_legs; bind it
+    fake = SimpleNamespace(
+        repos=repos,
+        config=SimpleNamespace(fanin_max_age_s=0),
+        # F2 poison-group counter the real __init__ owns.
+        _fanin_failures={},
+    )
+    # _resolve_fan_in_barriers calls these on self; bind the real methods
     # so the lightweight fake-self exercises the real composition.
     fake._reconcile_fan_in_failed_legs = (
         lambda g: Scheduler._reconcile_fan_in_failed_legs(fake, g)
+    )
+    fake._resolve_one_fan_in_group = (
+        lambda g, now, max_age: Scheduler._resolve_one_fan_in_group(
+            fake, g, now, max_age
+        )
+    )
+    fake._force_expire_poison_fan_in = (
+        lambda g, exc: Scheduler._force_expire_poison_fan_in(fake, g, exc)
     )
     return fake
 

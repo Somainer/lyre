@@ -27,7 +27,7 @@ import contextlib
 import os
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any
 
@@ -68,6 +68,18 @@ from ..runtime.wakeup_summary import summarize_and_append
 from ..runtime.worktree import WorktreeHandle, WorktreeManager
 
 log = structlog.get_logger()
+
+
+# F2 poison-row thresholds: consecutive failing attempts before the
+# scheduler stops retrying a row it can never process. Small on purpose —
+# every attempt burns a delivery/resolution slot each tick, and a
+# genuinely transient failure (DB lock blip) clears in one tick, not
+# three. Scheduled mail quarantines DURABLY (status='quarantined' +
+# creator notified); fan-in groups force-expire through their existing
+# terminal path (the in-memory counter resets on restart, see
+# self._fanin_failures).
+_SCHEDMAIL_QUARANTINE_AFTER = 3
+_FANIN_QUARANTINE_AFTER = 3
 
 
 # Wakeup-level statuses produced by AgentLoopResult are richer than
@@ -270,6 +282,12 @@ class Scheduler:
         # C4: monotonic timestamp of the last DB maintenance run (None = never).
         # The maintenance phase runs at most once per maintenance_interval_s.
         self._last_maintenance: float | None = None
+        # F2 poison-group guard: consecutive Phase 0.5 resolution failures
+        # per fan-in group id. In-memory on purpose — a restart retries the
+        # group fresh, and if it's genuinely poisoned it re-quarantines
+        # within _FANIN_QUARANTINE_AFTER ticks; no schema rent for a counter
+        # whose only job is breaking a retry loop.
+        self._fanin_failures: dict[str, int] = {}
 
     def request_stop(self) -> None:
         self._stop_event.set()
@@ -358,24 +376,40 @@ class Scheduler:
             await self._drain_subprocesses()
         log.info("scheduler_stopped")
 
+    async def _guarded_phase(self, name: str, coro: Awaitable[None]) -> None:
+        """Run one mail/bookkeeping phase, swallowing (and logging) its
+        failure so the phases BEHIND it still run this tick. Before this
+        guard, one exception anywhere in Phase −1 aborted the whole tick:
+        Phases 2/3 never ran, so a single corrupt scheduled_mail row could
+        starve ALL task dispatch forever (run() catches the exception and
+        the next tick fails at the same row). The dispatch phases (2/3)
+        deliberately stay UNguarded — they're the tick's tail, and their
+        failures should keep the existing run()-level semantics."""
+        try:
+            await coro
+        except Exception as exc:  # noqa: BLE001
+            log.exception("scheduler_phase_failed", phase=name, error=str(exc))
+
     async def _tick(self) -> None:
         # Phase -1 (future mail): deliver any scheduled_mail whose
         # scheduled_for has arrived. Runs BEFORE Phase 0 so a just-delivered
         # mail can immediately trigger an auto-dispatch in the same tick —
         # otherwise agents would wait a full poll interval for follow-up.
-        await self._deliver_scheduled_mail()
+        await self._guarded_phase("-1:scheduled_mail", self._deliver_scheduled_mail())
 
         # Phase 0.5 (fan-in barrier): resolve any workflow barrier whose
         # delivered result-mails reached quorum (or whose deadline passed)
         # and deliver the coordinator a 'ready' mail. Runs BEFORE Phase 0 so
         # that wake mail is picked up by auto-wake on the SAME tick.
-        await self._resolve_fan_in_barriers()
+        await self._guarded_phase("0.5:fan_in", self._resolve_fan_in_barriers())
 
         # Phase 0 (mail-triggered wakeup): if any agent has unread mail and
         # has no in-flight task, create an auto-"check inbox" task so the
         # message gets read.
         if self.auto_wake_on_mail:
-            await self._auto_dispatch_for_unread_mail()
+            await self._guarded_phase(
+                "0:auto_wake", self._auto_dispatch_for_unread_mail()
+            )
 
         # Phase 0.7 (workflow barrier resume): flip any task parked in
         # 'needs_input' whose resume flag is set back to 'pending' so Phase 3
@@ -384,12 +418,12 @@ class Scheduler:
         # barrier (a later PR) is what raises the flag; doing the canonical
         # needs_input -> pending transition HERE (and only here) keeps the
         # park/resume state machine single-writer and kill-safe.
-        await self._resume_parked_tasks()
+        await self._guarded_phase("0.7:park_resume", self._resume_parked_tasks())
 
         # Phase 0.8 (reaper): reclaim ephemeral agents whose work is done, so
         # spawned workers (fan-in panel members etc.) don't accumulate. Inert
         # until something spawns an ephemeral agent.
-        await self._reap_ephemeral_agents()
+        await self._guarded_phase("0.8:reaper", self._reap_ephemeral_agents())
 
         # Phase 2 (chaos recovery): pick up tasks whose lease has expired
         # (process died, SIGKILL, etc.) BEFORE looking for new pending work.
@@ -576,71 +610,88 @@ class Scheduler:
         for agent in agents:
             if agent.id == "owner":
                 continue  # owner has no LLM, never wakeable
-            # (list_all() already excludes archived agents — no guard needed.)
-
-            # Anti-loop cursor: pick the highest-id unread that's strictly
-            # above what we already dispatched for. Avoids re-firing for a
-            # mail whose dispatch's task already completed without the
-            # agent advancing read state (silent turn / model bug).
-            last_auto_triggered = (
-                await self.repos.mailbox.get_last_auto_triggered_id(agent.id)
-            )
-            unread = await self.repos.mailbox.read_unread(
-                agent.id, min_urgency="normal", limit=50,
-            )
-            unread_new = [
-                m for m in unread
-                if m.id is not None and m.id > last_auto_triggered
-            ]
-            if not unread_new:
-                continue
-            # Among the not-yet-dispatched-for unread, pick the highest-
-            # urgency one (read_unread already sorted urgency-desc).
-            top = unread_new[0]
-
-            # Skip if this agent already has an in-flight task (predicate
-            # unchanged: own an active task by exact agent_id; NULL-owner rows
-            # never matched and are excluded from the set).
-            if agent.id in busy_agent_ids:
-                continue
-
-            # Volatile hint kept at the TAIL of the goal so the cached
-            # prefix (the boilerplate above) hits across wakeups.
-            volatile_hint = (
-                f"\n\nHint: scheduler woke you because mail id={top.id} "
-                f"from {top.sender} (urgency={top.urgency}, "
-                f"title={top.title!r}) is unread."
-            )
-            task_id = await self.repos.tasks.create(
-                TaskSpec(
-                    agent_id=agent.id,
-                    goal=self._AUTO_INBOX_GOAL + volatile_hint,
-                    acceptance=self._AUTO_INBOX_ACCEPTANCE,
-                    metadata={
-                        "auto_dispatched": True,
-                        "triggered_by_mail_id": top.id,
-                        "triggered_by_urgency": top.urgency,
-                        # Carry the 主线 from the triggering mail onto the task,
-                        # so the woken wakeup knows its thread (T2 → T3/T4).
-                        "thread_id": (
-                            top.metadata.get("thread_id") if top.metadata else None
-                        ),
-                    },
+            try:
+                await self._auto_dispatch_one_agent(agent, busy_agent_ids)
+            except Exception as exc:  # noqa: BLE001
+                # F2 row isolation: one agent whose wake bookkeeping raises
+                # (corrupt mail metadata, FK surprise) must not block the
+                # auto-wake scan for every OTHER agent with unread mail.
+                log.exception(
+                    "auto_wake_failed", agent_id=agent.id, error=str(exc)
                 )
-            )
-            # top.id is non-None because read_unread only returns
-            # persisted rows (the watermark column itself is NOT NULL).
-            assert top.id is not None  # noqa: S101 — narrows for mypy
-            await self.repos.mailbox.set_last_auto_triggered_id(
-                agent.id, top.id
-            )
-            log.info(
-                "scheduler_auto_dispatched_for_mail",
+
+    async def _auto_dispatch_one_agent(
+        self, agent: Agent, busy_agent_ids: set[str]
+    ) -> None:
+        """Auto-wake check for ONE agent — the Phase 0 loop body,
+        isolated so one poison agent fails alone. Retries naturally next
+        tick; no durable quarantine needed because a failing agent doesn't
+        consume anything but its own slot in the scan."""
+        # (list_all() already excludes archived agents — no guard needed.)
+
+        # Anti-loop cursor: pick the highest-id unread that's strictly
+        # above what we already dispatched for. Avoids re-firing for a
+        # mail whose dispatch's task already completed without the
+        # agent advancing read state (silent turn / model bug).
+        last_auto_triggered = (
+            await self.repos.mailbox.get_last_auto_triggered_id(agent.id)
+        )
+        unread = await self.repos.mailbox.read_unread(
+            agent.id, min_urgency="normal", limit=50,
+        )
+        unread_new = [
+            m for m in unread
+            if m.id is not None and m.id > last_auto_triggered
+        ]
+        if not unread_new:
+            return
+        # Among the not-yet-dispatched-for unread, pick the highest-
+        # urgency one (read_unread already sorted urgency-desc).
+        top = unread_new[0]
+
+        # Skip if this agent already has an in-flight task (predicate
+        # unchanged: own an active task by exact agent_id; NULL-owner rows
+        # never matched and are excluded from the set).
+        if agent.id in busy_agent_ids:
+            return
+
+        # Volatile hint kept at the TAIL of the goal so the cached
+        # prefix (the boilerplate above) hits across wakeups.
+        volatile_hint = (
+            f"\n\nHint: scheduler woke you because mail id={top.id} "
+            f"from {top.sender} (urgency={top.urgency}, "
+            f"title={top.title!r}) is unread."
+        )
+        task_id = await self.repos.tasks.create(
+            TaskSpec(
                 agent_id=agent.id,
-                persona=agent.persona_name,
-                triggered_by_mail_id=top.id,
-                new_task_id=task_id,
+                goal=self._AUTO_INBOX_GOAL + volatile_hint,
+                acceptance=self._AUTO_INBOX_ACCEPTANCE,
+                metadata={
+                    "auto_dispatched": True,
+                    "triggered_by_mail_id": top.id,
+                    "triggered_by_urgency": top.urgency,
+                    # Carry the 主线 from the triggering mail onto the task,
+                    # so the woken wakeup knows its thread (T2 → T3/T4).
+                    "thread_id": (
+                        top.metadata.get("thread_id") if top.metadata else None
+                    ),
+                },
             )
+        )
+        # top.id is non-None because read_unread only returns
+        # persisted rows (the watermark column itself is NOT NULL).
+        assert top.id is not None  # noqa: S101 — narrows for mypy
+        await self.repos.mailbox.set_last_auto_triggered_id(
+            agent.id, top.id
+        )
+        log.info(
+            "scheduler_auto_dispatched_for_mail",
+            agent_id=agent.id,
+            persona=agent.persona_name,
+            triggered_by_mail_id=top.id,
+            new_task_id=task_id,
+        )
 
     async def _resolve_fan_in_barriers(self) -> None:
         """Phase 0.5: resolve mailbox-driven fan-in barriers.
@@ -663,7 +714,6 @@ class Scheduler:
             return
         from datetime import timedelta
 
-        from ..persistence.models import MailboxMessage as _Msg
         from ..runtime.future_mail import now_utc
 
         now = now_utc()
@@ -677,61 +727,145 @@ class Scheduler:
         # back and leaks past the ceiling under load.
         max_age = self.config.fanin_max_age_s
         ttl_cutoff = now - timedelta(seconds=max_age) if max_age > 0 else None
-        for g in await self.repos.fan_in.find_open(limit=20, ttl_cutoff=ttl_cutoff):
-            # O1: turn any failed/abandoned leg into a counted barrier event so
-            # the group resolves at quorum instead of hanging to its deadline.
-            await self._reconcile_fan_in_failed_legs(g)
-            delivered = await self.repos.mailbox.count_fan_in_results(
-                g.coordinator_agent_id, g.id
+        open_groups = await self.repos.fan_in.find_open(
+            limit=20, ttl_cutoff=ttl_cutoff
+        )
+        open_ids = {g.id for g in open_groups}
+        # Hygiene: drop failure counters for groups no longer open (they
+        # resolved or were cancelled through some other path).
+        for gone in set(self._fanin_failures) - open_ids:
+            del self._fanin_failures[gone]
+        for g in open_groups:
+            try:
+                await self._resolve_one_fan_in_group(g, now, max_age)
+                self._fanin_failures.pop(g.id, None)
+            except Exception as exc:  # noqa: BLE001
+                # F2 row isolation: one unresolvable group must not block
+                # the other barriers (or, pre-guard, the whole tick).
+                log.exception(
+                    "fan_in_resolution_failed", group_id=g.id, error=str(exc)
+                )
+                count = self._fanin_failures.get(g.id, 0) + 1
+                self._fanin_failures[g.id] = count
+                if count >= _FANIN_QUARANTINE_AFTER:
+                    await self._force_expire_poison_fan_in(g, exc)
+
+    async def _force_expire_poison_fan_in(
+        self, g: FanInGroup, exc: Exception
+    ) -> None:
+        """A group whose RESOLUTION keeps raising would retry every tick
+        forever (deadline/TTL can't save it — the resolution path is the
+        thing that's broken). Force it through the existing terminal
+        'expired' status and tell the coordinator why; both steps guarded
+        — this is already the fallback path."""
+        from ..persistence.models import MailboxMessage as _Msg
+
+        try:
+            flipped = await self.repos.fan_in.set_status(
+                g.id, "expired", guard="open"
             )
-            ready = delivered >= g.quorum
-            timed_out = g.deadline is not None and now >= g.deadline
-            ttl_expired = (
-                max_age > 0
-                and g.created_at is not None
-                and (now - g.created_at).total_seconds() > max_age
+        except Exception as flip_exc:  # noqa: BLE001
+            log.warning(
+                "fan_in_force_expire_failed", group_id=g.id, error=str(flip_exc)
             )
-            if not (ready or timed_out or ttl_expired):
-                continue
-            new_status = "quorum_met" if ready else "expired"
-            trigger = "quorum" if ready else ("ttl" if ttl_expired else "deadline")
+            return
+        self._fanin_failures.pop(g.id, None)
+        if not flipped:
+            return
+        log.warning(
+            "fan_in_quarantined",
+            group_id=g.id,
+            failures=_FANIN_QUARANTINE_AFTER,
+            error=str(exc),
+        )
+        try:
             await self.repos.mailbox.ensure_mailbox(g.coordinator_agent_id)
             await self.repos.mailbox.insert_message(
                 _Msg(
                     recipient=g.coordinator_agent_id,
-                    external_id=f"fanin:{g.id}:resolved",
+                    external_id=f"fanin:{g.id}:quarantined",
                     sender="system:fan-in",
                     urgency="high",
-                    title=f"fan-in {g.id} ready ({new_status})",
+                    title=f"fan-in {g.id} force-expired (resolution kept failing)",
                     body=(
-                        f"Fan-in barrier {g.id} is ready to aggregate: "
-                        f"{delivered}/{g.expect_replies} legs delivered "
-                        f"(quorum {g.quorum}, status {new_status}, "
-                        f"trigger {trigger}). Read your result-mails (they carry "
-                        f"metadata.fan_in.group_id={g.id}) and synthesize."
+                        f"Fan-in barrier {g.id} was force-expired: its "
+                        f"resolution failed {_FANIN_QUARANTINE_AFTER} ticks "
+                        f"in a row (last error: {str(exc)[:300]}). Read "
+                        f"whatever result-mails arrived and synthesize from "
+                        f"those, or re-dispatch the missing legs."
                     ),
                     task_id=g.parent_task_id,
-                    metadata={
-                        "fan_in_resolved": g.id,
-                        "delivered": delivered,
-                        "resolved_status": new_status,
-                        "trigger": trigger,
-                    },
+                    metadata={"fan_in_quarantined": g.id},
                 )
             )
-            flipped = await self.repos.fan_in.set_status(
-                g.id, new_status, guard="open"
+        except Exception as notify_exc:  # noqa: BLE001
+            log.warning(
+                "fan_in_quarantine_notice_failed",
+                group_id=g.id,
+                error=str(notify_exc),
             )
-            if flipped:
-                log.info(
-                    "fan_in_resolved",
-                    group_id=g.id,
-                    status=new_status,
-                    trigger=trigger,
-                    delivered=delivered,
-                    quorum=g.quorum,
-                    coordinator=g.coordinator_agent_id,
-                )
+
+    async def _resolve_one_fan_in_group(
+        self, g: FanInGroup, now: datetime, max_age: int
+    ) -> None:
+        """Resolve ONE open fan-in group — the Phase 0.5 loop body,
+        isolated so a poison group fails alone."""
+        from ..persistence.models import MailboxMessage as _Msg
+
+        # O1: turn any failed/abandoned leg into a counted barrier event so
+        # the group resolves at quorum instead of hanging to its deadline.
+        await self._reconcile_fan_in_failed_legs(g)
+        delivered = await self.repos.mailbox.count_fan_in_results(
+            g.coordinator_agent_id, g.id
+        )
+        ready = delivered >= g.quorum
+        timed_out = g.deadline is not None and now >= g.deadline
+        ttl_expired = (
+            max_age > 0
+            and g.created_at is not None
+            and (now - g.created_at).total_seconds() > max_age
+        )
+        if not (ready or timed_out or ttl_expired):
+            return
+        new_status = "quorum_met" if ready else "expired"
+        trigger = "quorum" if ready else ("ttl" if ttl_expired else "deadline")
+        await self.repos.mailbox.ensure_mailbox(g.coordinator_agent_id)
+        await self.repos.mailbox.insert_message(
+            _Msg(
+                recipient=g.coordinator_agent_id,
+                external_id=f"fanin:{g.id}:resolved",
+                sender="system:fan-in",
+                urgency="high",
+                title=f"fan-in {g.id} ready ({new_status})",
+                body=(
+                    f"Fan-in barrier {g.id} is ready to aggregate: "
+                    f"{delivered}/{g.expect_replies} legs delivered "
+                    f"(quorum {g.quorum}, status {new_status}, "
+                    f"trigger {trigger}). Read your result-mails (they carry "
+                    f"metadata.fan_in.group_id={g.id}) and synthesize."
+                ),
+                task_id=g.parent_task_id,
+                metadata={
+                    "fan_in_resolved": g.id,
+                    "delivered": delivered,
+                    "resolved_status": new_status,
+                    "trigger": trigger,
+                },
+            )
+        )
+        flipped = await self.repos.fan_in.set_status(
+            g.id, new_status, guard="open"
+        )
+        if flipped:
+            log.info(
+                "fan_in_resolved",
+                group_id=g.id,
+                status=new_status,
+                trigger=trigger,
+                delivered=delivered,
+                quorum=g.quorum,
+                coordinator=g.coordinator_agent_id,
+            )
 
     async def _reconcile_fan_in_failed_legs(self, g: FanInGroup) -> None:
         """O1: a fan-in leg whose child task terminated WITHOUT delivering a typed
@@ -1265,146 +1399,233 @@ class Scheduler:
         catches it since we mint a deterministic external_id from
         scheduled_id + occurrence_count).
         """
-        from ..persistence.models import MailboxMessage as _Msg
-        from ..runtime.future_mail import compute_next_fire, iso, now_utc
+        from ..runtime.future_mail import iso, now_utc
 
         now = now_utc()
         due = await self.repos.scheduled_mail.find_ready(iso(now), limit=20)
-        if not due:
+        for sched in due:
+            try:
+                await self._deliver_one_scheduled_mail(sched, now)
+            except Exception as exc:  # noqa: BLE001
+                # F2 row isolation: one undeliverable row must not block the
+                # rest of this tick's due mail — before this guard it aborted
+                # the WHOLE tick, so a single poison row (corrupt recurrence,
+                # FK surprise, …) starved every dispatch phase forever.
+                log.exception(
+                    "scheduled_mail_delivery_failed",
+                    scheduled_id=sched.id,
+                    recipient=sched.recipient,
+                    error=str(exc),
+                )
+                await self._record_scheduled_mail_failure(sched, exc)
+
+    async def _deliver_one_scheduled_mail(
+        self, sched: ScheduledMail, now: datetime
+    ) -> None:
+        """Deliver (or bounce) ONE due scheduled_mail row — the Phase −1
+        loop body, isolated so a poison row fails alone."""
+        from ..persistence.models import MailboxMessage as _Msg
+        from ..runtime.future_mail import compute_next_fire, iso
+
+        recipient = sched.recipient
+        # Is the recipient eligible? `owner` is always-valid; otherwise
+        # the agent must exist and not be archived.
+        archived = False
+        missing = False
+        if recipient != "owner":
+            agent = await self.repos.agents.get(recipient)
+            if agent is None:
+                missing = True
+            elif agent.status == "archived":
+                archived = True
+
+        if archived or missing:
+            reason = (
+                "recipient agent archived"
+                if archived
+                else f"recipient agent {recipient!r} not found"
+            )
+            await self._bounce_scheduled_mail(sched, reason)
             return
 
-        for sched in due:
-            recipient = sched.recipient
-            # Is the recipient eligible? `owner` is always-valid; otherwise
-            # the agent must exist and not be archived.
-            archived = False
-            missing = False
-            if recipient != "owner":
-                agent = await self.repos.agents.get(recipient)
-                if agent is None:
-                    missing = True
-                elif agent.status == "archived":
-                    archived = True
-
-            if archived or missing:
-                reason = (
-                    "recipient agent archived"
-                    if archived
-                    else f"recipient agent {recipient!r} not found"
-                )
-                await self._bounce_scheduled_mail(sched, reason)
-                continue
-
-            # Deliver: insert a regular mailbox_message. Deterministic
-            # external_id covers the rare crash-between-insert-and-mark
-            # case.
-            # T4: a recurring self-mail is a bounded loop. This delivery is
-            # occurrence #(occurrence_count+1); if it reaches max_occurrences it
-            # is the FINAL wake — mark it high-urgency with a wrap-up note and
-            # don't re-arm. The scheduler (not the model) enforces the ceiling,
-            # so a confused loop can't run forever.
-            loop_final = (
-                sched.max_occurrences is not None
-                and sched.occurrence_count + 1 >= sched.max_occurrences
+        # Deliver: insert a regular mailbox_message. Deterministic
+        # external_id covers the rare crash-between-insert-and-mark
+        # case.
+        # T4: a recurring self-mail is a bounded loop. This delivery is
+        # occurrence #(occurrence_count+1); if it reaches max_occurrences it
+        # is the FINAL wake — mark it high-urgency with a wrap-up note and
+        # don't re-arm. The scheduler (not the model) enforces the ceiling,
+        # so a confused loop can't run forever.
+        loop_final = (
+            sched.max_occurrences is not None
+            and sched.occurrence_count + 1 >= sched.max_occurrences
+        )
+        # H2: the count budget alone lets a loop spin uselessly inside
+        # its allowance ("沿无意义路径继续"). Evaluate the thread's
+        # progress since the previous occurrence and stop the loop after
+        # max_no_progress consecutive worked-but-silent rounds — same
+        # stop path as loop_final, distinct wrap-up note.
+        np_count, np_final = await self._evaluate_no_progress(sched)
+        urgency = "high" if (loop_final or np_final) else sched.urgency
+        body = sched.body
+        if loop_final:
+            body = (
+                f"[loop budget reached: {sched.occurrence_count + 1}/"
+                f"{sched.max_occurrences} iterations — this is your LAST "
+                f"scheduled wake on this thread. Finish up or escalate; "
+                f"you will NOT be auto-woken again.]\n\n" + sched.body
             )
-            # H2: the count budget alone lets a loop spin uselessly inside
-            # its allowance ("沿无意义路径继续"). Evaluate the thread's
-            # progress since the previous occurrence and stop the loop after
-            # max_no_progress consecutive worked-but-silent rounds — same
-            # stop path as loop_final, distinct wrap-up note.
-            np_count, np_final = await self._evaluate_no_progress(sched)
-            urgency = "high" if (loop_final or np_final) else sched.urgency
-            body = sched.body
-            if loop_final:
-                body = (
-                    f"[loop budget reached: {sched.occurrence_count + 1}/"
-                    f"{sched.max_occurrences} iterations — this is your LAST "
-                    f"scheduled wake on this thread. Finish up or escalate; "
-                    f"you will NOT be auto-woken again.]\n\n" + sched.body
-                )
-            elif np_final:
-                body = (
-                    f"[no-progress gate reached: {np_count} consecutive "
-                    f"rounds did real work but produced nothing outward on "
-                    f"this thread (no mail to others, no child task, no "
-                    f"checkpoint, no completion). This is your LAST "
-                    f"scheduled wake — wrap up with a result or escalate to "
-                    f"your supervisor; you will NOT be auto-woken again.]"
-                    f"\n\n" + sched.body
-                )
+        elif np_final:
+            body = (
+                f"[no-progress gate reached: {np_count} consecutive "
+                f"rounds did real work but produced nothing outward on "
+                f"this thread (no mail to others, no child task, no "
+                f"checkpoint, no completion). This is your LAST "
+                f"scheduled wake — wrap up with a result or escalate to "
+                f"your supervisor; you will NOT be auto-woken again.]"
+                f"\n\n" + sched.body
+            )
 
-            external_id = f"sched:{sched.id}:{sched.occurrence_count}"
-            await self.repos.mailbox.ensure_mailbox(recipient)
-            msg_id = await self.repos.mailbox.insert_message(
-                _Msg(
-                    recipient=recipient,
-                    external_id=external_id,
-                    sender=sched.sender,
-                    urgency=urgency,
-                    title=sched.title,
-                    body=body,
-                    task_id=sched.task_id,
-                    parent_msg_id=sched.parent_msg_id,
-                    metadata=sched.metadata,
-                )
-            )
-            if msg_id < 0:
-                # UNIQUE collision = already delivered before the previous
-                # run crashed mid-update. Look up the existing row's id so
-                # we can still set last_delivery_id correctly (FK protected).
-                existing_id = await self.repos.mailbox.find_id_by_external_id(
-                    recipient, external_id,
-                )
-                delivered_msg_id = existing_id or 0
-                if np_final:
-                    # The H2 decision re-evaluates live tables, so THIS
-                    # attempt may be final while the already-delivered
-                    # (deduped) message carried no banner — the loop would
-                    # die silently and the agent would never see "this is
-                    # your LAST wake". Deliver the banner as its own
-                    # idempotent notice instead.
-                    await self.repos.mailbox.insert_message(
-                        _Msg(
-                            recipient=recipient,
-                            external_id=f"{external_id}:final-notice",
-                            sender=sched.sender,
-                            urgency="high",
-                            title=sched.title,
-                            body=body,
-                            task_id=sched.task_id,
-                            parent_msg_id=sched.parent_msg_id,
-                            metadata=sched.metadata,
-                        )
-                    )
-            else:
-                delivered_msg_id = msg_id
-
-            # Compute next fire (None = no more occurrences).
-            next_fire = compute_next_fire(
-                sched.recur_kind,
-                sched.recur_value,
-                after=now,
-                recur_until=sched.recur_until,
-            )
-            if loop_final or np_final:
-                next_fire = None  # budget / progress gate exhausted → stop
-            # sched was loaded from a persisted row — its id is always set
-            # by the time it lands in the delivery loop.
-            assert sched.id is not None  # noqa: S101 — narrows for mypy
-            await self.repos.scheduled_mail.mark_delivered(
-                mail_id=sched.id,
-                delivered_msg_id=delivered_msg_id,
-                next_scheduled_for=iso(next_fire) if next_fire else None,
-                completed=(next_fire is None),
-                no_progress_count=np_count if sched.max_no_progress else None,
-            )
-            log.info(
-                "scheduled_mail_delivered",
-                scheduled_id=sched.id,
+        external_id = f"sched:{sched.id}:{sched.occurrence_count}"
+        await self.repos.mailbox.ensure_mailbox(recipient)
+        msg_id = await self.repos.mailbox.insert_message(
+            _Msg(
                 recipient=recipient,
-                msg_id=delivered_msg_id,
-                next_fire=iso(next_fire) if next_fire else None,
-                occurrence=sched.occurrence_count + 1,
+                external_id=external_id,
+                sender=sched.sender,
+                urgency=urgency,
+                title=sched.title,
+                body=body,
+                task_id=sched.task_id,
+                parent_msg_id=sched.parent_msg_id,
+                metadata=sched.metadata,
+            )
+        )
+        if msg_id < 0:
+            # UNIQUE collision = already delivered before the previous
+            # run crashed mid-update. Look up the existing row's id so
+            # we can still set last_delivery_id correctly (FK protected).
+            existing_id = await self.repos.mailbox.find_id_by_external_id(
+                recipient, external_id,
+            )
+            delivered_msg_id = existing_id or 0
+            if np_final:
+                # The H2 decision re-evaluates live tables, so THIS
+                # attempt may be final while the already-delivered
+                # (deduped) message carried no banner — the loop would
+                # die silently and the agent would never see "this is
+                # your LAST wake". Deliver the banner as its own
+                # idempotent notice instead.
+                await self.repos.mailbox.insert_message(
+                    _Msg(
+                        recipient=recipient,
+                        external_id=f"{external_id}:final-notice",
+                        sender=sched.sender,
+                        urgency="high",
+                        title=sched.title,
+                        body=body,
+                        task_id=sched.task_id,
+                        parent_msg_id=sched.parent_msg_id,
+                        metadata=sched.metadata,
+                    )
+                )
+        else:
+            delivered_msg_id = msg_id
+
+        # Compute next fire (None = no more occurrences).
+        next_fire = compute_next_fire(
+            sched.recur_kind,
+            sched.recur_value,
+            after=now,
+            recur_until=sched.recur_until,
+        )
+        if loop_final or np_final:
+            next_fire = None  # budget / progress gate exhausted → stop
+        # sched was loaded from a persisted row — its id is always set
+        # by the time it lands in the delivery loop.
+        assert sched.id is not None  # noqa: S101 — narrows for mypy
+        await self.repos.scheduled_mail.mark_delivered(
+            mail_id=sched.id,
+            delivered_msg_id=delivered_msg_id,
+            next_scheduled_for=iso(next_fire) if next_fire else None,
+            completed=(next_fire is None),
+            no_progress_count=np_count if sched.max_no_progress else None,
+        )
+        log.info(
+            "scheduled_mail_delivered",
+            scheduled_id=sched.id,
+            recipient=recipient,
+            msg_id=delivered_msg_id,
+            next_fire=iso(next_fire) if next_fire else None,
+            occurrence=sched.occurrence_count + 1,
+        )
+
+    async def _record_scheduled_mail_failure(
+        self, sched: ScheduledMail, exc: Exception
+    ) -> None:
+        """Poison-row bookkeeping for a Phase −1 delivery that raised:
+        count the failure; at the threshold the row flips to the terminal
+        'quarantined' status (find_ready stops returning it) and the
+        creator is told. Every step is guarded — bookkeeping about a
+        failure must never become a second failure that blocks the
+        remaining due rows."""
+        if sched.id is None:
+            return
+        try:
+            quarantined = await self.repos.scheduled_mail.record_delivery_failure(
+                sched.id, str(exc), _SCHEDMAIL_QUARANTINE_AFTER
+            )
+        except Exception as book_exc:  # noqa: BLE001
+            log.warning(
+                "scheduled_mail_failure_bookkeeping_failed",
+                scheduled_id=sched.id,
+                error=str(book_exc),
+            )
+            return
+        if not quarantined:
+            return
+        log.warning(
+            "scheduled_mail_quarantined",
+            scheduled_id=sched.id,
+            recipient=sched.recipient,
+            failures=_SCHEDMAIL_QUARANTINE_AFTER,
+            error=str(exc),
+        )
+        creator = sched.created_by_agent
+        if not creator:
+            return
+        try:
+            if creator != "owner" and (
+                await self.repos.agents.get(creator)
+            ) is None:
+                return
+            from ..persistence.models import MailboxMessage as _Msg
+
+            await self.repos.mailbox.ensure_mailbox(creator)
+            await self.repos.mailbox.insert_message(
+                _Msg(
+                    recipient=creator,
+                    external_id=f"sched-quarantine:{sched.id}",
+                    sender="system:scheduled-mail",
+                    urgency="high",
+                    body=(
+                        f"[QUARANTINED] Your scheduled mail to "
+                        f"`{sched.recipient}` failed to deliver "
+                        f"{_SCHEDMAIL_QUARANTINE_AFTER} times and has been "
+                        f"stopped. Last error: {str(exc)[:300]}\n"
+                        f"Original body:\n─────\n{sched.body}"
+                    ),
+                    metadata={
+                        "quarantine": True,
+                        "original_scheduled_id": sched.id,
+                    },
+                )
+            )
+        except Exception as notify_exc:  # noqa: BLE001
+            log.warning(
+                "scheduled_mail_quarantine_notice_failed",
+                scheduled_id=sched.id,
+                error=str(notify_exc),
             )
 
     async def _evaluate_no_progress(

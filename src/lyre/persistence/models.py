@@ -254,7 +254,9 @@ class Wakeup(BaseModel):
     compaction_summary_degraded: int = 0
 
 
-ScheduledMailStatus = Literal["pending", "completed", "cancelled", "bounced"]
+ScheduledMailStatus = Literal[
+    "pending", "completed", "cancelled", "bounced", "quarantined"
+]
 RecurKind = Literal["interval", "cron"]
 
 
@@ -288,6 +290,9 @@ class ScheduledMail(BaseModel):
     # rounds. None/0 max = gate off.
     no_progress_count: int = 0
     max_no_progress: int | None = None
+    # Poison-row quarantine (F2): consecutive Phase −1 delivery attempts
+    # that raised; at the threshold the row is quarantined (terminal).
+    delivery_failure_count: int = 0
 
     created_at: datetime | None = None
     created_by_agent: str | None = None
