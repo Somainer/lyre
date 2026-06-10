@@ -217,3 +217,178 @@ async def test_summary_inserts_newest_first_in_existing_section(
     # Original file content preserved.
     assert "# Leader notes" in final
     assert "Some content." in final
+
+
+# ---------------------------------------------------------------------------
+# Spawned-agent notes path: the appender must use the SAME flattened path
+# that seed creates and the identity preamble advertises. It used to build
+# from the raw `persona/name` id, silently forking every spawned agent's
+# auto-summaries into facts/agent-<persona>/<name>-notes.md — a file (and
+# directory layer) the agent is never told about.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_spawned_agent_summary_lands_in_flattened_notes(
+    tmp_path: Path,
+) -> None:
+    memory = tmp_path / "memory"
+    (memory / "facts").mkdir(parents=True)
+    router, adapter = _router_with_cheap()
+
+    out = await summarize_and_append(
+        wakeup_id="0190abcdef00",
+        agent_id="worker-maintainer/backend-1",
+        persona_name="worker-maintainer",
+        result=_result_with_mailbox_send(),
+        memory_path=memory,
+        router=router,
+        adapter_for_entry=lambda _e: adapter,
+    )
+
+    assert out is not None
+    flat = memory / "facts" / "agent-worker-maintainer-backend-1-notes.md"
+    assert flat.is_file()
+    assert SUMMARY_SECTION_HEADER in flat.read_text(encoding="utf-8")
+    # No stray directory layer from the raw id.
+    assert not (memory / "facts" / "agent-worker-maintainer").exists()
+
+
+@pytest.mark.asyncio
+async def test_stray_prefix_notes_merged_into_flattened_file_once(
+    tmp_path: Path,
+) -> None:
+    """Installs that ran the pre-fix code accumulated summaries at the
+    stray unflattened path. The first append after the fix folds that
+    content into the canonical notebook and removes the stray file."""
+    memory = tmp_path / "memory"
+    stray_dir = memory / "facts" / "agent-worker-maintainer"
+    stray_dir.mkdir(parents=True)
+    stray = stray_dir / "backend-1-notes.md"
+    stray.write_text("## Auto-summary log\n\n### old · wakeup deadbeef\n- old entry\n",
+                     encoding="utf-8")
+    router, adapter = _router_with_cheap()
+
+    await summarize_and_append(
+        wakeup_id="0190abcdef00",
+        agent_id="worker-maintainer/backend-1",
+        persona_name="worker-maintainer",
+        result=_result_with_mailbox_send(),
+        memory_path=memory,
+        router=router,
+        adapter_for_entry=lambda _e: adapter,
+    )
+
+    flat = memory / "facts" / "agent-worker-maintainer-backend-1-notes.md"
+    text = flat.read_text(encoding="utf-8")
+    assert "- old entry" in text, "stray content must be folded in"
+    assert "wakeup 0190abcd" in text, "new entry must still be appended"
+    assert not stray.exists(), "stray file must be removed after merge"
+    assert not stray_dir.exists(), "emptied stray dir must be removed"
+
+
+@pytest.mark.asyncio
+async def test_stray_merge_is_write_then_unlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Kill-test law for the heal itself: if the canonical write dies
+    (SIGKILL/ENOSPC stand-in), the stray file must SURVIVE — removing it
+    first would permanently destroy the very history being rescued."""
+    memory = tmp_path / "memory"
+    stray_dir = memory / "facts" / "agent-worker-maintainer"
+    stray_dir.mkdir(parents=True)
+    stray = stray_dir / "backend-1-notes.md"
+    stray.write_text("- precious legacy entry\n", encoding="utf-8")
+    router, adapter = _router_with_cheap()
+
+    import lyre.runtime.wakeup_summary as ws
+
+    def _boom(path: Path, text: str) -> None:
+        raise OSError("simulated kill at publish")
+
+    monkeypatch.setattr(ws, "atomic_write_text", _boom)
+    # summarize_and_append is a best-effort sidecar: the failure is
+    # swallowed, but the stray file must still be there afterwards.
+    await summarize_and_append(
+        wakeup_id="0190abcdef00",
+        agent_id="worker-maintainer/backend-1",
+        persona_name="worker-maintainer",
+        result=_result_with_mailbox_send(),
+        memory_path=memory,
+        router=router,
+        adapter_for_entry=lambda _e: adapter,
+    )
+    assert stray.exists(), "stray must survive a failed canonical write"
+
+
+@pytest.mark.asyncio
+async def test_stray_merge_idempotent_when_unlink_was_lost(
+    tmp_path: Path,
+) -> None:
+    """Kill window between the durable write and the unlink: the next
+    wakeup must remove the leftover stray WITHOUT folding its content in
+    a second time (marker-guarded)."""
+    memory = tmp_path / "memory"
+    stray_dir = memory / "facts" / "agent-worker-maintainer"
+    stray_dir.mkdir(parents=True)
+    stray = stray_dir / "backend-1-notes.md"
+    stray.write_text("- old entry\n", encoding="utf-8")
+    router, adapter = _router_with_cheap()
+
+    await summarize_and_append(
+        wakeup_id="0190abcdef00",
+        agent_id="worker-maintainer/backend-1",
+        persona_name="worker-maintainer",
+        result=_result_with_mailbox_send(),
+        memory_path=memory,
+        router=router,
+        adapter_for_entry=lambda _e: adapter,
+    )
+    # Simulate the lost unlink: resurrect the stray file post-merge.
+    stray_dir.mkdir(parents=True, exist_ok=True)
+    stray.write_text("- old entry\n", encoding="utf-8")
+
+    router2, adapter2 = _router_with_cheap()
+    await summarize_and_append(
+        wakeup_id="0190abcdef99",
+        agent_id="worker-maintainer/backend-1",
+        persona_name="worker-maintainer",
+        result=_result_with_mailbox_send(),
+        memory_path=memory,
+        router=router2,
+        adapter_for_entry=lambda _e: adapter2,
+    )
+
+    flat = memory / "facts" / "agent-worker-maintainer-backend-1-notes.md"
+    text = flat.read_text(encoding="utf-8")
+    assert text.count("- old entry") == 1, "content must not be folded twice"
+    assert not stray.exists(), "leftover stray must still be cleaned up"
+
+
+@pytest.mark.asyncio
+async def test_stray_merge_salvages_non_utf8_legacy(tmp_path: Path) -> None:
+    """A non-UTF8 byte in the legacy file must neither crash the append
+    nor permanently block future summaries — content is salvaged with
+    replacement characters."""
+    memory = tmp_path / "memory"
+    stray_dir = memory / "facts" / "agent-worker-maintainer"
+    stray_dir.mkdir(parents=True)
+    stray = stray_dir / "backend-1-notes.md"
+    stray.write_bytes(b"- legacy with bad byte \xff here\n")
+    router, adapter = _router_with_cheap()
+
+    await summarize_and_append(
+        wakeup_id="0190abcdef00",
+        agent_id="worker-maintainer/backend-1",
+        persona_name="worker-maintainer",
+        result=_result_with_mailbox_send(),
+        memory_path=memory,
+        router=router,
+        adapter_for_entry=lambda _e: adapter,
+    )
+
+    flat = memory / "facts" / "agent-worker-maintainer-backend-1-notes.md"
+    text = flat.read_text(encoding="utf-8")
+    assert "- legacy with bad byte" in text
+    assert "wakeup 0190abcd" in text
+    assert not stray.exists()

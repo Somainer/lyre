@@ -12,7 +12,9 @@ from __future__ import annotations
 import pytest
 
 from lyre.runtime.identity import (
+    agent_notes_rel_path,
     compose_id,
+    flat_id,
     is_bare_id,
     is_valid_agent_id,
     split_id,
@@ -128,3 +130,25 @@ def test_is_bare_id(agent_id: str, bare: bool) -> None:
     bootstrap-seeded (that's DB state, queried via
     ``parent_agent_id IS NULL`` at call sites that need it)."""
     assert is_bare_id(agent_id) == bare
+
+
+# ---------------------------------------------------------------------------
+# Filesystem mapping: flat_id / agent_notes_rel_path are the SSOT every
+# per-agent file path derives from. wakeup_summary used to build the notes
+# path from the RAW id (no flatten), forking every spawned agent's memory
+# into a stray directory the agent never reads — these pin the contract.
+# ---------------------------------------------------------------------------
+
+
+def test_flat_id_flattens_spawned_ids() -> None:
+    assert flat_id("dispatcher") == "dispatcher"
+    assert flat_id("worker-maintainer/backend-1") == "worker-maintainer-backend-1"
+
+
+def test_agent_notes_rel_path_is_always_a_flat_file() -> None:
+    assert agent_notes_rel_path("dispatcher") == "facts/agent-dispatcher-notes.md"
+    rel = agent_notes_rel_path("worker-maintainer/backend-1")
+    assert rel == "facts/agent-worker-maintainer-backend-1-notes.md"
+    # One path segment under facts/ — a slash here would imply a directory
+    # layer and break the identity preamble's read_memory instructions.
+    assert "/" not in rel.removeprefix("facts/")

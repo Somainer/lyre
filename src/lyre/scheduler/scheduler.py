@@ -145,6 +145,12 @@ _TASK_OUTCOME_URGENCY: dict[str, str] = {
 }
 
 
+class _LeaseUnclaimed(Exception):
+    """Internal control-flow sentinel: lost the lease race inside the
+    wakeup-start transaction. Raising rolls the freshly-INSERTed wakeup
+    row back out so losing the race leaves no trace at all."""
+
+
 def _should_restart(policy: str, outcome: str) -> bool:
     """OTP restart-type semantics for an ephemeral child's latest outcome.
     ``permanent`` restarts on any terminal outcome; ``transient`` only on an
@@ -1549,24 +1555,34 @@ class Scheduler:
         # resolves — tasks created with a bare persona name (legacy
         # tests, pre-A3 callers) leave agent=None and the FK
         # `wakeups.agent_id REFERENCES agents(id)` would fail.
-        wakeup_id = await self.repos.wakeups.start(
-            task_id, persona.name,
-            agent_id=agent.id if agent is not None else None,
-        )
-        claimed = await self.repos.tasks.claim_lease(
-            task_id, wakeup_id, duration_sec=task.lease_duration_s
-        )
-        if not claimed:
-            # The wakeup row got INSERTed before we attempted the claim
-            # (wakeups.start commits unconditionally). If we just return
-            # here, the row stays at ended_at IS NULL forever — exactly
-            # the orphan pattern close_orphans_for_task exists to fix.
-            # Close our own freshly-inserted row in the same code path
-            # rather than relying on the next _run_task to sweep it.
-            log.warning(
-                "lease_unclaimed", task_id=task_id, wakeup_id=wakeup_id,
-            )
-            await self.repos.wakeups.end(wakeup_id, end_status="abandoned")
+        #
+        # Wakeup row + lease claim commit ATOMICALLY. They used to be two
+        # commits, and a SIGKILL (or a claim_lease busy_timeout raise)
+        # between them left an open wakeup row on a still-'pending'
+        # leaseless task — has_active_for_agent counts that as in-flight,
+        # Phase 3 then skips every task of this agent forever, and the
+        # only sweeper (close_orphans_for_task above) sits behind the very
+        # gate that latched: the agent is permanently bricked. With one
+        # commit there is no in-between state: either nothing happened
+        # (task stays pending, next tick retries) or row+lease exist
+        # together (a crash after that is ordinary lease recovery).
+        wakeup_id = ""
+        try:
+            async with self.repos.transaction():
+                wakeup_id = await self.repos.wakeups.start(
+                    task_id, persona.name,
+                    agent_id=agent.id if agent is not None else None,
+                )
+                claimed = await self.repos.tasks.claim_lease(
+                    task_id, wakeup_id, duration_sec=task.lease_duration_s
+                )
+                if not claimed:
+                    # Raise to roll the wakeup INSERT back out — losing the
+                    # claim race must leave no row at all (an 'abandoned'
+                    # row would just be orphan-shaped noise).
+                    raise _LeaseUnclaimed()
+        except _LeaseUnclaimed:
+            log.warning("lease_unclaimed", task_id=task_id)
             return
 
         transcript = TranscriptWriter(self.config.object_store_path, wakeup_id)

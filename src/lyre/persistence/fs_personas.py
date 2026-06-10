@@ -38,6 +38,7 @@ from typing import TYPE_CHECKING, Any, get_args
 
 import structlog
 
+from ..fsutil import atomic_write_text
 from ..personas.seed import (
     _parse_markdown_with_frontmatter,
     load_persona_from_file,
@@ -104,15 +105,12 @@ def _serialize_persona(persona: Persona) -> str:
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
-    """Write through a temp file + atomic rename in the same directory so a
-    partial write under SIGKILL / power-loss / ENOSPC can't leave a
-    half-written or empty identity.md. identity.md is the persona SSOT
-    (no DB mirror); a torn write makes load_persona_from_file raise
+    """identity.md is the persona SSOT (no DB mirror); a torn write under
+    SIGKILL / power-loss / ENOSPC makes load_persona_from_file raise
     KeyError, which get()/list_active() swallow, silently dropping the
-    persona. Same kill-test fix as runtime/blob_store.py."""
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    tmp.replace(path)
+    persona — so writes must be atomic. Delegates to the shared fsutil
+    helper (tmp + fsync + rename)."""
+    atomic_write_text(path, text)
 
 
 class FilesystemPersonaRepository:

@@ -13,10 +13,10 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
-from anthropic.types import MessageDeltaEvent, MessageStartEvent
+from anthropic.types import MessageDeltaEvent, MessageStartEvent, MessageStopEvent
 
 from lyre.adapter.anthropic import AnthropicAdapter
-from lyre.adapter.llm_adapter import Usage
+from lyre.adapter.llm_adapter import TurnComplete, Usage
 from lyre.outbox.dispatcher import OutboxDispatcher
 from lyre.persistence.models import OutboxRow, Persona, TaskSpec
 from lyre.persistence.sqlite_impl import SqliteRepositories
@@ -91,6 +91,63 @@ def test_anthropic_usage_falls_back_to_delta_then_zero_without_message_start() -
     assert isinstance(usage2, Usage)
     assert usage2.input_tokens == 0
     assert usage2.output_tokens == 3
+
+
+# ---------------------------------------------------------------------------
+# Anthropic adapter must surface the REAL stop_reason. The SDK's
+# message_delta usage is a required field, so the Usage branch always wins
+# and the stop_reason can only travel via the stash → message_stop path.
+# Before the stash existed every Anthropic turn surfaced as end_turn and a
+# max_tokens-truncated final response was classified 'completed' (A2 defeat).
+# ---------------------------------------------------------------------------
+
+
+def test_anthropic_stop_reason_survives_to_message_stop() -> None:
+    holder: dict[str, Any] = {"input_tokens": 0}
+
+    delta = _fake_event(MessageDeltaEvent)
+    delta.delta.stop_reason = "max_tokens"
+    delta.usage.output_tokens = 11
+    delta.usage.input_tokens = None
+    emitted = AnthropicAdapter._anthropic_to_lyre(delta, {}, {}, holder)
+    # The delta still emits Usage (required field wins) — never TurnComplete.
+    assert isinstance(emitted, Usage)
+
+    stop = _fake_event(MessageStopEvent)
+    done = AnthropicAdapter._anthropic_to_lyre(stop, {}, {}, holder)
+    assert isinstance(done, TurnComplete)
+    assert done.stop_reason == "max_tokens"
+
+
+def test_anthropic_stop_reason_defaults_to_end_turn_when_never_sent() -> None:
+    holder: dict[str, Any] = {"input_tokens": 0}
+    stop = _fake_event(MessageStopEvent)
+    done = AnthropicAdapter._anthropic_to_lyre(stop, {}, {}, holder)
+    assert isinstance(done, TurnComplete)
+    assert done.stop_reason == "end_turn"
+
+
+def test_anthropic_stop_reason_maps_provider_vocabulary() -> None:
+    """stop_sequence is a clean stop; refusal is error-shaped; unknown
+    compat-endpoint values degrade to end_turn instead of leaking raw
+    strings into the loop's StopReason literal."""
+    for wire, expected in [
+        ("stop_sequence", "end_turn"),
+        ("refusal", "error"),
+        ("tool_use", "tool_use"),
+        ("model_context_window_exceeded", "max_tokens"),
+        ("some-future-compat-value", "end_turn"),
+    ]:
+        holder: dict[str, Any] = {"input_tokens": 0}
+        delta = _fake_event(MessageDeltaEvent)
+        delta.delta.stop_reason = wire
+        delta.usage.output_tokens = 1
+        delta.usage.input_tokens = None
+        AnthropicAdapter._anthropic_to_lyre(delta, {}, {}, holder)
+        stop = _fake_event(MessageStopEvent)
+        done = AnthropicAdapter._anthropic_to_lyre(stop, {}, {}, holder)
+        assert isinstance(done, TurnComplete)
+        assert done.stop_reason == expected, wire
 
 
 # ---------------------------------------------------------------------------

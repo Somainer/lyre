@@ -18,13 +18,17 @@ Format guarantees:
   * ``split_id(id)`` is unambiguous — at most one ``/`` per id.
   * No collisions between persona names and spawn names (persona can't
     contain ``/``, names can't either).
-  * Filesystem-safe (matches the ``agent-<id>-notes.md`` file convention,
-    where ``/`` becomes a one-level directory).
+  * Filesystem-safe via ``flat_id()``: ``/`` is flattened to ``-`` so every
+    agent's notes/scratchpad live as ONE flat file (never a directory
+    layer). ``agent_notes_rel_path()`` below is the single source of truth
+    for the notes filename — runtime writers and the identity preamble must
+    agree on it byte-for-byte or an agent's long-term memory silently forks.
 
-This module is GRAMMAR-only. It deliberately does NOT export "is this id
-a bootstrap-seeded singleton?" — that's runtime state (live in
-``agents.parent_agent_id IS NULL`` in the DB), not a syntactic property.
-Callers needing that distinction query the agent table directly.
+This module is the id grammar AND its filesystem mapping. It deliberately
+does NOT export "is this id a bootstrap-seeded singleton?" — that's
+runtime state (live in ``agents.parent_agent_id IS NULL`` in the DB), not
+a syntactic property. Callers needing that distinction query the agent
+table directly.
 """
 
 from __future__ import annotations
@@ -66,6 +70,25 @@ def compose_id(persona: str, name: str | None) -> str:
     if name is None or name == "":
         return persona
     return f"{persona}/{name}"
+
+
+def flat_id(agent_id: str) -> str:
+    """Filesystem-flat form of an agent id: ``worker-maintainer/backend-1``
+    → ``worker-maintainer-backend-1``. Every per-agent file (notes,
+    scratchpad, notes archive) is named with this form so spawned ids never
+    create a directory layer. Centralised here because four inline copies
+    plus one site that forgot the flatten already produced a real bug
+    (spawned agents' auto-summaries written to a path nobody reads)."""
+    return agent_id.replace("/", "-")
+
+
+def agent_notes_rel_path(agent_id: str) -> str:
+    """Path of the agent's long-term notes file relative to memory_root.
+
+    Single source of truth shared by seed (file creation), context (the
+    identity preamble that tells the agent where its notebook lives), and
+    wakeup_summary (the runtime appender/rotator)."""
+    return f"facts/agent-{flat_id(agent_id)}-notes.md"
 
 
 def validate_agent_id(agent_id: str) -> None:

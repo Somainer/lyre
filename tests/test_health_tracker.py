@@ -62,6 +62,39 @@ def test_mark_success_closes_circuit_and_clears_failures() -> None:
     assert h.state("m") == "closed"
 
 
+def test_failure_during_half_open_reopens_circuit() -> None:
+    """A still-dead model probed in half_open must re-enter a full
+    cooldown. opened_at used to be set only once, so after the first
+    cooldown the state stuck at half_open (available) forever and the
+    breaker protected for exactly one window per process lifetime."""
+    clock = _Clock()
+    h = HealthTracker(cooldown_s=180.0, now_fn=clock)
+    for _ in range(3):
+        h.mark_failure("m")
+    clock.t += 200
+    assert h.state("m") == "half_open"
+    # The half-open probe fails → circuit re-opens for a fresh cooldown.
+    h.mark_failure("m")
+    assert h.state("m") == "open"
+    assert not h.is_available("m")
+    # And the new cooldown counts from the re-open, not the original open.
+    clock.t += 100
+    assert h.state("m") == "open"
+    clock.t += 100
+    assert h.state("m") == "half_open"
+
+
+def test_success_during_half_open_closes_circuit() -> None:
+    clock = _Clock()
+    h = HealthTracker(cooldown_s=180.0, now_fn=clock)
+    for _ in range(3):
+        h.mark_failure("m")
+    clock.t += 200
+    assert h.state("m") == "half_open"
+    h.mark_success("m")
+    assert h.state("m") == "closed"
+
+
 def test_old_failures_are_pruned_from_window() -> None:
     clock = _Clock()
     h = HealthTracker(window_s=60.0, now_fn=clock)

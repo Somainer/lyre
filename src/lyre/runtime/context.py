@@ -18,6 +18,7 @@ from typing import Any
 from ..adapter.llm_adapter import LyreContentBlock, LyreMessage
 from ..persistence.models import Persona, Task
 from ..persistence.repositories import TaskRepository
+from .identity import agent_notes_rel_path, flat_id
 from .memory import build_memory_index_for_prompt
 from .skills import format_skills_for_prompt, load_skills_for_context
 
@@ -259,12 +260,13 @@ def _build_identity_preamble(
     in each persona's identity.md; this section in the preamble
     grounds those generic references to the actual ids."""
     # `persona/name` ids would otherwise hint at a directory layer in
-    # the notes / scratchpad paths; flatten `/` to `-` to match the
-    # ensure_agent_*_file filename convention.
-    _flat_id = agent_id.replace("/", "-")
-    notes_path = f"~/.lyre/memory/facts/agent-{_flat_id}-notes.md"
-    scratchpad_path = f"~/.lyre/memory/scratchpad/{_flat_id}.md"
-    scratchpad_rel = f"scratchpad/{_flat_id}.md"
+    # the notes / scratchpad paths; identity.flat_id is the shared SSOT
+    # so the preamble, seed, and the wakeup_summary appender can never
+    # disagree on where an agent's files live.
+    _fid = flat_id(agent_id)
+    notes_path = f"~/.lyre/memory/{agent_notes_rel_path(agent_id)}"
+    scratchpad_path = f"~/.lyre/memory/scratchpad/{_fid}.md"
+    scratchpad_rel = f"scratchpad/{_fid}.md"
     parent_line = ""
     if parent_agent_id:
         parent_line = (
@@ -459,7 +461,7 @@ def _build_identity_preamble(
         f"owner preferences, project decisions, gotchas\". Notes "
         f"persist forever; scratchpad cycles. The runtime also "
         f"appends an `## Auto-summary log` here at every wakeup end. "
-        f"Read with `read_memory(\"facts/agent-{_flat_id}-notes.md\")`. "
+        f"Read with `read_memory(\"{agent_notes_rel_path(agent_id)}\")`. "
         f"Append via `shell_exec` / `python_exec` if you have them, "
         f"or delegate to an analyst.\n"
         f"  4. **Your own sent mail** — `mailbox_read(box=\"sent\")` "
@@ -529,8 +531,7 @@ def _read_scratchpad(
 
     Path mirrors the preamble's ``memory/scratchpad/<flat-id>.md`` (``/`` → ``-``).
     """
-    flat_id = agent_id.replace("/", "-")
-    p = memory_root / "scratchpad" / f"{flat_id}.md"
+    p = memory_root / "scratchpad" / f"{flat_id(agent_id)}.md"
     if not p.is_file():
         return None
     text = p.read_text(encoding="utf-8").strip()

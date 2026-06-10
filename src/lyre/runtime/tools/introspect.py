@@ -23,6 +23,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+from ...fsutil import atomic_write_text
 from ...persistence.models import Agent, Task
 from ..future_mail import now_utc
 from ..identity import compose_id, is_valid_agent_id
@@ -198,7 +199,11 @@ async def _update_scratchpad(
             f"facts/agent-<id>-notes.md."
         )
 
-    path.write_text(new_body, encoding="utf-8")
+    # Atomic write: the scratchpad is a durability-tier file (the identity
+    # preamble tells every agent to read it at wakeup start) with no other
+    # recovery source — a bare write_text truncates at open, so a SIGKILL
+    # mid-write would silently destroy the agent's working memory.
+    atomic_write_text(path, new_body)
     return {
         "rel_path": rel,
         "mode": mode,

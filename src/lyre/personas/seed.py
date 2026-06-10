@@ -35,8 +35,10 @@ from typing import Any
 
 import yaml
 
+from ..fsutil import atomic_write_text
 from ..persistence.models import Persona
 from ..persistence.repositories import AgentRepository, PersonaRepository
+from ..runtime.identity import agent_notes_rel_path, flat_id
 
 
 def _parse_markdown_with_frontmatter(text: str) -> tuple[dict[str, Any], str]:
@@ -299,13 +301,13 @@ def ensure_agent_notes_file(memory_root: Path, agent_id: str) -> Path:
     """
     facts_dir = memory_root / "facts"
     facts_dir.mkdir(parents=True, exist_ok=True)
-    flat_id = agent_id.replace("/", "-")
-    path = facts_dir / f"agent-{flat_id}-notes.md"
+    fid = flat_id(agent_id)
+    path = memory_root / agent_notes_rel_path(agent_id)
     if path.exists():
         return path
     now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     seed = f"""---
-name: agent-{flat_id}-notes
+name: agent-{fid}-notes
 description: {agent_id}'s private notebook for cross-wakeup memory.
 type: agent_notes
 agent_id: {agent_id}
@@ -317,7 +319,7 @@ created: {now}
 This is your private notebook. Every wakeup is stateless — anything you
 want to remember across wakeups goes here. The identity preamble points
 you at this file by path; you read it with `read_memory(
-"facts/agent-{flat_id}-notes.md")` and append to it with shell_exec /
+"facts/agent-{fid}-notes.md")` and append to it with shell_exec /
 python_exec.
 
 Suggested sections (free-form — edit as you like):
@@ -333,12 +335,10 @@ Suggested sections (free-form — edit as you like):
 
 ## Decisions / facts worth remembering
 """
-    path.write_text(seed, encoding="utf-8")
+    # Atomic: a SIGKILL mid-seed would otherwise leave a truncated notes
+    # file that the exists() guard above never repairs (kill-test law).
+    atomic_write_text(path, seed)
     return path
-
-
-def _flatten_agent_id(agent_id: str) -> str:
-    return agent_id.replace("/", "-")
 
 
 def scratchpad_rel_path(agent_id: str) -> str:
@@ -347,8 +347,10 @@ def scratchpad_rel_path(agent_id: str) -> str:
     Used both for ``read_memory(rel_path)`` and inside the
     ``update_scratchpad`` tool's sandbox check. Centralised so the
     runtime and the tool never disagree on where a scratchpad lives.
+    Flattening itself lives in ``runtime.identity.flat_id`` — the same
+    SSOT the notes path uses.
     """
-    return f"scratchpad/{_flatten_agent_id(agent_id)}.md"
+    return f"scratchpad/{flat_id(agent_id)}.md"
 
 
 def ensure_agent_scratchpad_file(memory_root: Path, agent_id: str) -> Path:
@@ -368,8 +370,7 @@ def ensure_agent_scratchpad_file(memory_root: Path, agent_id: str) -> Path:
     """
     scratchpad_dir = memory_root / "scratchpad"
     scratchpad_dir.mkdir(parents=True, exist_ok=True)
-    flat_id = _flatten_agent_id(agent_id)
-    path = scratchpad_dir / f"{flat_id}.md"
+    path = memory_root / scratchpad_rel_path(agent_id)
     if not path.exists():
         path.write_text("", encoding="utf-8")
     return path

@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import os
 import re
-import tempfile
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -34,8 +33,10 @@ from ..adapter.llm_adapter import (
     StreamEvent,
     TurnComplete,
 )
+from ..fsutil import atomic_write_text
 from .adapter_factory import model_name_for_provider
 from .agent_loop import AgentLoopResult
+from .identity import agent_notes_rel_path, flat_id
 from .model_registry import ModelEntry
 from .model_router import ModelPreference, ModelRouter, NoEligibleModelError
 
@@ -43,6 +44,11 @@ log = structlog.get_logger()
 
 
 SUMMARY_SECTION_HEADER = "## Auto-summary log"
+
+# Idempotency sentinel for the one-time stray-notes heal in
+# _append_to_notes: its presence in the canonical notebook means the
+# legacy unflattened file's content has already been folded in.
+_STRAY_MERGE_MARKER = "<!-- merged from pre-fix stray notes path -->"
 SUMMARY_PREFERENCE = ModelPreference(
     tier="cheap", requires=("streaming",), prefer=(),
 )
@@ -256,13 +262,56 @@ def _append_to_notes(
     Order is newest-first within the section, so a quick `head` shows
     recent wakeups without scrolling.
     """
-    notes = memory_path / "facts" / f"agent-{agent_id}-notes.md"
+    # identity.agent_notes_rel_path flattens `persona/name` ids — the SAME
+    # path seed creates and the identity preamble advertises. Building the
+    # path from the raw id here used to fork every spawned agent's memory
+    # into a stray `facts/agent-<persona>/<name>-notes.md` nobody reads.
+    notes = memory_path / agent_notes_rel_path(agent_id)
     notes.parent.mkdir(parents=True, exist_ok=True)
     ts = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     short_id = wakeup_id[:8]
     entry = f"\n### {ts} · wakeup {short_id}\n{summary.strip()}\n"
 
     existing = notes.read_text(encoding="utf-8") if notes.exists() else ""
+
+    # One-time heal for installs that already accumulated summaries at the
+    # pre-fix stray path: fold that file's content into the canonical
+    # notebook. ORDER MATTERS (kill-test law): the stray file is removed
+    # only AFTER atomic_write_text below has durably published the merged
+    # content — unlink-first would let a SIGKILL/ENOSPC in between
+    # permanently destroy the very history this heal rescues. The marker
+    # makes the merge idempotent: a kill after write-before-unlink leaves
+    # the stray file behind, and the next wakeup just removes it without
+    # folding the content in twice. Best-effort — a failure here must not
+    # block the append (the stray file just survives for next time).
+    legacy: Path | None = None
+    if "/" in agent_id:
+        candidate = memory_path / "facts" / f"agent-{agent_id}-notes.md"
+        try:
+            if candidate.is_file():
+                legacy = candidate
+                if _STRAY_MERGE_MARKER not in existing:
+                    # errors="replace": salvaging mojibake beats letting a
+                    # UnicodeDecodeError escape and permanently block every
+                    # future auto-summary append for this agent.
+                    stray = candidate.read_text(
+                        encoding="utf-8", errors="replace"
+                    ).strip()
+                    if stray:
+                        sep = (
+                            "" if (not existing or existing.endswith("\n"))
+                            else "\n"
+                        )
+                        existing = (
+                            existing + sep
+                            + f"\n{_STRAY_MERGE_MARKER}\n"
+                            + stray + "\n"
+                        )
+        except OSError as exc:
+            legacy = None
+            log.warning(
+                "stray_notes_merge_failed", agent_id=agent_id, error=str(exc)
+            )
 
     if SUMMARY_SECTION_HEADER in existing:
         # Insert the new entry immediately after the section header so the
@@ -281,14 +330,24 @@ def _append_to_notes(
         sep = "" if not existing or existing.endswith("\n") else "\n"
         new_content = existing + sep + f"\n{SUMMARY_SECTION_HEADER}\n" + entry
 
-    # Write through a sibling temp file + atomic rename so a SIGKILL
-    # mid-write can't truncate the durable long-term notes file. An
-    # interrupted write leaves the prior complete file intact and only
-    # orphans a .tmp. (Kill-test: any process can die at any moment;
-    # same pattern as runtime/blob_store.py.)
-    tmp = notes.with_name(notes.name + ".tmp")
-    tmp.write_text(new_content, encoding="utf-8")
-    tmp.replace(notes)
+    # Atomic write: a SIGKILL mid-write must not truncate the durable
+    # long-term notes file (kill-test law).
+    atomic_write_text(notes, new_content)
+
+    # Only now is the merged content durable — safe to drop the stray file.
+    if legacy is not None:
+        try:
+            legacy.unlink()
+            # The stray layout created facts/agent-<persona>/; drop the
+            # directory once emptied so the facts/ scan stays clean.
+            try:
+                legacy.parent.rmdir()
+            except OSError:
+                pass
+        except OSError as exc:
+            log.warning(
+                "stray_notes_cleanup_failed", agent_id=agent_id, error=str(exc)
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -327,24 +386,6 @@ def _archived_wakeup_ids(archive_file: Path) -> set[str]:
     return {m.group(1) for m in _ENTRY_HEADER_RE.finditer(text)}
 
 
-def _atomic_write(path: Path, text: str) -> None:
-    """Write `text` to `path` via a same-dir temp file + os.replace, so a
-    SIGKILL mid-write never leaves the hot notes half-truncated."""
-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".notes-", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(text)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, path)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
-
-
 def _maybe_rotate_notes(
     *,
     memory_path: Path,
@@ -358,7 +399,7 @@ def _maybe_rotate_notes(
     own errors (the summary append already succeeded and is durable)."""
     if max_entries <= 0 or object_store_path is None:
         return
-    notes = memory_path / "facts" / f"agent-{agent_id}-notes.md"
+    notes = memory_path / agent_notes_rel_path(agent_id)
     try:
         if not notes.exists():
             return
@@ -393,7 +434,7 @@ def _maybe_rotate_notes(
         # wakeup id — never loses an entry.
         archive_dir = object_store_path / "notes_archive"
         archive_dir.mkdir(parents=True, exist_ok=True)
-        archive_file = archive_dir / f"agent-{agent_id}.md"
+        archive_file = archive_dir / f"agent-{flat_id(agent_id)}.md"
         seen = _archived_wakeup_ids(archive_file)
         to_archive = [
             blk for (wid, blk) in reversed(overflow) if wid and wid not in seen
@@ -409,10 +450,10 @@ def _maybe_rotate_notes(
         # archive where the older ones now live.
         pointer = (
             f"\n> _Earlier auto-summaries archived to "
-            f"`notes_archive/agent-{agent_id}.md`._\n"
+            f"`notes_archive/agent-{flat_id(agent_id)}.md`._\n"
         )
         kept_text = "".join(blk for _, blk in keep)
-        _atomic_write(notes, prefix + leading + kept_text + pointer)
+        atomic_write_text(notes, prefix + leading + kept_text + pointer)
         log.info(
             "notes_rotated",
             agent_id=agent_id,
