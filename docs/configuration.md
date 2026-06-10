@@ -60,6 +60,31 @@ auth_env = "ANTHROPIC_API_KEY"
 > Known risk (accepted, single-owner model): the injected key is readable by the
 > worker subprocess. True isolation is deferred to sandbox hardening.
 
+### Logging
+
+Long-lived processes (`lyre serve`, `lyre dashboard`, and every
+`lyre run-task` wakeup subprocess) write structured logs to a shared
+JSONL file in addition to the console — one structlog event per line,
+so incidents are a `grep`/`jq` away. Only the serve/dashboard process
+rotates the file; subprocesses follow rotation. One-shot CLI commands
+(`audit`, `tail`, …) stay console-only.
+
+| Variable | What it controls | Default |
+|---|---|---|
+| `LYRE_LOG_LEVEL` | Level for both sinks (`DEBUG`/`INFO`/`WARNING`/`ERROR`) | `INFO` |
+| `LYRE_LOG_TO_FILE` | `0`/`false` disables the file sink (console only) | `1` |
+| `LYRE_LOG_DIR` | Directory for `lyre.jsonl` + rotated backups | `~/.lyre/logs/` |
+| `LYRE_LOG_MAX_BYTES` | Rotation threshold per file | `10485760` (10 MB) |
+| `LYRE_LOG_BACKUPS` | Rotated files kept (`lyre.jsonl.1` … `.N`) | `5` |
+
+The same knobs live under `[logging]` in `config.toml`
+(`level` / `to_file` / `dir` / `max_bytes` / `backup_count`); env wins.
+
+```bash
+jq 'select(.level == "warning")' ~/.lyre/logs/lyre.jsonl   # all warnings
+jq 'select(.event == "tool_args_truncated")' ~/.lyre/logs/lyre.jsonl
+```
+
 ### Storage paths
 
 | Variable | What it controls | Default |

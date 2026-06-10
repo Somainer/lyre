@@ -29,13 +29,33 @@ log = structlog.get_logger()
 
 
 def _setup_logging() -> None:
-    structlog.configure(
-        processors=[
-            structlog.processors.TimeStamper(fmt="iso"),
-            structlog.processors.add_log_level,
-            structlog.dev.ConsoleRenderer(colors=sys.stderr.isatty()),
-        ]
+    """Console-only baseline for every CLI command — runs in the group
+    callback BEFORE Config is loaded, so it can't know the log dir yet.
+    Long-lived entry points (serve / dashboard / run-task) upgrade to
+    file logging via _configure_process_logging once Config is in hand;
+    one-shot commands (audit, tail, …) stay console-only."""
+    from .logging_setup import configure_logging
+
+    configure_logging(log_dir=None)
+
+
+def _configure_process_logging(cfg: Config, *, rotate: bool) -> None:
+    """File + console logging for a long-lived process. ``rotate=False``
+    for wakeup subprocesses — only the serve/dashboard process may
+    rotate the shared file (see logging_setup module docstring)."""
+    from .logging_setup import configure_logging
+
+    path = configure_logging(
+        level=cfg.log_level,
+        log_dir=cfg.log_dir if cfg.log_to_file else None,
+        max_bytes=cfg.log_max_bytes,
+        backup_count=cfg.log_backup_count,
+        rotate=rotate,
     )
+    if path is not None and rotate:
+        # Only the rotating owner announces — one line per serve start,
+        # not one per wakeup subprocess.
+        click.echo(f"logging to {path} (level={cfg.log_level})", err=True)
 
 
 @click.group()
@@ -134,6 +154,7 @@ def serve_cmd(
         from .runtime.model_registry import load_registry_for_config
 
         cfg = Config.from_env()
+        _configure_process_logging(cfg, rotate=True)
         # Each model entry has its own auth config — either an `auth_env`
         # holding an API key, custom HTTP headers (proxy / gateway mode),
         # or both stacked. Validate that at least one enabled entry can
@@ -582,6 +603,9 @@ def run_task_cmd(task_id: str) -> None:
 
     async def _run() -> None:
         cfg = Config.from_env()
+        # rotate=False: this subprocess appends to the shared log file
+        # but must never rotate it — that's the serve process's job.
+        _configure_process_logging(cfg, rotate=False)
         conn = await init_db(cfg.db_path)
         try:
             repos = SqliteRepositories(
@@ -637,6 +661,7 @@ def dashboard_cmd(host: str, port: int) -> None:
         from .runtime.model_registry import load_registry_for_config
 
         cfg = Config.from_env()
+        _configure_process_logging(cfg, rotate=True)
         registry = load_registry_for_config(cfg)
         ctx_windows = {
             e.id: e.context_window
