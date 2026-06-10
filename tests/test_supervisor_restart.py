@@ -277,3 +277,47 @@ async def test_wakeup_paced_failures_hit_the_cumulative_cap(
     # The windowed count meanwhile reset every time — proving the window
     # alone would never have escalated this loop.
     assert st.restart_count == 1
+
+
+@pytest.mark.asyncio
+async def test_healthy_permanent_restarts_do_not_charge_the_lifetime_total(
+    repos: SqliteRepositories,
+) -> None:
+    """A permanent-policy worker completing on schedule is healthy by
+    design — storm-halting it at its 11th success would punish correctness.
+    count_total=False records the restart in the window without charging
+    the lifetime total; failures still count."""
+    await repos.agents.create("eph-2", "reviewer", parent_agent_id="owner")
+    base = datetime(2026, 6, 10, 12, 0, 0, tzinfo=UTC)
+    for i in range(15):
+        within = await repos.supervision.bump_and_check_intensity(
+            "eph-2", 3, 60, base + timedelta(minutes=5 * i),
+            reason="completed", max_total=None, count_total=False,
+        )
+        assert within
+    st = await repos.supervision.get("eph-2")
+    assert st is not None and st.total_restart_count == 0
+
+    # Failures still charge the total as usual.
+    within = await repos.supervision.bump_and_check_intensity(
+        "eph-2", 3, 60, base + timedelta(minutes=90),
+        reason="failed", max_total=10,
+    )
+    assert within
+    st = await repos.supervision.get("eph-2")
+    assert st is not None and st.total_restart_count == 1
+
+
+def test_sup_max_total_parses_defensively() -> None:
+    """supervision metadata is model-supplied; a smuggled null/garbage
+    max_restarts_total must fall back to the default instead of crashing
+    Phase 0.8 (which would starve all dispatch every tick). 0 disables,
+    consistent with the H2 gate's convention."""
+    from lyre.scheduler.scheduler import _sup_max_total
+
+    assert _sup_max_total({}) == 10
+    assert _sup_max_total({"max_restarts_total": 5}) == 5
+    assert _sup_max_total({"max_restarts_total": None}) == 10
+    assert _sup_max_total({"max_restarts_total": "garbage"}) == 10
+    assert _sup_max_total({"max_restarts_total": 0}) is None
+    assert _sup_max_total({"max_restarts_total": -3}) is None

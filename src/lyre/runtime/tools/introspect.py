@@ -509,7 +509,7 @@ async def _create_agent(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any
             raise ToolError(
                 "supervision.restart must be temporary / transient / permanent"
             )
-        for k in ("max_restarts", "max_seconds"):
+        for k in ("max_restarts", "max_seconds", "max_restarts_total"):
             v = supervision.get(k)
             if v is not None and (not isinstance(v, int) or v < 0):
                 raise ToolError(f"supervision.{k} must be a non-negative integer")

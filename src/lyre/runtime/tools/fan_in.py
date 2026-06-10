@@ -143,7 +143,23 @@ async def _fan_in_cancel(ctx: ToolContext, args: dict[str, Any]) -> dict[str, An
     # Guard on 'open' so a cancel races cleanly against a concurrent resolve:
     # whoever wins, the group lands in exactly one terminal state.
     cancelled = await ctx.repos.fan_in.set_status(group_id, "cancelled", guard="open")
-    return {"group_id": group_id, "cancelled": cancelled, "status": g.status}
+    stopped: list[str] = []
+    if cancelled:
+        # "Stand down" must be true, not aspirational: flag B2 cancel on
+        # every in-flight leg task so workers stop at the next tool
+        # boundary instead of finishing work whose submission will be
+        # rejected (and would otherwise burn their restart budget).
+        for member in await ctx.repos.fan_in.members(group_id):
+            if member.child_task_id and await ctx.repos.tasks.request_cancel(
+                member.child_task_id, reason=f"fan-in group {group_id} cancelled"
+            ):
+                stopped.append(member.child_task_id)
+    return {
+        "group_id": group_id,
+        "cancelled": cancelled,
+        "status": g.status,
+        "legs_stopped": stopped,
+    }
 
 
 FAN_IN_OPEN = Tool(
@@ -236,8 +252,10 @@ FAN_IN_RESULTS = Tool(
 FAN_IN_CANCEL = Tool(
     name="fan_in_cancel",
     description=(
-        "Abandon an open fan-in group (e.g. you decided not to wait). Late "
-        "result-mails then just sit in your inbox as ordinary low-urgency mail."
+        "Abandon an open fan-in group (e.g. you decided not to wait). "
+        "In-flight legs get a cancel flag and stop at their next tool "
+        "boundary; submissions after the cancel are rejected, and a leg "
+        "finishing without a result is NOT penalized for it."
     ),
     input_schema={
         "type": "object",

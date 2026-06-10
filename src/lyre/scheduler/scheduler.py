@@ -158,13 +158,16 @@ def _iso_ms(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%S") + f".{dt.microsecond // 1000:03d}Z"
 
 
-# H2 work floor: below BOTH thresholds a round counts as a waiting heartbeat
-# (wake, peek at the inbox, sleep — typically 1-2 tool calls and a short
-# text), not a thrashing round. Above either, the round burned real model
-# work and "no outward output" becomes meaningful. Module constants rather
-# than config knobs on purpose: the per-loop API surface is max_no_progress;
-# the floor is a heuristic internal that should stay uniform system-wide.
-_H2_WORK_FLOOR_TOOL_CALLS = 3
+# H2 work floor: below BOTH thresholds a round counts as a waiting heartbeat,
+# not a thrashing round. Above either, the round burned real model work and
+# "no outward output" becomes meaningful. The tool floor is sized against the
+# hygiene routine the identity preamble itself MANDATES every wake (read
+# scratchpad + mailbox_read + mailbox_get_message + update_scratchpad ≈ 4
+# bookkeeping calls; tool_call_count cannot distinguish bookkeeping from
+# action) — a dutiful waiter must sit under the floor with margin. Module
+# constants rather than config knobs on purpose: the per-loop API surface is
+# max_no_progress; the floor is a heuristic internal kept uniform system-wide.
+_H2_WORK_FLOOR_TOOL_CALLS = 6
 _H2_WORK_FLOOR_OUTPUT_TOKENS = 1500
 
 
@@ -172,6 +175,20 @@ class _LeaseUnclaimed(Exception):
     """Internal control-flow sentinel: lost the lease race inside the
     wakeup-start transaction. Raising rolls the freshly-INSERTed wakeup
     row back out so losing the race leaves no trace at all."""
+
+
+def _sup_max_total(sup: dict[str, Any]) -> int | None:
+    """Lifetime restart cap from supervision metadata, parsed defensively —
+    the dict is model-supplied and unvalidated for unknown keys, and a bare
+    int(None) here would crash Phase 0.8 every tick, starving all dispatch.
+    0 or negative = cap off (consistent with the H2 gate's 0-disables
+    convention); garbage = the default."""
+    raw = sup.get("max_restarts_total", 10)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = 10
+    return value if value > 0 else None
 
 
 def _should_restart(policy: str, outcome: str) -> bool:
@@ -839,12 +856,17 @@ class Scheduler:
                 # retry) always outlive the sliding window, so the window
                 # alone never escalates them. Default 10 ≈ generous for a
                 # legitimately flaky leg, finite for a structural failure.
-                max_t = int(sup.get("max_restarts_total", 10))
+                # Charged for ABNORMAL outcomes only — a permanent-policy
+                # worker completing on schedule is healthy by design and must
+                # not be storm-halted at its 11th success (the window still
+                # bounds rapid loops of any outcome).
+                abnormal = outcome == "failed"
                 restarted = False
                 async with self.repos.transaction():
                     within = await self.repos.supervision.bump_and_check_intensity(
                         agent.id, max_r, max_s, now, reason=outcome,
-                        max_total=max_t,
+                        max_total=_sup_max_total(sup) if abnormal else None,
+                        count_total=abnormal,
                     )
                     if within:
                         await self.repos.tasks.create(
@@ -916,7 +938,7 @@ class Scheduler:
             int(sup.get("max_seconds", 60)),
             now,
             reason="lease_expired",
-            max_total=int(sup.get("max_restarts_total", 10)),
+            max_total=_sup_max_total(sup),
         )
         if within:
             return False
@@ -1099,13 +1121,24 @@ class Scheduler:
         ):
             return True
         grp = await self.repos.fan_in.get(group_id)
-        if grp is not None:
-            delivered = await self.repos.mailbox.read_fan_in_results(
-                grp.coordinator_agent_id, group_id
-            )
-            if any(r.leg_key == leg_key for r in delivered):
-                return True
-        return False
+        if grp is None:
+            # Group row pruned (retention) — the contract it expressed is
+            # gone; a downgrade would punish the leg for outliving cleanup.
+            return None
+        if grp.status == "cancelled":
+            # The coordinator told the legs to stand down; finishing without
+            # a result IS the requested behavior, not a broken contract.
+            return None
+        coord = await self.repos.agents.get(grp.coordinator_agent_id)
+        if coord is None or coord.status == "archived":
+            # Nobody is listening — submission was impossible through no
+            # fault of the leg. Void the contract instead of burning
+            # restarts on an undeliverable result.
+            return None
+        delivered = await self.repos.mailbox.read_fan_in_results(
+            grp.coordinator_agent_id, group_id
+        )
+        return any(r.leg_key == leg_key for r in delivered)
 
     async def _emit_task_terminated_mail(
         self,
@@ -1323,6 +1356,26 @@ class Scheduler:
                     recipient, external_id,
                 )
                 delivered_msg_id = existing_id or 0
+                if np_final:
+                    # The H2 decision re-evaluates live tables, so THIS
+                    # attempt may be final while the already-delivered
+                    # (deduped) message carried no banner — the loop would
+                    # die silently and the agent would never see "this is
+                    # your LAST wake". Deliver the banner as its own
+                    # idempotent notice instead.
+                    await self.repos.mailbox.insert_message(
+                        _Msg(
+                            recipient=recipient,
+                            external_id=f"{external_id}:final-notice",
+                            sender=sched.sender,
+                            urgency="high",
+                            title=sched.title,
+                            body=body,
+                            task_id=sched.task_id,
+                            parent_msg_id=sched.parent_msg_id,
+                            metadata=sched.metadata,
+                        )
+                    )
             else:
                 delivered_msg_id = msg_id
 
@@ -1372,9 +1425,12 @@ class Scheduler:
           wiped by the idle ones either.
 
         Crash-safety: the count rides ``mark_delivered`` (same row update as
-        the occurrence bump). A kill between mailbox insert and mark means
-        re-delivery re-evaluates the SAME window (``last_delivered_at``
-        unchanged) and recomputes the same answer — never double-counted.
+        the occurrence bump), so it is never double-counted — re-delivery
+        re-evaluates from the STORED count over the same window. The
+        DECISION, however, reads live tables and can differ across attempts
+        (signal rows may land in the gap); the delivery loop compensates by
+        inserting a supplementary final-notice mail when the capping
+        attempt's banner was deduplicated away.
         """
         cap = sched.max_no_progress or 0
         if cap <= 0:
@@ -1385,12 +1441,13 @@ class Scheduler:
         thread_id = (sched.metadata or {}).get("thread_id")
         if not isinstance(thread_id, str) or not thread_id:
             # No thread linkage → signals are unmeasurable; never guess an
-            # agent into a forced stop. (mailbox_send mints thread ids for
-            # recurring self-mail, so this is a legacy/edge shape.)
+            # agent into a forced stop. mailbox_send now mints a thread for
+            # any recurring send that lacks one, so only pre-existing rows
+            # land here.
             return (sched.no_progress_count, False)
 
         since = _iso_ms(sched.last_delivered_at)
-        progressed = await self.repos.mailbox.thread_has_nonself_message_since(
+        progressed = await self.repos.mailbox.loop_progress_mail_since(
             thread_id, since, sched.recipient
         ) or await self.repos.tasks.thread_activity_since(thread_id, since)
         if progressed:

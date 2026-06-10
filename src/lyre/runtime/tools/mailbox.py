@@ -30,14 +30,16 @@ from . import Tool, ToolContext, ToolError
 
 async def _validate_fan_in_result(
     ctx: ToolContext, args: dict[str, Any]
-) -> dict[str, Any]:
+) -> dict[str, Any] | None:
     """Validate a fan-in result-mail BEFORE it enters the outbox (fail-closed).
 
-    Checks, in order: leg_key/result present; group exists and is open;
-    sender owns (group_id, leg_key) in the roster (lineage — stops a forged
-    or misrouted result, incl. one fabricated by the owner/CLI); result
+    Checks, in order: leg_key/result present; group exists and is not
+    cancelled (late results to a resolved group are accepted); sender owns
+    (group_id, leg_key) in the roster (lineage — stops a forged or
+    misrouted result, incl. one fabricated by the owner/CLI); result
     matches the group's result_schema. Returns the forced coordinator
-    recipient + the metadata.fan_in envelope to stamp.
+    recipient + the metadata.fan_in envelope to stamp — or None when the
+    coordinator is gone and the result should be accepted-and-discarded.
     """
     group_id = args["result_for"]
     if not isinstance(group_id, str):
@@ -67,6 +69,15 @@ async def _validate_fan_in_result(
         raise ToolError(
             f"fan-in group {group_id!r} is cancelled — result rejected"
         )
+    coord = await ctx.repos.agents.get(group.coordinator_agent_id)
+    if coord is None or coord.status == "archived":
+        # Nobody is listening: the coordinator was archived (e.g. an
+        # ephemeral that aggregated at quorum and got reaped) before this
+        # straggler finished. Accept-and-drop — raising here would error
+        # the leg every turn and burn its restart budget on a result that
+        # can never be delivered. The leg-contract check voids the O2
+        # downgrade for the same condition.
+        return None
     member = await ctx.repos.fan_in.get_member(group_id, leg_key)
     if member is None:
         raise ToolError(f"no leg_key={leg_key} in fan-in group {group_id!r}")
@@ -96,6 +107,21 @@ async def _mailbox_send(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any
     fan_in_meta: dict[str, Any] | None = None
     if args.get("result_for") is not None:
         fan_in_meta = await _validate_fan_in_result(ctx, args)
+        if fan_in_meta is None:
+            # Coordinator archived before this straggler finished. Falling
+            # through would re-discover that as "unknown recipient" and
+            # error the leg every turn — return success so the leg can
+            # close out (the leg-contract check voids the O2 downgrade for
+            # this same condition).
+            return {
+                "status": "discarded",
+                "group_id": args["result_for"],
+                "note": (
+                    "the coordinator of this fan-in group is gone "
+                    "(archived); your result was accepted and discarded. "
+                    "This leg's contract is satisfied — finish up."
+                ),
+            }
 
     raw_to = fan_in_meta["coordinator"] if fan_in_meta else args.get("to")
     body = args.get("body")
@@ -226,6 +252,18 @@ async def _mailbox_send(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any
     # ------------------------------------------------------------------
     if _has_scheduling_args(args):
         sched_meta = dict(args.get("metadata") or {})
+        if thread_id is None and "thread_id" not in sched_meta:
+            recurring = (
+                args.get("recur_every") is not None
+                or args.get("recur_cron") is not None
+            )
+            if recurring:
+                # A recurring send IS a loop; without a thread the H2
+                # no-progress gate (and T3 context / T4 budgets) would be
+                # silently blind to it. Mint one — same shape the CLI mints.
+                import uuid as _uuid
+
+                thread_id = f"thread-{_uuid.uuid4().hex[:16]}"
         if thread_id is not None and "thread_id" not in sched_meta:
             # The recurring self-mail of a loop carries its thread so each
             # re-woken iteration (and its token budget) stays on-thread.

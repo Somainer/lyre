@@ -572,13 +572,27 @@ class SqliteTaskRepository:
         """H2 progress signals ②③: any task on this thread that was created
         (a child got dispatched — an outward act), reached a terminal state,
         or had its checkpoint advanced via report_progress since ``since_iso``.
-        Deliberately NOT keyed on updated_at — lease claim/renew churn touches
-        that column every heartbeat and would mask real stalls."""
+
+        Two deliberate exclusions, both "the harness must not feed its own
+        gate": NOT keyed on updated_at (lease claim/renew churn touches it
+        every heartbeat and would mask real stalls), and Phase-0
+        auto-dispatched wake tasks don't count via created_at/completed_at —
+        the scheduler creates one PER ROUND carrying the loop's thread_id,
+        so counting them would reset the gate every round and make it
+        structurally inert in the exact recurring-self-mail shape it exists
+        for. checkpoint_updated_at stays unguarded: report_progress on an
+        auto task is still the agent recording real progress."""
         async with self.conn.execute(
             """
             SELECT 1 FROM tasks
             WHERE json_extract(metadata, '$.thread_id') = ?
-              AND (created_at > ? OR completed_at > ? OR checkpoint_updated_at > ?)
+              AND (
+                checkpoint_updated_at > ?
+                OR (
+                  json_extract(metadata, '$.auto_dispatched') IS NULL
+                  AND (created_at > ? OR completed_at > ?)
+                )
+              )
             LIMIT 1
             """,
             (thread_id, since_iso, since_iso, since_iso),
@@ -1087,7 +1101,10 @@ class SqliteWakeupRepository:
         self, thread_id: str, since_iso: str
     ) -> tuple[int, int]:
         """H2 work signal: the LARGEST single-wakeup (tool calls, output
-        tokens) among this thread's wakeups started since ``since_iso``.
+        tokens) among this thread's wakeups ENDED since ``since_iso`` —
+        metering lands only at wakeup end, so windowing on started_at let a
+        wakeup spanning the occurrence boundary contribute nothing and the
+        heaviest thrashers fail open.
         MAX, not SUM, on purpose: the criterion is "did some wakeup this
         round do substantial work" — several light waiting-style peeks must
         never sum past the floor and get a waiter killed, while a thrashing
@@ -1099,7 +1116,7 @@ class SqliteWakeupRepository:
             FROM wakeups w
             JOIN tasks t ON t.id = w.task_id
             WHERE json_extract(t.metadata, '$.thread_id') = ?
-              AND w.started_at > ?
+              AND w.ended_at > ?
             """,
             (thread_id, since_iso),
         ) as cur:
@@ -1391,23 +1408,31 @@ class SqliteMailboxRepository:
             rows = await cur.fetchall()
         return [self._row_to_msg(r) for r in rows]
 
-    async def thread_has_nonself_message_since(
+    async def loop_progress_mail_since(
         self, thread_id: str, since_iso: str, self_actor: str
     ) -> bool:
-        """H2 progress signal ①: did any mail land on this thread since
-        ``since_iso`` that is NOT the loop agent talking to itself? Both an
-        outward send (self → other) and an inbound reply (other → self)
-        mean the thread is alive; only pure self↔self traffic (the loop's
-        own scheduled wakes and self-notes) is excluded."""
+        """H2 progress signal ①: did any mail since ``since_iso`` show the
+        loop is alive? Two lenient legs: (a) non-self↔self mail ON the
+        thread (outward send or inbound reply; the loop's own scheduled
+        self-wakes are excluded); (b) ANY send by the loop agent to a
+        non-self recipient, thread or not — replies inherit the PARENT
+        mail's thread, so an inbox-servicing loop's real output would
+        otherwise be invisible to its own gate and a useful agent could be
+        falsely stopped. Lenient by design: a false PASS costs one more
+        bounded round; a false STOP kills a working loop."""
         async with self.conn.execute(
             """
             SELECT 1 FROM mailbox_messages
-            WHERE json_extract(metadata, '$.thread_id') = ?
-              AND delivered_at > ?
-              AND NOT (sender = ? AND recipient = ?)
+            WHERE delivered_at > ?
+              AND (
+                (json_extract(metadata, '$.thread_id') = ?
+                 AND NOT (sender = ? AND recipient = ?))
+                OR (sender = ? AND recipient != ?)
+              )
             LIMIT 1
             """,
-            (thread_id, since_iso, self_actor, self_actor),
+            (since_iso, thread_id, self_actor, self_actor,
+             self_actor, self_actor),
         ) as cur:
             row = await cur.fetchone()
         return row is not None
@@ -2527,11 +2552,15 @@ class SqliteSupervisionRepository:
         now: datetime,
         reason: str | None = None,
         max_total: int | None = None,
+        count_total: bool = True,
     ) -> bool:
         """Record one restart and return True iff it's within budget — at most
         ``max_restarts`` restarts within a sliding ``max_seconds`` window, AND
         (when ``max_total`` is set) at most ``max_total`` restarts over the
-        agent's lifetime. The window resets when ``max_seconds`` has elapsed
+        agent's lifetime. ``count_total=False`` records the restart in the
+        window WITHOUT charging the lifetime total — used for by-design
+        healthy restarts of ``permanent``-policy workers, which must not be
+        storm-halted for completing on schedule. The window resets when ``max_seconds`` has elapsed
         since it opened — which is exactly why the window alone cannot bound
         wakeup-paced failures (each retry takes minutes and opens a fresh
         window); the cumulative bound closes that loop. An over-count from a
@@ -2547,7 +2576,9 @@ class SqliteSupervisionRepository:
         else:
             count = state.restart_count + 1
             window_start = state.window_start_at
-        total = (state.total_restart_count if state else 0) + 1
+        total = (state.total_restart_count if state else 0) + (
+            1 if count_total else 0
+        )
         await self.conn.execute(
             """
             INSERT INTO supervision_state

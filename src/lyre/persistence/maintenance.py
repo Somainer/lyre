@@ -84,7 +84,7 @@ async def run_maintenance(
         f"""
         DELETE FROM fan_in_members WHERE group_id IN (
           SELECT id FROM fan_in_groups
-          WHERE status IN ('expired','cancelled','resolved')
+          WHERE status IN ('expired','cancelled','resolved','quorum_met')
             AND created_at < {_NOW}
         )
         """,
@@ -93,7 +93,7 @@ async def run_maintenance(
         pass
     async with conn.execute(
         f"DELETE FROM fan_in_groups "
-        f"WHERE status IN ('expired','cancelled','resolved') "
+        f"WHERE status IN ('expired','cancelled','resolved','quorum_met') "
         f"AND created_at < {_NOW}",
         (age,),
     ) as cur:
