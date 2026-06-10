@@ -3,7 +3,7 @@
 > **文档定位**：定义 agent subprocess 内部的运行时实现——LLMAdapter 抽象、provider 适配、agent loop（asyncio + streaming + mid-loop 中断）、MCP server 暴露 Lyre 工具的方式、context 装配、失败处理、计量与 transcript 写入。本文档与 AGENT_CONTRACT 的关系：AGENT_CONTRACT 定**外部接口**（输入输出 / 工具 / 持久层接触面），本文档定**内部实现机制**。
 > **相关**：[`FOUNDATION.md`](./FOUNDATION.md) 五条铁律；[`AGENT_CONTRACT.md`](./AGENT_CONTRACT.md) 接口契约；[`TRANSACTION_BOUNDARIES.md`](./TRANSACTION_BOUNDARIES.md) 事务边界；[`PERSISTENCE_SCHEMA.md`](./PERSISTENCE_SCHEMA.md) 持久层。
 >
-> **Status (2026-06-10, deep-review E1)**: split verdict — trust by section. **Current**: §1 (the `LLMAdapter` seam), §3.6–§3.8, §5.5. **Historical (v0.x plan, see the section notes)**: §2 ("唯一实现" is false — three adapters ship), §3.1–§3.5 pseudocode, §4 (MCP gateway, never built). As-built runtime: `RUNTIME_CURRENT.md` (living).
+> **Status (2026-06-10)**: split verdict — trust by section. **Current**: §1 (the `LLMAdapter` seam), §3.6–§3.8, §5.5. **Historical (v0.x plan, see the section notes)**: §2 ("唯一实现" is false — three adapters ship), §3.1–§3.5 pseudocode, §4 (MCP gateway, never built). As-built runtime: `RUNTIME_CURRENT.md` (living).
 
 ---
 

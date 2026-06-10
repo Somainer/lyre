@@ -1,4 +1,4 @@
-"""Doc-drift tripwires (2026-06 canon alignment).
+"""Doc-drift tripwires.
 
 Fully offline: no subprocess, no DB, no provider keys. Each test pins one
 high-value fact in the public docs to the code that implements it, so the

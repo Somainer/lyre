@@ -2,7 +2,7 @@
 
 > **文档定位**：Lyre 架构的稳定参照。"架构内核"小节（铁律一至五、三档持久层、三类 global 条目）为**定论**（status: settled），其它设计文档以本文为依据。
 >
-> **Status note (2026-06-10, deep-review E1)**: 架构内核的**五条铁律本身仍为定论**。但 §3.3 的 enforcement model（subprocess sandbox + Unix-socket gateway）与 §3.7 的五层架构表描述的是 v0.x 计划，不是建成的运行时——see the correction note in §3.3. For the as-built runtime read `RUNTIME_CURRENT.md` (living doc, added in this canon-alignment round).
+> **Status note (2026-06-10)**: 架构内核的**五条铁律本身仍为定论**。但 §3.3 的 enforcement model（subprocess sandbox + Unix-socket gateway）与 §3.7 的五层架构表描述的是 v0.x 计划，不是建成的运行时——see the correction note in §3.3. For the as-built runtime read `RUNTIME_CURRENT.md` (living doc).
 
 ---
 
@@ -314,13 +314,13 @@ Skills 是 know-how，需要质量把关：agent 干完任务判断"值得复用
 
 ## 7. 文档导航
 
-> 补全于 2026-06-10（deep-review E1）：列出 `docs/design/` 全部文档。状态标注：**定论** = settled canon；**部分历史** = 核心结论成立但含 v0.x 已被实现取代的章节（见各文件横幅）；**已落地** = PR-round changelog，描述已合并的实现；**living** = 持续更新；**parked** = 已拍板搁置。
+> 状态标注：**定论** = settled canon；**部分历史** = 核心结论成立但含 v0.x 已被实现取代的章节（见各文件横幅）；**已落地** = PR-round changelog，描述已合并的实现；**living** = 持续更新；**parked** = 已拍板搁置。
 
 | 文档 | 作用 |
 |---|---|
 | [`../../README.md`](../../README.md) | 项目入口 |
 | `FOUNDATION.md`（本文件） | 架构内核五铁律，**定论**（§3.3 enforcement / §3.7 分层表为 v0.x 计划，见横幅） |
-| `RUNTIME_CURRENT.md` | **living**：as-built 运行时全貌（wakeup 生命周期、真实事务模型、调度相位；E1 轮新增） |
+| `RUNTIME_CURRENT.md` | **living**：as-built 运行时全貌（wakeup 生命周期、真实事务模型、调度相位） |
 | [`AGENT_CONTRACT.md`](./AGENT_CONTRACT.md) | Agent 接口契约；**部分历史**（§4 subprocess/gateway 为 v0.x，见横幅） |
 | [`AGENT_RUNTIME.md`](./AGENT_RUNTIME.md) | Agent 运行时设计；**部分历史**（§2-§4 v0.x；§3.6-3.8 / §5.5 current，见横幅） |
 | [`TRANSACTION_BOUNDARIES.md`](./TRANSACTION_BOUNDARIES.md) | 一次唤醒的事务边界；**部分历史**（Step-9 单提交点模型已被"工具时即时持久"取代，见横幅） |

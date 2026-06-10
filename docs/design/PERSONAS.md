@@ -5,7 +5,7 @@
 > summary-agent) is the v0.x design. The shipped roster is **dispatcher (singleton) / analyst /
 > reviewer / worker-maintainer / long-runner / owner** — see `src/lyre/personas/*.md` (user SSOT
 > after onboard: `~/.lyre/personas/<name>/identity.md`). Several mechanisms below were never built
-> or were since deleted; per-section notes mark the worst drift (deep review 2026-06, finding [50]).
+> or were since deleted; per-section notes mark the worst drift.
 > For the current runtime see [`RUNTIME_CURRENT.md`](./RUNTIME_CURRENT.md); the real tool registry
 > is `build_default_registry()` in `src/lyre/runtime/tools/builtin.py`.
 
