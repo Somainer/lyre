@@ -10,24 +10,28 @@ stuck?").
 
 | Command | Purpose |
 |---|---|
-| `lyre onboard` | Interactive wizard: writes `~/.lyre/config.toml` + `.env` + `user.md`, copies shipped personas to `~/.lyre/personas/<name>/identity.md`, bootstraps DB + memory dirs + agents (`owner`, `leader`). Safe to re-run. |
-| `lyre serve [--no-dashboard] [--dashboard-port N]` | Run scheduler + outbox dispatcher (+ dashboard). The main runtime entry point. |
+| `lyre onboard` | Interactive wizard: writes `~/.lyre/config.toml` + `.env` + `user.md`, copies shipped personas to `~/.lyre/personas/<name>/identity.md`, bootstraps DB + memory dirs + seeded agents (`owner`, `dispatcher`, `analyst-1`, `reviewer-1`). Safe to re-run. |
+| `lyre serve [--poll-interval S] [--no-dashboard] [--dashboard-host H] [--dashboard-port N] [--no-subprocess]` | Run scheduler + outbox dispatcher (+ dashboard). The main runtime entry point. Each task runs in a fresh `lyre run-task` subprocess by default; `--no-subprocess` runs them inline (debugging). |
 | `lyre dashboard [--host H] [--port N]` | Run only the dashboard (no scheduler). For inspecting state without starting the runtime. |
+| `lyre maintenance [--retention-days N] [--no-vacuum]` | Prune terminal/delivered DB rows past the retention window, checkpoint the WAL, VACUUM. The scheduler also runs this automatically (without VACUUM) when `retention_days > 0`. |
+| `lyre persona-refresh <name>` / `lyre persona-refresh --all [--no-backup]` | Re-copy a shipped persona over `~/.lyre/personas/<name>/identity.md` (onboard never overwrites it). Backs up the current identity.md first unless `--no-backup`. |
 
 ### Sending and reading mail
 
 | Command | Purpose |
 |---|---|
-| `lyre send <agent_id> "<body>" [--title T] [--urgency normal\|high\|blocker\|low] [--reply-to N]` | Send a mail. Always from `owner`. |
-| `lyre mailbox <agent_id> [--unread-only] [--since N]` | List mail in an agent's inbox. |
+| `lyre send <agent_id> "<body>" [--title T] [--urgency blocker\|high\|normal\|low] [--from S] [--task-id ID] [--thread-id ID] [--no-spawn]` | Send a mail. Sender defaults to `owner` (`--from` overrides). Unknown `persona/name` recipients are auto-created unless `--no-spawn`. |
+| `lyre send ... [--at <ISO8601>] [--in 2h] [--recur-every 1d] [--recur-cron "0 9 * * 1-5"] [--until <ISO8601>]` | Future / recurring mail: schedule the delivery instead of sending now (`--at` absolute, `--in` relative; `--recur-every` and `--recur-cron` are mutually exclusive). |
+| `lyre mailbox [agent_id] [--unread-only] [--since N]` | List mail in an agent's inbox (defaults to `owner`). `--since` is a message-id watermark (only `id > N`), not a time. |
 
 ### Agent management
 
 | Command | Purpose |
 |---|---|
-| `lyre agent list [--include-archived]` | List agent instances (NOT personas). |
-| `lyre agent create <persona> [--name N] [--model M] [--description D]` | Create a new agent instance of a persona. |
-| `lyre agent archive <agent_id>` | Soft-delete an agent (bootstrap agents `owner` / `leader` can't be archived). |
+| `lyre agent list [--all]` | List agent instances (NOT personas). `--all` includes archived ones. |
+| `lyre agent create <persona> [--name N] [--model M] [--description D]` | Create a new agent instance of a persona (`--name` sets the full agent id; omitted → auto `<persona>/<n>`). |
+| `lyre agent archive <agent_id>` | Soft-archive **any** agent; in-flight tasks finish. (Only the agent-facing `archive_agent` tool refuses seeded agents.) If you archive a singleton like `dispatcher`, restarting `lyre serve` re-seeds it. |
+| `lyre agent unarchive <agent_id>` | Bring an archived agent back to `idle`. Mail history is preserved; idempotent. |
 
 ### Inspection (the debug entry points)
 
@@ -35,15 +39,16 @@ stuck?").
 |---|---|
 | `lyre wakeups list [--limit N] [--persona P] [--status S] [--since 1h] [--has-compaction] [--summary-degraded] [--json]` | List recent wakeups with status, tokens, context-usage %, compaction count, and degraded-compaction count. The first thing you run when something feels off. `--summary-degraded` filters to wakeups where a compaction's work-summary LLM call failed (lossy compaction). |
 | `lyre tasks list [--limit N] [--persona P] [--agent A] [--status S] [--since 1h] [--json]` | List recent tasks with status and goal preview. |
+| `lyre tasks cancel <task_id> [--reason R]` | Cooperative cancel of a running / pending task. The wakeup observes it at its next turn boundary and stops with status `cancelled`. Cancels the TASK, not the agent. |
 | `lyre status <task_id>` | Single-task detail: checkpoint, all wakeups for it, latest transcript. |
 | `lyre audit <wakeup_id_prefix> [--system/--no-system] [--full-result] [--json]` | Pretty-print a wakeup's transcript. `--latest [--persona P]` for the most recent. `--json` for raw JSONL. |
-| `lyre tail [--persona P] [--active-only] [--json]` | Live `tail -f`–style stream of an active wakeup's transcript. |
+| `lyre tail [--persona P] [--active-only/--include-completed] [--poll S] [--no-follow] [--json]` | Live `tail -f`–style stream of an active wakeup's transcript. Follows subsequent wakeups by default (`--no-follow` to stop at the first ended one). |
 
 ### Future mail
 
 | Command | Purpose |
 |---|---|
-| `lyre mail list-scheduled [--recipient R] [--sender S] [--status S]` | List pending scheduled mail. |
+| `lyre mail list-scheduled [--recipient R] [--sender S] [--status pending\|completed\|cancelled\|bounced\|all] [--limit N]` | List scheduled mail entries. |
 | `lyre mail cancel <id> [--reason R]` | Cancel a pending scheduled mail (stops recurring schedules too). |
 
 ### Models
@@ -56,8 +61,8 @@ stuck?").
 
 | Command | Purpose |
 |---|---|
-| `lyre dispatch <persona> <goal> <acceptance>` | Directly enqueue a task. You usually don't need this — leader does it via `dispatch_task`. |
-| `lyre run-task <task_id>` | (Hidden) Subprocess mode for one specific task. Used internally when `lyre serve --subprocess` is enabled. |
+| `lyre dispatch <persona> <goal> [--acceptance A]` | Directly enqueue a task. You usually don't need this — the dispatcher does it via `dispatch_task`. |
+| `lyre run-task <task_id>` | (Hidden) Run one task to completion in this process. Spawned per task by `lyre serve` (subprocess mode is the default). |
 
 ## Output formats
 
@@ -66,15 +71,15 @@ table; `--json` emits JSON Lines (one record per line) for piping to
 `jq`.
 
 ```bash
-# Latest 10 leader wakeups, just the IDs
-lyre wakeups list --persona leader --limit 10 --json | jq -r '.id'
+# Latest 10 dispatcher wakeups, just the IDs
+lyre wakeups list --persona dispatcher --limit 10 --json | jq -r '.id'
 
 # Find all wakeups that compacted (had to summarize mid-flight)
 lyre wakeups list --has-compaction --since 24h --json | \
   jq -r '"\(.id) compacted ×\(.compaction_count) (peak \(.context_peak_pct)%)"'
 
-# All tool calls from the most recent leader wakeup
-lyre audit --latest --persona leader --json | \
+# All tool calls from the most recent dispatcher wakeup
+lyre audit --latest --persona dispatcher --json | \
   jq -r 'select(.type=="tool_use") | "\(.name)(\(.input|tostring|.[:80]))"'
 
 # Extract just the model's reasoning from a wakeup
@@ -111,12 +116,20 @@ lyre audit --latest --persona <agent>
 # In-progress tasks (running RIGHT NOW)
 lyre tasks list --status in_progress
 
-# Tasks waiting for subagents
-lyre tasks list --status needs_input --since 24h
+# Pending backlog (queued, not yet claimed)
+lyre tasks list --status pending --since 24h
 
 # Active wakeups (still streaming)
 sqlite3 ~/.lyre/lyre.db "SELECT id, persona_name, started_at FROM wakeups WHERE ended_at IS NULL;"
+
+# Genuinely wedged? Cancel the task cooperatively (agent stays alive)
+lyre tasks cancel <task_id> --reason "stuck, will re-dispatch"
 ```
+
+(There is no "waiting for subagents" status to query: delegation is
+mail-driven — a delegating agent's task completes when it stops calling
+tools, and the reply mail wakes it later. `needs_input` exists in the
+schema but nothing sets it today.)
 
 ### "Did the model hit context limit?"
 
@@ -197,8 +210,8 @@ sqlite3 ~/.lyre/lyre.db "
 "
 ```
 
-The full schema is documented in `PERSISTENCE_SCHEMA.md` at the repo
-root. Schema version is tracked in the `schema_migrations` table.
+The full schema is documented in `docs/design/PERSISTENCE_SCHEMA.md`.
+Schema version is tracked in the `schema_migrations` table.
 
 ## Environment cheatsheet
 

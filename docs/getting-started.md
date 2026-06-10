@@ -34,10 +34,11 @@ Then it writes:
 - `~/.lyre/personas/<name>/identity.md` — shipped personas copied here as the SSOT (edit / rename / delete freely)
 - `~/.lyre/lyre.db` — SQLite for tasks / wakeups / mailbox
 - `~/.lyre/memory/` — markdown filesystem the agents write to
-- `~/.lyre/memory/facts/agent-owner-notes.md` + `agent-leader-notes.md`
-  — per-agent notebook files
-- Two seeded agents: `owner` (you, addressable but not LLM-driven) and
-  `leader` (the dispatcher persona)
+- `~/.lyre/memory/facts/agent-<id>-notes.md` — one per-agent notebook
+  file for each seeded agent (e.g. `agent-dispatcher-notes.md`)
+- Seeded agents: `owner` (you, addressable but not LLM-driven),
+  `dispatcher` (the orchestrator), plus one starter `analyst-1` and
+  `reviewer-1`
 
 Re-running `lyre onboard` is safe — each overwrite is gated by a
 confirmation prompt. For scripted / headless setup, hand-edit
@@ -63,14 +64,14 @@ Leave this running in a terminal. Press `Ctrl+C` to stop.
 In another terminal:
 
 ```bash
-uv run lyre send leader "Hi leader, please reply with 'pong' and tell me what model you're running on."
+uv run lyre send dispatcher "Hi dispatcher, please reply with 'pong' and tell me what model you're running on."
 ```
 
 Within a few seconds you'll see in the original terminal:
 
-- The scheduler dispatching a "check inbox" task to `leader`
+- The scheduler dispatching a "check inbox" task to `dispatcher`
 - An LLM call going out, streaming back
-- `leader` calling `mailbox_send` to reply to you
+- `dispatcher` calling `mailbox_send` to reply to you
 
 Then check what came back:
 
@@ -78,7 +79,7 @@ Then check what came back:
 uv run lyre mailbox owner --unread-only
 ```
 
-You should see `leader`'s reply.
+You should see `dispatcher`'s reply.
 
 ## 5. See it in the dashboard
 
@@ -87,19 +88,19 @@ Open <http://127.0.0.1:8765> in a browser. You'll see:
 - The **Activity** tab — a chat-bubble timeline of everything that just
   happened, including the model's thinking (rendered with a brain badge),
   every tool call, and the mail it sent
-- The **Agents** tab — drill into `leader` to see its full transcript
-- The **Inbox** tab — your own mailbox
+- The **Agents** tab — drill into `dispatcher` to see its full transcript
+- The **Mail** tab — mailbox traffic, including your own inbox
 
 ## What just happened
 
 A lot, actually. Walking through one cycle:
 
-1. `lyre send leader "..."` wrote a row to the `mailbox_messages` table
-   (recipient=`leader`).
-2. The scheduler's Phase 0 noticed `leader` had unread mail and no
+1. `lyre send dispatcher "..."` wrote a row to the `mailbox_messages` table
+   (recipient=`dispatcher`).
+2. The scheduler's Phase 0 noticed `dispatcher` had unread mail and no
    in-flight task, so it auto-created a task with goal *"Check your
    inbox..."* and dispatched it.
-3. The agent loop started a new wakeup, loaded `leader`'s persona prompt
+3. The agent loop started a new wakeup, loaded `dispatcher`'s persona prompt
    plus identity preamble, included the task goal as the initial user
    message, and called the LLM with the registered tools.
 4. The model called `mailbox_read()` (which auto-marked the message as
@@ -114,7 +115,7 @@ A lot, actually. Walking through one cycle:
 You can see the full trace via:
 
 ```bash
-uv run lyre audit --latest --persona leader
+uv run lyre audit --latest --persona dispatcher
 ```
 
 ## Next steps
@@ -122,6 +123,6 @@ uv run lyre audit --latest --persona leader
 - Read [concepts.md](./concepts.md) to understand the runtime's mental
   model — agents vs. personas, what a wakeup is, why mailbox-only.
 - Read [writing-personas.md](./writing-personas.md) to add your own
-  agent types beyond `leader` + the bundled workers.
+  agent types beyond `dispatcher` + the bundled workers.
 - Read [cli-reference.md](./cli-reference.md) for the full command
   reference and debug recipes.

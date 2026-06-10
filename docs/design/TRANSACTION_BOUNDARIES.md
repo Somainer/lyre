@@ -2,6 +2,8 @@
 
 > **文档定位**：定义"一次 agent 唤醒"从读持久层到写回的精确事务边界，确保拔线测试通过。
 > **相关**：[`FOUNDATION.md §4`](./FOUNDATION.md#4-工程后果拔线测试的三条硬约束) 拔线测试的三条硬约束；[`AGENT_CONTRACT.md`](./AGENT_CONTRACT.md) 接口契约。
+>
+> **Implementation correction (2026-06-10)**: the buffered-send / single Step-9 commit-point model in this doc is **historical**. As built, every effectful tool call commits durably **at tool time**: `mailbox_send` enqueues outbox rows immediately (`src/lyre/runtime/tools/mailbox.py`, external_id = `{wakeup_id}:{tool_use_id}:{recipient}`); `read_at` is written immediately (§6.2 already reflects this); `report_progress` checkpoints immediately. Recovery = per-write durability + idempotent `external_id` dedup + one **fenced end-of-wakeup finalize** transaction (wakeups.end + task status fenced on the holder wakeup + `task_terminated` outbox row). Consequence: a mid-wakeup kill does **not** mean "本次唤醒等于没发生" — already-sent mail stands and gets dispatched, and a lease-expiry re-run re-sends with fresh wakeup-scoped external_ids: **at-least-once** mail semantics, accepted. §2's 关键定理, the §3 kill-point tables ("Mailbox | 未发") and §6.1 are wrong on these points. Also historical: Postgres (SQLite shipped), fork-subprocess / tmpdir / ssh-agent (see FOUNDATION.md §3.3 note). As-built model: `RUNTIME_CURRENT.md`.
 
 ---
 
@@ -83,6 +85,8 @@
 >
 > Step 9 完成后：所有"已 commit 的工作"持久；Step 10 由独立 dispatcher 承担，dispatcher 死亡可重启续做。
 
+> ⚠️ **Correction (2026-06-10)**: superseded — mail / read-state / checkpoint commit mid-wakeup at tool time; Step 9 survives only as the fenced status-finalize transaction. See the banner at the top.
+
 **一个重要变化**（相对 v0.1）：v0.2 起 Agent 通过 subprocess 内 shell 直接做 git push / open PR 等 Tier 1 操作，**这些操作的"外部副作用已在远端当场发生"**（不像 v0.1 那样进 outbox 等异步投递）。Lyre 通过 agent 调 `report_side_effect` 自报的方式知晓这些副作用，并在 COMMIT POINT 把"派生通知"写进 outbox 等待 dispatcher 投递给 owner。详见 §3 kill 点 4 与 §4。
 
 ---
@@ -113,6 +117,8 @@
 | Mailbox（接收方）| 未发（outbox buffer 在 agent 内存，未提交）|
 | Git 远端 | 无任何 push |
 
+> ⚠️ **Correction (2026-06-10)**: the Mailbox row is wrong as built — any `mailbox_send` already made by this point is durably committed to outbox and WILL be delivered; the re-run may re-send (at-least-once). See top banner.
+
 **重启行为**：新 agent 接 lease；**tmpdir 不继承**——旧 tmpdir 已被 rm -rf；新 subprocess 启动 + 新 tmpdir + 重新 git clone；本地 worktree 修改 / 本地 commit 全部消失（因为它们只在销毁的 tmpdir 里）；从 checkpoint 重做这次任务的"这一步"。
 
 > ⚠️ 关键约定：**tmpdir 与 subprocess in-memory 状态都不是持久状态**。Agent 不能假设本地 worktree、本地 commit、临时文件在重启后保留。需要保留的中间产物必须 `report_progress` 写到 checkpoint，由 Step 9 持久化。
@@ -127,6 +133,8 @@
 | Tmpdir / subprocess | 编辑完成、本地 commit 完成，**可能已 git push 远端 + 已开 PR**（Tier 1 操作发生在 subprocess 内）|
 | Mailbox（接收方）| 未发 |
 | Git 远端 | **可能已有 push 的分支 + 已开的 PR**（如果 agent 在 kill 前完成了 push / open_pr 操作但还没到 Step 9） |
+
+> ⚠️ **Correction (2026-06-10)**: the Mailbox row is wrong as built — mail sent before the kill is already durable in outbox and WILL be delivered; the re-run may re-send (at-least-once). See top banner.
 
 **这是 v0.2 起引入的复杂情形**——v0.1 假设所有副作用都过 Lyre 工具 outbox，因此可以"全部回滚"。v0.2 起 agent 通过 subprocess 内 shell 直接做 git push / open PR，**这些副作用已经留在 git hosting 上无法回滚**。
 

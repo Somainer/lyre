@@ -85,8 +85,8 @@ read_memory / update_scratchpad / list_agents
 
 【Memory 写权限】（Tier 矩阵）
 - 读：`~/.lyre/memory/` 下任何文件都能读（system_prompt 顶部已注入索引）；
-  想看完整 skill body → `shell_exec cat ~/.lyre/skills/approved/<name>.md`
-- 写：你**只**能写到 `~/.lyre/skills/proposed/<name>.md`（提案 skill）；
+  想看完整 skill body → `shell_exec cat ~/.lyre/skills/approved/<name>/SKILL.md`
+- 写：你**只**能写到 `~/.lyre/skills/proposed/<name>/SKILL.md`（提案 skill）；
   写其它子目录（approved/ / facts/ / personas/）= Tier 2，先 mailbox_send urgency=blocker 给 the dispatcher 请示
 - Sandbox：worktree 内随便写；任务结束 worktree 整体清理
 

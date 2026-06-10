@@ -2,6 +2,11 @@
 
 > **文档定位**：定义 `Agent` 接口的字段、生命周期、约束。Lyre 中**所有** agent（不论扮演 leader / worker / reviewer 等任何角色）共用此契约——角色由 persona 决定，机制不预设角色差异。任何 agent 后端（自写 agentic loop、第三方 coding agent、开源模型等）接入 Lyre 都须满足此契约。
 > **相关**：[`FOUNDATION.md`](./FOUNDATION.md) 五条铁律；[`TRANSACTION_BOUNDARIES.md`](./TRANSACTION_BOUNDARIES.md) 事务边界。
+>
+> **Implementation correction (2026-06-10)**: §2 (steps 1/7/9/11) and §4.1–§4.5 / §4.8 describe the v0.x plan — fork-subprocess sandbox, Unix-socket gateway, Tier-matrix enforcement — which was **not built**. As built: tools dispatch **in-process** in the wakeup loop (`agent_loop._dispatch_tool`); `src/lyre/mcp_server/` is an empty stub; `allowed_lyre_tools` is enforced when building the LLM tool list (`ToolRegistry.specs_for` in `agent_loop`) and again at dispatch (`_dispatch_tool` allowlist check); containment = the shell/python env allowlist (strips `ANTHROPIC_*` / `LYRE_*`, **deliberately forwards `GH_TOKEN` / `GITHUB_TOKEN`** — §4.1's claim that GH_TOKEN is scrubbed is wrong) + single-owner trust (`CAPABILITY_DISCOVERY.md` §3). The per-task tmpdir and ephemeral SSH key DO exist (`runtime/worktree.py` scratch dir under `object_store/worktrees/{task_id}/`; `git_context` provisions a per-task key + ssh-agent for git ops) — but only as working artifacts, **not** as the containment boundary §4.1 describes: no env-scoped fork sandbox, no cwd jail. Tier enforcement (§4.8) never went beyond `report_side_effect` self-reporting. Drift of the §4.4 tool table vs the real registry (`src/lyre/runtime/tools/builtin.py`, 25 tools):
+> - **Never built**: `load_skill` / `propose_skill` / `approve_skill` / `propose_persona` / `approve_persona` / `request_review` / `mark_pr_reviewed` / `query_local_hot_summary` (referenced in §2 / §3.5 / §4.6 here and in AGENT_RUNTIME §4 / PERSONAS.md). Skill bodies are read via `read_memory`; skill governance is plain file moves under `~/.lyre/skills/`.
+> - **Registered but missing from the table**: `mailbox_react`, `fan_in_open` / `fan_in_status` / `fan_in_results` / `fan_in_cancel`.
+> - §6.2 "send 不立即投递…COMMIT POINT 时一起原子提交" is superseded — sends commit to outbox **at tool time** (see the TRANSACTION_BOUNDARIES.md banner). The §6.3 read-state semantics are current.
 
 ---
 

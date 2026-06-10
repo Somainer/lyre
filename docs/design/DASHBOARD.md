@@ -1,5 +1,18 @@
 # Lyre — Dashboard 设计
 
+> **STATUS (2026-06-10): substantially stale — for the real surface read
+> `src/lyre/dashboard/routes/` (deep review 2026-06, finding [40]).** What shipped diverges from
+> this doc on every major axis: the tab IA is Home `/` / Activity / Agents / Mail / Runs (Inbox +
+> Feed merged into `/mail`, Tasks + Wakeups merged into `/runs`); the only write endpoints are
+> `POST /send` and `POST /tasks/{id}/cancel` — `/mailbox/reply`, `/dispatch` and the `/approvals/*`
+> surface were never built (no approvals UI exists); the primary live-update mechanism is
+> `/sse/dashboard` HTML-fragment push driven by `DashboardBroadcaster`
+> (`dashboard_broadcaster.py`), with `/sse/mailbox` as a secondary stream; the CSRF token promised
+> in §3/§8 was **never implemented** (finding [38], still open); and the §7 env vars are wrong —
+> `LYRE_DASHBOARD_HOST` / `LYRE_DASHBOARD_ENABLED` do not exist, and `LYRE_DASHBOARD_PORT` is
+> parsed but never consumed (the port comes from the `--dashboard-port` / `--port` CLI flags,
+> default 8765).
+
 > **文档定位**：定义 owner 与 Lyre 交互的 web UI——FastAPI + HTMX + SSE 服务端渲染；半交互（回 blocker / 审 approvals / 派 task）。
 > **相关**：[`FOUNDATION.md §3.6`](./FOUNDATION.md#36-铁律五mailbox-是-lyre-通讯的唯一原语)（Inbox/Dashboard 是同一 mailbox 的两种视图）；[`FOUNDATION.md §3.7`](./FOUNDATION.md#37-五层架构整体分层)（第 5 层：观测）；[`AGENT_CONTRACT.md`](./AGENT_CONTRACT.md)；[`PERSISTENCE_SCHEMA.md`](./PERSISTENCE_SCHEMA.md)；[`AGENT_RUNTIME.md`](./AGENT_RUNTIME.md)；[`PERSONAS.md`](./PERSONAS.md)。
 >

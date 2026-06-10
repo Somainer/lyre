@@ -6,7 +6,7 @@
 >
 > **相关**:[`FOUNDATION.md`](./FOUNDATION.md) 铁律五(mailbox 唯一)、铁律三(kill-test);[`AGENT_RUNTIME.md`](./AGENT_RUNTIME.md) wakeup 与 context 组装;[`WORKFLOW_ORCHESTRATION.md`](./WORKFLOW_ORCHESTRATION.md) fan-in barrier / scheduled mail / PR1 park-resume(本设计复用)。
 >
-> **状态**:**设计定稿,待实现**(经 RCA `019e8d7d` 复盘 + 双 agent 评审收敛)。PR 路线见 §7。
+> **状态**:**已落地**——T1–T4 全部 shipped in PR #45(commit `d2cf778`,2026-06)。设计经 RCA `019e8d7d` 复盘 + 双 agent 评审收敛;PR 路线见 §7。
 
 ---
 

@@ -16,7 +16,7 @@ Python 3.11+ (CI runs 3.12). Managed with `uv`.
 ```bash
 uv sync --extra dev              # install with pytest/ruff/mypy
 
-uv run pytest -q                 # full suite (~15s, 350+ tests, fully offline)
+uv run pytest -q                 # full suite (~25s, ~900 tests, fully offline)
 uv run pytest tests/test_agent_loop.py::test_loop_continues_after_tool_use_with_end_turn_stop_reason
 uv run pytest -k "compact"       # filter by name
 uv run pytest --cov=lyre         # coverage
@@ -96,13 +96,22 @@ These are **settled**. PRs that violate them won't land.
   per-agent **notes** at `~/.lyre/memory/facts/agent-<id>-notes.md` (long-term,
   runtime also appends `## Auto-summary log` here), or `task.checkpoint`.
 - **Task** = a goal an agent pursues across many wakeups. States: `pending`
-  → `in_progress` → (`needs_input` while awaiting subagents) →
-  `completed`/`failed`/`cancelled`. Tasks can have `parent_task_id`, enabling
-  parent-resume when subagents terminate.
-- **Scheduler** (`src/lyre/scheduler/scheduler.py`) — three phases per tick:
-  Phase −1 delivers due `scheduled_mail`; Phase 0 auto-wakes agents with
-  unread mail; Phase 1 claims pending tasks, resumes parents, runs wakeups.
-  Single-threaded async; SQLite WAL serializes writes.
+  → `in_progress` → `completed`/`failed`/`cancelled`. (`needs_input` is a
+  reserved park/resume state — dormant today, nothing writes it.) Tasks can
+  have `parent_task_id` (lineage / fan-in bookkeeping).
+- **Scheduler** (`src/lyre/scheduler/scheduler.py`) — phase ladder per tick
+  (numbering is historical; there is no Phase 1): **−1** deliver due
+  `scheduled_mail` → **0.5** resolve fan-in barriers (incl. O1 failed-leg
+  reconciliation) → **0** auto-wake agents with unread mail → **0.7**
+  park/resume (dormant — nothing parks a task today) → **0.8** ephemeral
+  reaper/supervisor → **2** expired-lease recovery → **3** claim pending
+  tasks (singleton priority + a reserved slot; per-agent serialization) →
+  **4** throttled DB maintenance. Single-threaded async; SQLite WAL
+  serializes writes. Subagent coordination is purely mail-driven: the
+  coordinator `dispatch_task`s children and stops calling tools; children
+  mail results back; the fan-in barrier (or plain auto-wake on mail) wakes
+  the coordinator. There is **no parent-resume mechanism** — it was
+  deliberately deleted (see AGENT_RUNTIME.md §5.5.3).
 
 ### How a wakeup ends
 
@@ -132,6 +141,7 @@ prompt-cache efficiency):
 [persona.role_description + persona body]
 [~/.lyre/personas/<name>/APPEND.md if present]
 [~/.lyre/SYSTEM.md if present]
+[~/.lyre/user.md if present — owner identity & preferences]
 [AGENTS.md walk from cwd upward]
 [memory index — ## Available global memory]
 [skills XML — collapsed name+description; full body loaded on demand via read_memory]
@@ -142,6 +152,7 @@ prompt-cache efficiency):
 | Path | Purpose |
 |---|---|
 | `src/lyre/main.py` | Click CLI entrypoint (`lyre = "lyre.main:cli"`) |
+| `src/lyre/fsutil.py` | Shared atomic write helper (`atomic_write_text`: tmp + fsync + rename — kill-test law) |
 | `src/lyre/adapter/` | LLM providers — only place that knows about Anthropic/OpenAI specifics |
 | `src/lyre/runtime/agent_loop.py` | The wakeup loop: streaming, tool dispatch, fallback, interrupts |
 | `src/lyre/runtime/compact.py` | Mid-flight context compaction |
@@ -155,7 +166,7 @@ prompt-cache efficiency):
 | `src/lyre/personas/` | Shipped persona markdowns (copied to `~/.lyre/` on onboard) |
 | `src/lyre/data/model_registry.yaml` | Packaged provider/model entries |
 | `migrations/` | SQLite schema. MVP phase: single-file baseline (`0001_initial.sql`); owner nukes their local DB on schema changes rather than carrying historical migrations. |
-| `tests/` | Mirrors `src/lyre/`; `conftest.py` + `fake_adapter.py` + `helpers.py` are shared fixtures |
+| `tests/` | Flat (no subpackages — all `test_*.py` at top level); `conftest.py` + `fake_adapter.py` + `helpers.py` are shared fixtures |
 | `docs/design/` | Chinese architecture docs — source of truth for *why* decisions |
 
 ## Conventions
@@ -198,13 +209,14 @@ prompt-cache efficiency):
 
 ## Configuration knobs
 
-Set in shell or `.env` (auto-loaded). Full list in `docs/configuration.md`.
+Set in shell or `.env` (auto-loaded). Main knobs in `docs/configuration.md`
+(not exhaustive — code is the source of truth for the full `LYRE_*` set).
 
 | Var | Purpose |
 |---|---|
 | `ANTHROPIC_API_KEY` / `DEEPSEEK_API_KEY` / `OPENAI_API_KEY` | Provider auth (at least one) |
 | `LYRE_MODEL_OVERRIDE` | Force every wakeup to one `model_id` (testing) |
-| `LYRE_DEFAULT_MODEL` | Fallback when persona has no `model_preference` (default `claude-sonnet-4-6`) |
+| `LYRE_DEFAULT_MODEL` | Parsed but **not consumed** by the runtime — there is no fallback; personas must declare `model_preference` (the scheduler raises otherwise). Implement-or-delete is pending (DEEP_REVIEW E5) |
 | `LYRE_COMPACT_THRESHOLD` | Compaction trigger as fraction of context window (default `0.7`) |
 | `LYRE_HOME` / `LYRE_DB_PATH` / `LYRE_OBJECT_STORE` / `LYRE_MEMORY_PATH` | Storage paths |
 
@@ -212,5 +224,9 @@ Set in shell or `.env` (auto-loaded). Full list in `docs/configuration.md`.
 
 `docs/design/` (Chinese — source of truth for architecture decisions):
 `FOUNDATION.md`, `AGENT_CONTRACT.md`, `TRANSACTION_BOUNDARIES.md`,
-`PERSISTENCE_SCHEMA.md`, `AGENT_RUNTIME.md`, `PERSONAS.md`, `DASHBOARD.md`.
+`PERSISTENCE_SCHEMA.md`, `AGENT_RUNTIME.md`, `PERSONAS.md`, `DASHBOARD.md`,
+`RUNTIME_CURRENT.md` (living as-built runtime overview — start here for how
+the runtime works today), `DEEP_REVIEW_2026-06.md` (deep review: findings +
+entropy-reduction/iteration plans), `PLUGINS.md` (parked spec — proposed,
+not scheduled).
 Don't translate when editing — a one-line English summary alongside is enough.

@@ -1,5 +1,14 @@
 # Lyre — Persona 设计
 
+> **STATUS (2026-06-10): historical (v0.x plan) — superseded by the shipped implementation.**
+> The persona roster below (leader / worker-maintainer / reviewer-skill / reviewer-pr /
+> summary-agent) is the v0.x design. The shipped roster is **dispatcher (singleton) / analyst /
+> reviewer / worker-maintainer / long-runner / owner** — see `src/lyre/personas/*.md` (user SSOT
+> after onboard: `~/.lyre/personas/<name>/identity.md`). Several mechanisms below were never built
+> or were since deleted; per-section notes mark the worst drift (deep review 2026-06, finding [50]).
+> For the current runtime see [`RUNTIME_CURRENT.md`](./RUNTIME_CURRENT.md); the real tool registry
+> is `build_default_registry()` in `src/lyre/runtime/tools/builtin.py`.
+
 > **文档定位**：定义 MVP persona 清单、每个 persona 的字段约定与 starter prompt、persona 之间的交互模式、hosting-specific 注入模板、Lyre 工具白名单的 persona 分配、subagent 机制（模式 A）、动态 persona / agent 创建的机制。
 > **相关**：[`FOUNDATION.md §3.1`](./FOUNDATION.md#31-控制链默认-persona-路由) 控制链；§3.8 三类 global 条目；[`AGENT_CONTRACT.md`](./AGENT_CONTRACT.md)；[`AGENT_RUNTIME.md`](./AGENT_RUNTIME.md)；[`PERSISTENCE_SCHEMA.md`](./PERSISTENCE_SCHEMA.md)。
 
@@ -327,6 +336,13 @@ hosting_templates:
 
 ## 6. 新增 Lyre 工具清单
 
+> **STATUS note (2026-06-10)**: of this table only `dispatch_task` and `query_task_status` were
+> built. `approve_skill` / `approve_persona` / `propose_persona` / `mark_pr_reviewed` /
+> `query_local_hot_summary` / `list_skills` were never implemented — skill/persona governance is
+> filesystem-based (`~/.lyre/skills/{proposed,approved,archived}/`, see `CAPABILITY_DISCOVERY.md`
+> and `runtime/skills.py`), and there is no MCP server (tools dispatch in-process). The real
+> registry (25 tools) is `build_default_registry()` in `src/lyre/runtime/tools/builtin.py`.
+
 > 这些工具加入 [`AGENT_CONTRACT.md §4.4`](./AGENT_CONTRACT.md#44-lyre-工具走-gateway) MVP Lyre 工具集；MCP server 实现见 [`AGENT_RUNTIME.md §4.2`](./AGENT_RUNTIME.md#42-mcp-server-架构)。
 
 | 工具 | 用途 | 谁能调（默认） |
@@ -343,6 +359,12 @@ hosting_templates:
 ---
 
 ## 7. Subagent 机制（模式 A：parent 挂起重唤）
+
+> **STATUS note (2026-06-10)**: Mode A (parent parks as `needs_input`, scheduler polls children,
+> re-wakes parent) was deliberately **deleted** — see `AGENT_RUNTIME.md` §5.5.3. Subagent
+> coordination today is mail-driven: `dispatch_task` + fan-in barrier mail + Phase-0
+> auto-wake-on-mail (see `WORKFLOW_ORCHESTRATION.md`). `needs_input` remains a reserved-but-dormant
+> task state (scheduler Phase 0.7 is inert — nothing parks a task today).
 
 ### 7.1 派 subagent
 

@@ -57,10 +57,11 @@ keeps them apart.
   many agent instances** running in parallel.
 
 Example: persona `worker-maintainer` is a single markdown file. The
-leader might `create_agent(persona="worker-maintainer")` three times,
-producing agents `worker-maintainer-1`, `worker-maintainer-2`,
-`worker-maintainer-3` — each with its own mailbox, working on different
-PRs simultaneously.
+dispatcher might `create_agent(persona="worker-maintainer")` three times,
+producing agents `worker-maintainer/1`, `worker-maintainer/2`,
+`worker-maintainer/3` (spawned agent ids are `persona/name`; pass `name`
+to pick something more meaningful) — each with its own mailbox, working
+on different PRs simultaneously.
 
 When you `mailbox_send` or `dispatch_task`, the target is **always** an
 `agent_id`, never a persona name.
@@ -102,8 +103,12 @@ when the wakeup ends. **Cross-wakeup state lives in:**
 
 - The mailbox (durable; readable via `mailbox_read(box="sent")` and
   `include_read=True`)
-- The notes file at `~/.lyre/memory/facts/agent-<id>-notes.md`
-  (pre-created per agent; agent writes via `shell_exec` or `python_exec`)
+- The scratchpad at `~/.lyre/memory/scratchpad/<flat-id>.md` — short-term
+  working memory the model curates via the `update_scratchpad` tool
+- The notes file at `~/.lyre/memory/facts/agent-<flat-id>-notes.md`
+  (pre-created per agent, `/` in spawned ids flattened to `-`; agent
+  writes via `shell_exec` or `python_exec`, and the runtime appends an
+  auto-summary log here after each wakeup)
 - The task's checkpoint (set via `report_progress`; used for crash
   recovery, NOT visible to anyone else)
 
@@ -116,32 +121,50 @@ A unit of work an agent is pursuing. Lifecycle states:
 
 - `pending` — queued, no agent has it yet
 - `in_progress` — an agent has the lease and is running a wakeup
-- `needs_input` — blocked on external input (rarely used; the runtime
-  has no blocking primitive — agents that delegate work end their
-  wakeup and rely on auto-wake-on-mail when children mail back)
+- `needs_input` — reserved park state, **dormant today**: nothing in the
+  runtime parks a task, and the scheduler phase that would resume parked
+  tasks (Phase 0.7) is inert. The runtime has no blocking primitive —
+  agents that delegate work end their wakeup and rely on
+  auto-wake-on-mail when children mail back
 - `completed` / `failed` / `cancelled` — terminal
 
 Tasks have an optional `parent_task_id` (set when one agent
-`dispatch_task`s another), so the runtime can detect when a parent's
-subagents have all terminated and wake the parent back up.
+`dispatch_task`s another). It records lineage only — there is **no
+parent-resume mechanism**. When a child task terminates, the runtime
+mails the result back (a `task_terminated` system mail, or a fan-in
+"ready" mail when the children were dispatched as a fan-in group), and
+the parent agent is woken by the ordinary unread-mail auto-wake.
 
 Tasks have a `checkpoint` (JSON blob) the agent can update via
 `report_progress` so a crashed wakeup can resume in the next one.
 
 ### Scheduler
 
-The bottom-half of the runtime. Three things it does:
+The bottom-half of the runtime. Each tick (default 1s) runs a ladder of
+phases (the gaps in the numbering are historical — there is no Phase 1):
 
-- **Phase -1**: scan `scheduled_mail` for entries due now, deliver them
-  (future-mail and recurring mail mechanism)
-- **Phase 0**: scan agents for unread mail without active tasks; auto-
-  dispatch a "check your inbox" task to wake them up
-- **Phase 1**: scan tasks; resume parents whose subagents have all
-  terminated, claim leases on pending tasks, run wakeups
+- **Phase -1**: deliver due `scheduled_mail` rows as real mailbox
+  messages (future-mail and recurring-mail mechanism)
+- **Phase 0.5**: resolve fan-in barriers — count delivered result-mails
+  for each open group and, on quorum/deadline, mail the coordinator a
+  "ready" notification (which Phase 0 then picks up)
+- **Phase 0**: scan agents for unread mail without an in-flight task;
+  auto-dispatch a "check your inbox" task to wake them up
+- **Phase 0.7**: resume parked `needs_input` tasks — *dormant*: nothing
+  parks a task today
+- **Phase 0.8**: reap ephemeral spawned agents whose work is done,
+  applying their restart policies
+- **Phase 2**: recover tasks whose lease expired (process killed
+  mid-wakeup) by re-running them
+- **Phase 3**: claim pending tasks (bootstrap singletons first, with a
+  reserved slot) and run wakeups, one in-flight wakeup per agent
+- **Phase 4**: throttled DB maintenance (retention prune + WAL checkpoint)
 
-The scheduler is single-threaded but async — it can hold many wakeups
-in flight concurrently. SQLite WAL mode handles the per-write
-serialization.
+There is no parent-resume phase: all cross-agent synchronisation is
+mail-driven (children mail results back; the parent auto-wakes on unread
+mail). The scheduler is single-threaded async; under `lyre serve` each
+wakeup runs in a `lyre run-task` subprocess by default, several in
+flight concurrently. SQLite WAL mode handles the per-write serialization.
 
 ### Auto-compaction
 
@@ -179,12 +202,12 @@ matters for prompt-cache hits on Anthropic and DeepSeek.
 
 ## The lifecycle of one piece of work
 
-To make this concrete, here's what happens when you `lyre send leader
+To make this concrete, here's what happens when you `lyre send dispatcher
 "please count the .py files in the project"`:
 
-1. CLI writes a row to `mailbox_messages` (recipient=`leader`,
+1. CLI writes a row to `mailbox_messages` (recipient=`dispatcher`,
    sender=`owner`, body=...).
-2. Scheduler's Phase 0 sees `leader` has unread mail and no active
+2. Scheduler's Phase 0 sees `dispatcher` has unread mail and no active
    task. It creates an auto-wake task with goal "Check your inbox..."
    and dispatches it.
 3. AgentLoop starts. It assembles the system prompt (identity preamble
@@ -202,15 +225,18 @@ To make this concrete, here's what happens when you `lyre send leader
 7. Outbox dispatcher delivers the reply into `owner`'s mailbox.
 8. `lyre mailbox owner --unread-only` shows it.
 
-If the task was bigger and `leader` decided to delegate — e.g., "have
-a worker-maintainer do this" — step 4 instead calls
-`dispatch_task(agent="worker-maintainer-1", ...)` and then **just
-stops calling tools**. The wakeup ends; `leader`'s task completes.
+If the task was bigger and `dispatcher` decided to delegate — e.g.,
+"have a worker-maintainer do this" — step 4 instead calls
+`dispatch_task(agent="worker-maintainer/1", ...)` and then **just
+stops calling tools**. The wakeup ends; `dispatcher`'s task completes.
 The worker runs its own wakeup; when it finishes, it `mailbox_send`s
-back to `leader`. Auto-wake-on-mail starts a fresh wakeup of `leader`
-to read the worker's reply and forward findings to you. Two wakeups,
-one mail thread — the runtime has no blocking "wait for children"
-primitive, all synchronisation is mail-driven.
+back to `dispatcher`. Auto-wake-on-mail starts a fresh wakeup of
+`dispatcher` to read the worker's reply and forward findings to you.
+Two wakeups, one mail thread — the runtime has no blocking "wait for
+children" primitive, all synchronisation is mail-driven. (For
+many-children patterns there's a fan-in barrier: `fan_in_open` a group,
+dispatch the legs, and the scheduler mails the coordinator one "ready"
+notification when enough result-mails have arrived.)
 
 This is what "long-running" means in Lyre. The conversation isn't one
 session — it's a chain of wakeups, possibly spread over hours or days,
@@ -218,7 +244,7 @@ all backed by durable state.
 
 ## Where to read more
 
-- **Internal design** (Chinese, repo root): `FOUNDATION.md` for the
+- **Internal design** (Chinese, `docs/design/`): `FOUNDATION.md` for the
   five laws in depth, `AGENT_CONTRACT.md` for the agent interface,
   `TRANSACTION_BOUNDARIES.md` for the commit-point and outbox patterns,
   `PERSISTENCE_SCHEMA.md` for the full schema.

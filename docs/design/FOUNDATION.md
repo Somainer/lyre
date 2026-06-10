@@ -1,6 +1,8 @@
 # Lyre — 架构奠基文档
 
 > **文档定位**：Lyre 架构的稳定参照。"架构内核"小节（铁律一至五、三档持久层、三类 global 条目）为**定论**（status: settled），其它设计文档以本文为依据。
+>
+> **Status note (2026-06-10, deep-review E1)**: 架构内核的**五条铁律本身仍为定论**。但 §3.3 的 enforcement model（subprocess sandbox + Unix-socket gateway）与 §3.7 的五层架构表描述的是 v0.x 计划，不是建成的运行时——see the correction note in §3.3. For the as-built runtime read `RUNTIME_CURRENT.md` (living doc, added in this canon-alignment round). Findings & owner rulings: `DEEP_REVIEW_2026-06.md` (§2.1, §F7).
 
 ---
 
@@ -89,6 +91,8 @@ Lyre 中**没有"Leader 进程"和"Worker 进程"两种实体**——只有 **Ag
 **关于 Claude Code 的 agent view / agent teams**：它们是 agent 层的一种可选后端 + 监督 UI，**不是 Lyre 的地基**。Lyre 不基于它们构建。可以接入，但只是众多 agent 后端之一。
 
 ### 3.3 铁律二：Lyre 与外部世界的所有交互通过 Lyre 定义和实现的工具集
+
+> **实现修正（2026-06-10）**: The law stands; this section's *enforcement model* is the v0.x plan and was **not built**. As-built: agents run **in-process** in the scheduler (or as one `lyre run-task` subprocess per wakeup). A per-task scratch worktree and (for `git_context` tasks) an ephemeral SSH key do exist, but as working artifacts only — they are **not** the env-scoped fork sandbox this section describes; the Unix-socket tool gateway was never built (`src/lyre/mcp_server/` is an empty stub). `shell_exec` / `python_exec` **are** Lyre tools dispatched in-process by the wakeup loop — so the law holds in the "every action goes through a Lyre tool" sense (CLAUDE.md's wording), not via this section's subprocess/gateway split. The table's "强" rows for the gateway are superseded: real containment = the shell/python env allowlist (strips `ANTHROPIC_*` / `LYRE_*`; **deliberately forwards `GH_TOKEN` / `GITHUB_TOKEN`** as worker capability — the "agent 不继承 GH_TOKEN" row below is wrong, `src/lyre/runtime/shell.py`) + the single-owner trust model (`CAPABILITY_DISCOVERY.md` §3). A gateway-like seam may be revived via the parked plugin spec (`PLUGINS.md`) if endorsed.
 
 Agent 是 Lyre 派生的 subprocess，跑在 per-task tmpdir + minimal env + task-local ssh-agent 内。Agent **可以**在 subprocess 内拥有任意 shell——这无所谓，因为 tmpdir / env / ssh 都是 scoped 的，agent 跟外部世界的接触面被严格控制。
 
@@ -190,6 +194,8 @@ Owner 不是系统外的用户，是"背后有人的 actor"，与其它 actor **
 ```
 
 **没有 `type`**。两端都是智能体（LLM 或人），自然语言足够表达。`type` 是为大流量预设统计与路由优化预留的设计，地基阶段是负债不是资产。统计需求出现时由 LLM 临时分类。
+
+**修订：系统元数据协议（2026-06-10，owner 决议，见 `DEEP_REVIEW_2026-06.md` §F7-2）**："没有 `type`"条款管的是 **agent↔agent 语义层，仍然成立**——智能体之间不引入消息类型系统，自然语言足够。与此同时，邮件与任务 `metadata` 下的 `kind`、`fan_in`（含 `fan_in.group_id` / `leg_key` / `result`）、`thread_id`、`auto_dispatched`、`broadcast_id` 等键是 **runtime 保留命名空间**：仅由 runtime / 工具层写入，仅系统生成的邮件依赖它们路由（fan-in barrier 计数、thread 历史、supervision / `task_terminated` 标记、auto-wake 抑制）。Agent 永远不需要自己读写这些键——需要时通过工具参数（如 `mailbox_send(result_for=…, thread_id=…)`）由工具层代为打标。实现零改动，此为对既成事实的正典承认与划界。
 
 **Urgency 四档**：
 
@@ -308,16 +314,32 @@ Skills 是 know-how，需要质量把关：agent 干完任务判断"值得复用
 
 ## 7. 文档导航
 
+> 补全于 2026-06-10（deep-review E1）：列出 `docs/design/` 全部文档。状态标注：**定论** = settled canon；**部分历史** = 核心结论成立但含 v0.x 已被实现取代的章节（见各文件横幅）；**已落地** = PR-round changelog，描述已合并的实现；**living** = 持续更新；**parked** = 已拍板搁置。
+
 | 文档 | 作用 |
 |---|---|
 | [`../../README.md`](../../README.md) | 项目入口 |
-| `FOUNDATION.md`（本文件） | 架构内核，定论 |
-| [`AGENT_CONTRACT.md`](./AGENT_CONTRACT.md) | Agent 接口契约 |
-| [`AGENT_RUNTIME.md`](./AGENT_RUNTIME.md) | Agent 运行时实现 |
-| [`TRANSACTION_BOUNDARIES.md`](./TRANSACTION_BOUNDARIES.md) | 一次唤醒的事务边界 |
-| [`PERSISTENCE_SCHEMA.md`](./PERSISTENCE_SCHEMA.md) | 持久层 schema |
-| [`PERSONAS.md`](./PERSONAS.md) | Persona 设计 |
-| [`DASHBOARD.md`](./DASHBOARD.md) | Owner 观测面板 |
+| `FOUNDATION.md`（本文件） | 架构内核五铁律，**定论**（§3.3 enforcement / §3.7 分层表为 v0.x 计划，见横幅） |
+| `RUNTIME_CURRENT.md` | **living**：as-built 运行时全貌（wakeup 生命周期、真实事务模型、调度相位；E1 轮新增） |
+| [`AGENT_CONTRACT.md`](./AGENT_CONTRACT.md) | Agent 接口契约；**部分历史**（§4 subprocess/gateway 为 v0.x，见横幅） |
+| [`AGENT_RUNTIME.md`](./AGENT_RUNTIME.md) | Agent 运行时设计；**部分历史**（§2-§4 v0.x；§3.6-3.8 / §5.5 current，见横幅） |
+| [`TRANSACTION_BOUNDARIES.md`](./TRANSACTION_BOUNDARIES.md) | 一次唤醒的事务边界；**部分历史**（Step-9 单提交点模型已被"工具时即时持久"取代，见横幅） |
+| [`PERSISTENCE_SCHEMA.md`](./PERSISTENCE_SCHEMA.md) | 持久层 schema（部分滞后于实现，以 `migrations/0001_initial.sql` 为准） |
+| [`PERSONAS.md`](./PERSONAS.md) | Persona 设计（v0.x roster；现役 persona 清单以 `src/lyre/personas/` 为准） |
+| [`DASHBOARD.md`](./DASHBOARD.md) | Owner 观测面板（FastAPI + HTMX + SSE） |
+| [`WORKFLOW_ORCHESTRATION.md`](./WORKFLOW_ORCHESTRATION.md) | 确定性编排：mailbox-native fan-in barrier + OTP 式 supervisor/reaper，**已落地** |
+| [`AGENT_THREADS.md`](./AGENT_THREADS.md) | `thread_id` 主线上下文连续性 + 有界自驱动，**已落地** |
+| [`LONG_RUNNING_ROBUSTNESS.md`](./LONG_RUNNING_ROBUSTNESS.md) | 长跑健壮性（一）：压缩硬化 + 记忆卫生，**已落地** |
+| [`LONG_RUNNING_ROBUSTNESS_2.md`](./LONG_RUNNING_ROBUSTNESS_2.md) | 长跑健壮性（二）：恢复诚实性（lease fencing / max_turns 分类）+ 反失控 + 索引卫生，**已落地** |
+| [`LONG_RUNNING_ROBUSTNESS_3.md`](./LONG_RUNNING_ROBUSTNESS_3.md) | 长跑健壮性（三）：无界增长与空转收口（D1/C4；H2 设计定稿待实现），**部分落地** |
+| [`FAILURE_ROBUSTNESS.md`](./FAILURE_ROBUSTNESS.md) | 失败韧性：dispatcher 监督缺口 + LLM 调用重试/failover，**已落地** |
+| [`ORCHESTRATION_ROBUSTNESS.md`](./ORCHESTRATION_ROBUSTNESS.md) | 编排健壮性：fan-in 失败可见 + typed-result 强制 + 轮次预算，**已落地** |
+| [`MEMORY_ORGANIZATION.md`](./MEMORY_ORGANIZATION.md) | memory facts 的整理与淘汰（index 分组 + archive），**已落地** |
+| [`CAPABILITY_DISCOVERY.md`](./CAPABILITY_DISCOVERY.md) | 外部 coding agent 委派 + 能力固化为 skills；含现实安全边界声明 |
+| [`BUILTIN_SKILLS.md`](./BUILTIN_SKILLS.md) | 出厂技能库机制（直接读 package），**已落地** |
+| [`OWNER_AS_CHAT_PARTNER.md`](./OWNER_AS_CHAT_PARTNER.md) | Owner 异步聊天界面（Lark 通道）设计 |
+| [`PLUGINS.md`](./PLUGINS.md) | 插件系统 spec，**parked**（owner 决议 2026-06-10；gateway 类接缝若复活走此弧线） |
+| [`DEEP_REVIEW_2026-06.md`](./DEEP_REVIEW_2026-06.md) | 2026-06 全库深度 review：145 findings + 五铁律审计 + 熵减/迭代计划 + owner 决议（§F7） |
 
 ---
 
