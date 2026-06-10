@@ -380,3 +380,81 @@ async def test_result_to_cancelled_group_still_rejected(
         await _send_result(
             repos, "rev-1", d1["task_id"], g, 0, {"verdict": "approve"}
         )
+
+
+@pytest.mark.asyncio
+async def test_result_to_archived_coordinator_is_accepted_and_discarded(
+    repos: SqliteRepositories, tmp_path: Path
+) -> None:
+    """An ephemeral coordinator can aggregate at quorum and get reaped
+    before a straggler finishes. Raising would error the leg every turn and
+    burn its restart budget on an undeliverable result — accept-and-drop so
+    the leg can close out."""
+    coord_task = await _setup(repos)
+    cctx = _ctx(repos, "coordinator-1", coord_task)
+    g = (await _fan_in_open(
+        cctx, {"expect_replies": 2, "quorum": 1, "result_schema": _SCHEMA}
+    ))["group_id"]
+    d1 = await _dispatch_task(
+        cctx, {"agent": "rev-1", "goal": "g", "acceptance": "a",
+               "fan_in": {"group_id": g, "leg_key": 0}}
+    )
+    await repos.agents.archive("coordinator-1", reason="reaped")
+
+    out = await _send_result(repos, "rev-1", d1["task_id"], g, 0, {"verdict": "ok"})
+    assert out["status"] == "discarded"
+    assert "coordinator" in out["note"]
+
+
+@pytest.mark.asyncio
+async def test_fan_in_cancel_flags_inflight_legs_to_stand_down(
+    repos: SqliteRepositories, tmp_path: Path
+) -> None:
+    """'The coordinator asked the legs to stand down' must be mechanism,
+    not aspiration: cancel propagates the durable B2 cancel flag to every
+    roster member's child task, so legs stop at their next tool boundary
+    instead of finishing work whose submission would be rejected."""
+    coord_task = await _setup(repos)
+    cctx = _ctx(repos, "coordinator-1", coord_task)
+    g = (await _fan_in_open(
+        cctx, {"expect_replies": 2, "quorum": 2, "result_schema": _SCHEMA}
+    ))["group_id"]
+    d1 = await _dispatch_task(
+        cctx, {"agent": "rev-1", "goal": "g", "acceptance": "a",
+               "fan_in": {"group_id": g, "leg_key": 0}}
+    )
+    d2 = await _dispatch_task(
+        cctx, {"agent": "rev-2", "goal": "g", "acceptance": "a",
+               "fan_in": {"group_id": g, "leg_key": 1}}
+    )
+    out = await _fan_in_cancel(cctx, {"group_id": g})
+    assert out["cancelled"] is True
+    assert sorted(out["legs_stopped"]) == sorted([d1["task_id"], d2["task_id"]])
+    for tid in (d1["task_id"], d2["task_id"]):
+        t = await repos.tasks.get(tid)
+        assert t is not None and (t.metadata or {}).get("cancel_requested")
+
+
+@pytest.mark.asyncio
+async def test_leg_contract_voided_for_cancelled_group(
+    repos: SqliteRepositories, tmp_path: Path
+) -> None:
+    """A leg finishing without a result on a CANCELLED group did exactly
+    what it was told — the O2 contract check must return None (void), not
+    False (downgrade-to-failed), or cancel itself becomes a burn loop."""
+    coord_task = await _setup(repos)
+    cctx = _ctx(repos, "coordinator-1", coord_task)
+    g = (await _fan_in_open(
+        cctx, {"expect_replies": 1, "quorum": 1, "result_schema": _SCHEMA}
+    ))["group_id"]
+    d1 = await _dispatch_task(
+        cctx, {"agent": "rev-1", "goal": "g", "acceptance": "a",
+               "fan_in": {"group_id": g, "leg_key": 0}}
+    )
+    await _fan_in_cancel(cctx, {"group_id": g})
+
+    sched = _scheduler(repos, tmp_path)
+    leg_task = await repos.tasks.get(d1["task_id"])
+    assert leg_task is not None
+    verdict = await sched._fan_in_leg_submitted_result(leg_task, d1["task_id"])
+    assert verdict is None, "cancelled group must void the contract, not fail it"

@@ -313,3 +313,118 @@ async def test_mailbox_send_arms_the_gate(
                 "max_no_progress": 3, "_tool_use_id": "tu2",
             },
         )
+
+
+# ---------------------------------------------------------------------------
+# The harness must not feed its own gate
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_phase0_auto_dispatch_task_is_not_progress(
+    repos: SqliteRepositories, tmp_path: Path,
+) -> None:
+    """The canonical production flow: an idle agent woken each round by
+    Phase 0's auto-inbox task, which carries the loop's thread_id. That
+    task's creation/completion is the scheduler's own wake mechanism — if
+    it counted as thread activity (it did, pre-fix), the counter reset
+    every round and the gate was structurally inert in the exact shape it
+    was designed for."""
+    cfg = _config(tmp_path)
+    # Agent only — no pre-existing task, so Phase 0 sees an idle agent.
+    await repos.personas.upsert(
+        Persona(name="dispatcher", role_description="d", system_prompt="d")
+    )
+    await repos.agents.create(agent_id="dispatcher", persona_name="dispatcher")
+    await repos.mailbox.ensure_mailbox("dispatcher")
+    sid = await repos.scheduled_mail.create(_loop_spec(max_no_progress=2))
+    sched = _make_scheduler(repos, cfg)
+
+    # Round 1, exactly as production runs it: deliver the loop mail, then
+    # Phase 0 auto-dispatches the inbox-check task (thread_id inherited).
+    await sched._deliver_scheduled_mail()
+    await sched._auto_dispatch_for_unread_mail()
+    tasks = await repos.tasks.find_pending(limit=10)
+    auto = [
+        x for x in tasks
+        if (x.metadata or {}).get("auto_dispatched")
+        and (x.metadata or {}).get("thread_id") == _THREAD
+    ]
+    assert auto, "Phase 0 must have created the thread-stamped wake task"
+    auto_task = auto[0]
+
+    # The wakeup it triggers burns real work and produces nothing outward.
+    wk = await repos.wakeups.start(auto_task.id, "dispatcher", agent_id="dispatcher")
+    await repos.wakeups.end(
+        wk, end_status="completed",
+        metering={"tool_call_count": 20, "token_output": 9000},
+    )
+    await repos.tasks.update_status(auto_task.id, "completed")
+
+    # Round 2: the auto task's created_at/completed_at fall inside the
+    # window — and must NOT count as progress; the worked wakeup MUST count
+    # as work. Pre-fix this asserted 0.
+    await _force_due_with_window(repos, sid)
+    await sched._deliver_scheduled_mail()
+    assert (await _np(repos, sid))[0] == 1
+
+
+@pytest.mark.asyncio
+async def test_off_thread_outward_send_counts_as_progress(
+    repos: SqliteRepositories, tmp_path: Path,
+) -> None:
+    """Replies inherit the PARENT mail's thread, so an inbox-servicing
+    loop's real output often lands off-thread. Any send by the loop agent
+    to a non-self recipient counts as alive — a false PASS costs one more
+    bounded round; a false STOP kills a working loop."""
+    from lyre.persistence.models import MailboxMessage
+
+    cfg = _config(tmp_path)
+    task_id = await _seed(repos)
+    sid = await repos.scheduled_mail.create(_loop_spec(max_no_progress=2))
+    sched = _make_scheduler(repos, cfg)
+
+    await sched._deliver_scheduled_mail()
+    await _force_due_with_window(repos, sid)
+    await _worked_wakeup(repos, task_id, tools=10, out_tokens=50)
+    # Outward reply on a DIFFERENT thread (inherited from some asker's mail).
+    await repos.mailbox.ensure_mailbox("owner")
+    await repos.mailbox.insert_message(
+        MailboxMessage(
+            recipient="owner", external_id="x-ot-1", sender="dispatcher",
+            urgency="normal", body="here's your answer",
+            metadata={"thread_id": "thread-someone-elses"},
+        )
+    )
+    await sched._deliver_scheduled_mail()
+    assert (await _np(repos, sid))[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_mailbox_send_mints_a_thread_for_recurring_mail(
+    repos: SqliteRepositories, tmp_path: Path,
+) -> None:
+    """A gated loop armed from a thread-less wakeup must not be silently
+    ungated: recurring sends without any resolvable thread get one minted
+    at arming time."""
+    await _seed(repos)
+    task_id = await repos.tasks.create(
+        TaskSpec(agent_id="dispatcher", goal="g", acceptance="a")
+    )
+    wk = await repos.wakeups.start(task_id, "dispatcher", agent_id="dispatcher")
+    ctx = ToolContext(
+        repos=repos, task_id=task_id, wakeup_id=wk,
+        persona_name="dispatcher", agent_id="dispatcher",
+        # NOTE: no thread_id on the context.
+    )
+    res = await MAILBOX_SEND.handler(
+        ctx,
+        {
+            "to": "dispatcher", "body": "loop", "deliver_in": "1h",
+            "recur_every": "1h", "max_no_progress": 3, "_tool_use_id": "tm",
+        },
+    )
+    s = await repos.scheduled_mail.get(res["scheduled_ids"][0])
+    assert s is not None
+    minted = (s.metadata or {}).get("thread_id")
+    assert isinstance(minted, str) and minted.startswith("thread-")

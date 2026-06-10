@@ -406,11 +406,12 @@ class MailboxRepository(Protocol):
         back-and-forth without the (stateless) agent hunting for it."""
         ...
 
-    async def thread_has_nonself_message_since(
+    async def loop_progress_mail_since(
         self, thread_id: str, since_iso: str, self_actor: str
     ) -> bool:
-        """H2 progress: any thread mail since ``since_iso`` that is not the
-        loop agent talking to itself (outward send OR inbound reply)."""
+        """H2 progress: thread mail that isn't self↔self, OR any send by
+        the loop agent to a non-self recipient (replies inherit the parent
+        thread, so off-thread output must still count as alive)."""
         ...
 
     # --- Internal listing helpers (system-side, not agent-facing) --------
@@ -688,6 +689,7 @@ class SupervisionRepository(Protocol):
         now: datetime,
         reason: str | None = None,
         max_total: int | None = None,
+        count_total: bool = True,
     ) -> bool:
         """Record one restart; return True iff within ``max_restarts`` per a
         sliding ``max_seconds`` window AND (when ``max_total`` is set) within
