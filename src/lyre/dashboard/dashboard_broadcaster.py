@@ -96,7 +96,18 @@ class DashboardBroadcaster:
     # None disables live cards (tests / minimal embeddings) — the DB
     # high-water events still work.
     object_store_root: Path | None = None
+    # Cap on the FIRST read when a tailer attaches to an already-large
+    # transcript (subscriber connecting mid-wakeup) — bounds the one-off
+    # backlog read; steady-state reads are just the new bytes per tick.
+    initial_tail_bytes: int = 512 * 1024
     _live: dict[str, LiveWakeup] = field(default_factory=dict)
+    # Wakeups pruned from _live last tick. Their card event fires ONE
+    # more time on the FOLLOWING tick (after the timeline re-render has
+    # removed the card element) so htmx's sse.js — which only drops a
+    # listener lazily, when its event fires while the element is gone —
+    # actually releases the listener; otherwise a days-open dashboard
+    # tab accumulates one dead EventSource listener per ended wakeup.
+    _tombstones: set[str] = field(default_factory=set)
     # Each event payload is the set of event names that changed; the
     # shutdown sentinel is an empty `frozenset()` plus a closing None.
     _subscribers: set[asyncio.Queue[set[str] | None]] = field(default_factory=set)
@@ -246,44 +257,59 @@ class DashboardBroadcaster:
         """
         if self.object_store_root is None:
             return set()
+        changed: set[str] = set()
+        # Fire (and clear) last tick's tombstones first — see the field
+        # comment. The SSE handler renders these as an empty payload.
+        for dead in self._tombstones:
+            changed.add(f"{CARD_EVENT_PREFIX}{dead}")
+        self._tombstones.clear()
         try:
             active = await self.repos.wakeups.list_active()
         except Exception:  # noqa: BLE001 — never let the watcher crash the loop
-            return set()
-        changed: set[str] = set()
+            return changed
         seen: set[str] = set()
         for w in active:
             seen.add(w.id)
-            lw = self._live.get(w.id)
-            if lw is None:
-                started_iso = (
-                    w.started_at.isoformat()
-                    if isinstance(w.started_at, datetime)
-                    else (w.started_at or "")
+            try:
+                lw = self._live.get(w.id)
+                if lw is None:
+                    started_iso = (
+                        w.started_at.isoformat()
+                        if isinstance(w.started_at, datetime)
+                        else (w.started_at or "")
+                    )
+                    lw = LiveWakeup(
+                        wakeup=w,
+                        tailer=TranscriptTailer(
+                            transcript_path(self.object_store_root, w.id),
+                            initial_tail_bytes=self.initial_tail_bytes,
+                        ),
+                        folder=LiveTranscriptFolder(
+                            wakeup_id=w.id,
+                            persona=w.persona_name,
+                            task_id=w.task_id,
+                            started_at=started_iso,
+                        ),
+                    )
+                    self._live[w.id] = lw
+                rows = await asyncio.to_thread(lw.tailer.poll)
+                if rows:
+                    lw.folder.ingest(rows)
+                    changed.add(f"{CARD_EVENT_PREFIX}{w.id}")
+            except Exception as exc:  # noqa: BLE001
+                # One bad wakeup (corrupt file, racing cleanup) must not
+                # suppress this tick's DB events or the other wakeups.
+                log.warning(
+                    "live_wakeup_poll_failed", wakeup_id=w.id, error=str(exc)
                 )
-                lw = LiveWakeup(
-                    wakeup=w,
-                    tailer=TranscriptTailer(
-                        transcript_path(self.object_store_root, w.id)
-                    ),
-                    folder=LiveTranscriptFolder(
-                        wakeup_id=w.id,
-                        persona=w.persona_name,
-                        task_id=w.task_id,
-                        started_at=started_iso,
-                    ),
-                )
-                self._live[w.id] = lw
-            rows = await asyncio.to_thread(lw.tailer.poll)
-            if rows:
-                lw.folder.ingest(rows)
-                changed.add(f"{CARD_EVENT_PREFIX}{w.id}")
         # Wakeups that ended (or vanished) drop their state — the
         # wakeup_max_ended watermark fires EVENT_ACTIVITY on the same
         # tick, and the full timeline render replaces the card with the
-        # regular ended-wakeup events.
+        # regular ended-wakeup events. Tombstoned for one more event
+        # next tick (browser listener cleanup).
         for gone in set(self._live) - seen:
             del self._live[gone]
+            self._tombstones.add(gone)
         return changed
 
     async def _detect_changes(self) -> set[str]:

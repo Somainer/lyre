@@ -187,6 +187,21 @@ async def test_transcript_growth_fires_card_event_not_activity(
                 and "hmm" in e.detail["text"]
                 for e in snap
             )
+
+            # End the wakeup: state is pruned, and the card event fires
+            # ONE more time on a following tick (tombstone) so the
+            # browser-side listener gets its cleanup chance.
+            await repos.wakeups.end(
+                wakeup_id, end_status="completed", metering={},
+            )
+            seen2: set[str] = set()
+            with _drain_for(q, 1.5) as drain:
+                async for events in drain:
+                    seen2.update(events)
+                    if card_event in seen2:
+                        break
+            assert card_event in seen2
+            assert wakeup_id not in bc.live_folders()
         finally:
             await bc.stop()
     finally:

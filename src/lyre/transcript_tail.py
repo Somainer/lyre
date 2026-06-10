@@ -28,10 +28,19 @@ class TranscriptTailer:
     chunk boundaries).
     """
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, initial_tail_bytes: int | None = None):
+        """`initial_tail_bytes`: when the FIRST poll finds the file already
+        larger than this, start that many bytes from the end instead of
+        reading the whole backlog (a subscriber attaching to a long-running
+        wakeup must not materialize a runaway multi-MB transcript in one
+        read — the bound the dashboard's old `deque(f, maxlen=...)` tail
+        provided). None (e.g. `lyre tail`, which always streamed the full
+        file) keeps read-from-start behavior."""
         self.path = path
         self._offset = 0
         self._buf = b""
+        self._initial_tail_bytes = initial_tail_bytes
+        self._skip_to_newline = False
 
     def poll(self) -> list[dict[str, Any]]:
         """Return newly completed events. Missing file → ``[]`` (the writer
@@ -44,10 +53,30 @@ class TranscriptTailer:
             return []
         if size <= self._offset:
             return []
-        with self.path.open("rb") as fp:
-            fp.seek(self._offset)
-            chunk = fp.read(size - self._offset)
+        if (
+            self._offset == 0
+            and self._initial_tail_bytes is not None
+            and size > self._initial_tail_bytes
+        ):
+            # Jump near the end; the slice almost certainly starts
+            # mid-line, so drop bytes up to the first newline below.
+            self._offset = size - self._initial_tail_bytes
+            self._skip_to_newline = True
+        try:
+            with self.path.open("rb") as fp:
+                fp.seek(self._offset)
+                chunk = fp.read(size - self._offset)
+        except OSError:
+            # Vanished between stat and open (object-store cleanup) —
+            # same non-event as a missing file.
+            return []
         self._offset += len(chunk)
+        if self._skip_to_newline:
+            nl = chunk.find(b"\n")
+            if nl < 0:
+                return []  # still mid-line; keep skipping next poll
+            chunk = chunk[nl + 1:]
+            self._skip_to_newline = False
         self._buf += chunk
         events: list[dict[str, Any]] = []
         while b"\n" in self._buf:
