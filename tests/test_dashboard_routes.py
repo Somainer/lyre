@@ -90,7 +90,7 @@ async def seeded_dashboard(
     )
     await broadcaster.prime()
 
-    app = create_app(repos, broadcaster)
+    app = create_app(repos, broadcaster, object_store_root=obj)
     client = TestClient(app)
     ids = {"running_task": running_tid, "done_task": done_tid,
            "running_wakeup": running_wid}
@@ -159,13 +159,14 @@ def test_task_detail_terminal_task_has_no_cancel_form(
     assert "Request cancel" not in r.text
 
 
-def test_activity_is_overview_only_no_transcript_noise(
+def test_activity_overview_keeps_timeline_coarse_but_streams_live_card(
     seeded_dashboard: tuple[TestClient, SqliteRepositories, dict],
 ) -> None:
     """/activity is the high-level cross-agent overview: tasks, wakeup
-    boundaries, mailbox. Transcript-derived events (tool_use,
-    assistant_text, turn_end, notes) live at /agents/<id> so this page
-    stays scan-able."""
+    boundaries, mailbox. ENDED wakeups' transcript noise stays at
+    /agents/<id>. But each IN-FLIGHT wakeup gets a live card pinned at
+    the bottom carrying its streaming transcript content — the global
+    page is no longer blind until wakeup_end."""
     client, *_ = seeded_dashboard
     r = client.get("/activity")
     assert r.status_code == 200
@@ -177,10 +178,11 @@ def test_activity_is_overview_only_no_transcript_noise(
     assert "STOP" in body
     # Filter selector
     assert "30m" in body and "5m" in body
-    # Transcript-derived events do NOT appear at the overview level — go
-    # to /agents/<id> for the drill-down.
-    assert "python_exec" not in body
-    assert "shell_exec" not in body
+    # The active wakeup's live card streams its transcript content on
+    # the overview, wired as a per-card SSE swap target.
+    assert "live-card" in body
+    assert "python_exec" in body
+    assert "wakeup-card:" in body
 
 
 def test_agent_detail_includes_tool_use_from_active_transcript(

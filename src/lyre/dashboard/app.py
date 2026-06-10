@@ -71,6 +71,7 @@ def create_app(
     model_context_windows: dict[str, int] | None = None,
     owner_name: str | None = None,
     blob_store: Any = None,
+    object_store_root: Path | None = None,
 ) -> FastAPI:
     """`model_context_windows` is a `{model_id_or_alias: context_window_tokens}`
     map used by the activity feed to compute "context usage %" for each
@@ -93,6 +94,10 @@ def create_app(
     app.state.repos = repos
     app.state.broadcaster = broadcaster
     app.state.dashboard_broadcaster = dashboard_broadcaster
+    # Object-store root for deriving ACTIVE wakeups' transcript paths
+    # (their transcript_uri column is NULL until end-of-wakeup). None →
+    # live cards degrade to transcript_uri-based fallback (ended only).
+    app.state.object_store_root = object_store_root
     app.state.model_context_windows = model_context_windows or {}
     app.state.owner_name = owner_name
     # Multimodal: optional BlobStore used by /send (upload) and the

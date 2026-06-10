@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from lyre.dashboard.dashboard_broadcaster import (
+    CARD_EVENT_PREFIX,
     EVENT_ACTIVITY,
     EVENT_AGENT_STATUS,
     EVENT_HEALTH,
@@ -122,29 +123,35 @@ async def test_wakeup_start_fires_status_and_health(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_transcript_growth_fires_activity_only(tmp_path: Path) -> None:
+async def test_transcript_growth_fires_card_event_not_activity(
+    tmp_path: Path,
+) -> None:
     """Mid-wakeup: the agent appends thinking_delta / tool_use rows to
-    the transcript file but the DB high-water marks are quiet. Without
-    transcript-watch the dashboard sat still until the wakeup ended;
-    with it the broadcaster must fire EVENT_ACTIVITY within one poll.
+    the transcript file but the DB high-water marks are quiet. The
+    broadcaster tails the file incrementally and fires the per-card
+    event ("wakeup-card:<id>") so ONLY that wakeup's live card
+    re-renders — NOT the full timeline (EVENT_ACTIVITY) and not the
+    DB-gated channels (stats / agent-status / health).
 
-    Other event channels (stats / agent-status / health) MUST NOT fire
-    — transcript growth doesn't change unread counts, running-wakeup
-    count, etc.
+    The wakeup's transcript_uri column is NULL while it runs (only
+    written at end-of-wakeup) — the broadcaster must derive the path
+    from the wakeup id + object_store_root; relying on the column made
+    the old size-sum pulse dead code in production.
     """
     conn, repos = await _seed(tmp_path)
     try:
-        # Set up an active wakeup with a real transcript file path.
         task_id = await repos.tasks.create(
             TaskSpec(persona_name="worker", goal="g", acceptance="a")
         )
         wakeup_id = await repos.wakeups.start(task_id, "worker")
-        transcript = tmp_path / "object_store" / "wakeups" / wakeup_id / "transcript.jsonl"
+        root = tmp_path / "object_store"
+        transcript = root / "wakeups" / wakeup_id / "transcript.jsonl"
         transcript.parent.mkdir(parents=True, exist_ok=True)
         transcript.write_text('{"type":"system","ts":1}\n', encoding="utf-8")
-        await repos.wakeups.set_transcript_uri(wakeup_id, f"file://{transcript}")
 
-        bc = DashboardBroadcaster(repos=repos, poll_interval_s=0.05)
+        bc = DashboardBroadcaster(
+            repos=repos, poll_interval_s=0.05, object_store_root=root,
+        )
         await bc.prime()
         await bc.start()
         try:
@@ -154,21 +161,32 @@ async def test_transcript_growth_fires_activity_only(tmp_path: Path) -> None:
             with transcript.open("a", encoding="utf-8") as fp:
                 fp.write('{"type":"thinking_delta","text":"hmm","ts":2}\n')
 
+            card_event = f"{CARD_EVENT_PREFIX}{wakeup_id}"
             seen: set[str] = set()
             with _drain_for(q, 1.5) as drain:
                 async for events in drain:
                     seen.update(events)
-                    if EVENT_ACTIVITY in seen:
+                    if card_event in seen:
                         break
-            assert EVENT_ACTIVITY in seen, (
-                "transcript file growth must trigger EVENT_ACTIVITY so "
-                "the agent-detail SSE stream refreshes mid-wakeup"
+            assert card_event in seen, (
+                "transcript file growth must trigger the per-card event "
+                "so the live card streams mid-wakeup"
             )
-            # transcript pulse is activity-only — channels gated on DB
-            # state stay quiet.
+            # Streaming is card-only — the timeline and the DB-gated
+            # channels stay quiet.
+            assert EVENT_ACTIVITY not in seen
             assert EVENT_STATS not in seen
             assert EVENT_AGENT_STATUS not in seen
             assert EVENT_HEALTH not in seen
+            # And the broadcaster's folded state carries the open
+            # thinking run, marked streaming for the typing cursor.
+            snap = bc.live_folders()[wakeup_id].snapshot()
+            assert any(
+                e.kind == "thinking"
+                and e.detail.get("streaming")
+                and "hmm" in e.detail["text"]
+                for e in snap
+            )
         finally:
             await bc.stop()
     finally:

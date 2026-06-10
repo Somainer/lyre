@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Coroutine
+from pathlib import Path
 from typing import Any
 
 import structlog
@@ -35,6 +36,7 @@ async def run_dashboard(
     model_context_windows: dict[str, int] | None = None,
     owner_name: str | None = None,
     blob_store: object | None = None,
+    object_store_root: Path | None = None,
 ) -> None:
     """Start the broadcaster + uvicorn server until `stop_event` is set
     (or the server otherwise exits). Designed for two callers:
@@ -56,8 +58,11 @@ async def run_dashboard(
     # Dashboard-wide change broadcaster replaces the per-element HTMX
     # polls (stats / activity / agent-status / health). 1s interval is
     # plenty for owner observation; the broadcaster only emits when a
-    # high-water mark actually moves.
-    dashboard_bc = DashboardBroadcaster(repos=repos, poll_interval_s=1.0)
+    # high-water mark actually moves (live wakeup cards: when the
+    # transcript grew).
+    dashboard_bc = DashboardBroadcaster(
+        repos=repos, poll_interval_s=1.0, object_store_root=object_store_root,
+    )
     await dashboard_bc.prime()
     await dashboard_bc.start()
 
@@ -67,6 +72,7 @@ async def run_dashboard(
         model_context_windows=model_context_windows,
         owner_name=owner_name,
         blob_store=blob_store,
+        object_store_root=object_store_root,
     )
     # lifespan="off": we don't use ASGI lifespan messages (the handler in
     # app.py is a no-op `yield`). With it on, Starlette's lifespan task

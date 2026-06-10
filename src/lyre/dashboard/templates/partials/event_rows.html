@@ -1,0 +1,159 @@
+{% from "_macros.html" import glyph, live_dot, agent_id_pill, urgency_chip, model_pill %}
+{# Shared event-row markup — included by the activity timeline AND the
+   per-wakeup live cards (which pass their own `events`). detail.streaming
+   marks an in-progress delta run: it gets a typing cursor. #}
+{% for e in events %}
+  {% if e.kind == "spawn" %}
+    <div class="spawn-row">
+      <span class="spawn-glyph">{{ glyph("spark", 11) }}</span>
+      <span class="spawn-label">spawned</span>
+      {{ agent_id_pill(e.detail.parent, size='sm') }}
+      <span class="spawn-arrow">→</span>
+      {{ agent_id_pill(e.detail.child, size='sm') }}
+      {% if e.detail.note %}<span class="spawn-note">· {{ e.detail.note }}</span>{% endif %}
+      <span class="spawn-when">{{ e.at[11:16] }}</span>
+    </div>
+
+  {% elif e.kind == "mailbox" %}
+    <div class="evt">
+      <div class="evt-gutter">
+        <span class="evt-icon" style="color:{% if e.detail.urgency == 'blocker' %}var(--urg-blocker){% elif e.detail.urgency == 'high' %}var(--urg-high){% else %}var(--fg-2){% endif %};">{{ glyph("mail", 11) }}</span>
+      </div>
+      <div class="evt-who">
+        {{ agent_id_pill(e.detail.sender, dim=True, size='sm') }}
+        <span class="when">{{ e.at[11:16] }}</span>
+      </div>
+      <div class="evt-body">
+        <div class="bub mail {{ e.detail.urgency }}">
+          <div class="mail-h">
+            {{ urgency_chip(e.detail.urgency) }}
+            <span class="mono" style="font-size:var(--t-micro);color:var(--fg-3);">#{{ e.detail.msg_id }}</span>
+            {{ agent_id_pill(e.detail.sender, size='sm') }}
+            <span style="color:var(--fg-4);">→</span>
+            {{ agent_id_pill(e.detail.recipient, size='sm') }}
+          </div>
+          {% if e.detail.title %}
+          <div class="mail-h title-row"><div class="title">{{ e.detail.title }}</div></div>
+          {% endif %}
+          {% if e.detail.body %}
+            <div class="mail-body">{{ e.detail.body | markdown }}</div>
+          {% endif %}
+          <div class="row" style="margin-top:var(--s-3);justify-content:flex-end;">
+            <a class="btn ghost sm" href="/send?reply_to={{ e.detail.msg_id }}">{{ glyph("reply", 11) }} reply</a>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  {% elif e.kind in ("thinking", "assistant_text") %}
+    <div class="evt">
+      <div class="evt-gutter">
+        <span class="evt-icon"{% if e.kind == "thinking" %} title="thinking"{% endif %}>
+          {{ glyph("brain" if e.kind == "thinking" else "chat", 12) }}
+        </span>
+      </div>
+      <div class="evt-who">
+        {{ agent_id_pill(e.detail.persona, dim=True, size='sm') }}
+        <span class="when">{{ e.at[11:16] }}</span>
+      </div>
+      <div class="evt-body">
+        {% if e.kind == "thinking" %}
+          <details class="bub thinking" open data-fold-id="th-{{ e.detail.wakeup_id }}-{{ e.at }}">
+            <summary style="list-style:none;cursor:pointer;outline:none;">
+              <div class="bub-h">{{ glyph("brain", 11) }} thinking</div>
+            </summary>
+            <div>{{ e.detail.text }}{% if e.detail.streaming %}<span class="stream-cursor">▌</span>{% endif %}</div>
+          </details>
+        {% else %}
+          <div class="bub assistant"><p>{{ e.detail.text }}{% if e.detail.streaming %}<span class="stream-cursor">▌</span>{% endif %}</p></div>
+        {% endif %}
+      </div>
+    </div>
+
+  {% elif e.kind == "tool_use" %}
+    <div class="evt">
+      <div class="evt-gutter">
+        <span class="evt-icon" style="color:var(--fg-2);">{{ glyph("tool", 11) }}</span>
+      </div>
+      <div class="evt-who">
+        {{ agent_id_pill(e.detail.persona, dim=True, size='sm') }}
+        <span class="when">{{ e.at[11:16] }}</span>
+      </div>
+      <div class="evt-body">
+        <details class="tool" data-fold-id="tool-{{ e.detail.wakeup_id }}-{{ e.at }}-{{ e.detail.tool }}">
+          <summary>
+            <span class="chev">›</span>
+            <span class="tname">{{ e.detail.tool }}</span>
+            <span class="tprev">{{ e.detail.tool_input_preview }}</span>
+            <span class="tmeta"></span>
+          </summary>
+          <div class="tbody">
+            <span class="label">input</span>
+            <pre>{{ e.detail.tool_input_full }}</pre>
+          </div>
+        </details>
+      </div>
+    </div>
+
+  {% elif e.kind == "wakeup_end" %}
+    {% set st = e.detail.end_status or "completed" %}
+    <div class="evt">
+      <div class="evt-gutter">
+        <span class="evt-icon" style="color:{% if st == 'completed' %}var(--st-ok){% elif st == 'silent_close' %}var(--st-warn){% else %}var(--st-fail){% endif %};">{{ glyph("stop", 10) }}</span>
+      </div>
+      <div class="evt-who">
+        {{ agent_id_pill(e.detail.persona, dim=True, size='sm') }}
+        <span class="when">{{ e.at[11:16] }}</span>
+      </div>
+      <div class="evt-body">
+        <div class="wmark end">
+          <span class="label">wakeup {{ st }}</span>
+          <span class="sep-dot">·</span>
+          {{ model_pill(e.detail.model) }}
+          <span class="sep-dot">·</span>
+          <span><span class="dim">ctx</span> {% if e.detail.context_peak_pct is not none %}{{ e.detail.context_peak_pct | round | int }}%{% else %}—{% endif %}</span>
+          {% if e.detail.compaction_count and e.detail.compaction_count > 0 %}
+            <span class="sep-dot">·</span><span class="num-warn">compaction ×{{ e.detail.compaction_count }}</span>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+
+  {% elif e.kind == "task" %}
+    {% set to_klass = {"completed":"ok","in_progress":"run","running":"run","needs_input":"warn","failed":"fail","cancelled":""}.get(e.detail.status, "") %}
+    <div class="evt">
+      <div class="evt-gutter"><span class="evt-icon">{{ glyph("task", 11) }}</span></div>
+      <div class="evt-who">
+        <span class="mono dim">task</span>
+        <span class="when">{{ e.at[11:16] }}</span>
+      </div>
+      <div class="evt-body">
+        <div class="tstate">
+          <span class="mono dim">{{ e.detail.task_id[:13] }}</span>
+          <span class="sep-dot">·</span>
+          <span class="from">{{ e.detail.persona }}</span>
+          <span class="arrow">→</span>
+          <span class="to {{ to_klass }}">{{ e.detail.status }}</span>
+          {% if e.detail.goal %}<span class="sep-dot">·</span><span class="dim">{{ e.detail.goal }}</span>{% endif %}
+        </div>
+      </div>
+    </div>
+
+  {% elif e.kind == "note" %}
+    <div class="evt">
+      <div class="evt-gutter"><span class="evt-icon"{% if e.severity == "warn" %} style="color:var(--st-warn);"{% endif %}>{{ glyph("warn" if e.severity == "warn" else "chat", 11) }}</span></div>
+      <div class="evt-who">
+        {{ agent_id_pill(e.detail.persona, dim=True, size='sm') }}
+        <span class="when">{{ e.at[11:16] }}</span>
+      </div>
+      <div class="evt-body">
+        <details class="bub thinking" data-fold-id="note-{{ e.detail.wakeup_id }}-{{ e.at }}">
+          <summary style="list-style:none;cursor:pointer;outline:none;">
+            <div class="bub-h">note · {{ e.detail.text[:140] }}</div>
+          </summary>
+          <div>{{ e.detail.text }}</div>
+        </details>
+      </div>
+    </div>
+  {% endif %}
+{% endfor %}

@@ -1,0 +1,10 @@
+{# INNER content of one live wakeup card — the sse-swap target's body.
+   Replaced wholesale on every "wakeup-card:<id>" SSE event; the wrapper
+   element (with the sse-swap attribute) lives in activity_body.html.
+   Context: `card_events` — the wakeup's folded ActivityEvents, where the
+   open delta run carries detail.streaming=True. #}
+{% if card_events %}
+  {% with events = card_events %}{% include "partials/event_rows.html" %}{% endwith %}
+{% else %}
+  <div class="evt"><div class="evt-body"><span class="stamp">wakeup starting…</span></div></div>
+{% endif %}

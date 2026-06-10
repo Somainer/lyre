@@ -21,11 +21,16 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 import structlog
 
+from ..persistence.models import Wakeup
 from ..persistence.repositories import Repositories
+from ..runtime.transcript import transcript_path
+from ..transcript_tail import TranscriptTailer
+from .activity import LiveTranscriptFolder
 
 log = structlog.get_logger()
 
@@ -38,9 +43,26 @@ EVENT_ACTIVITY = "activity"
 EVENT_AGENT_STATUS = "agent-status"
 EVENT_HEALTH = "health"
 
+# Per-wakeup live-card events: "wakeup-card:<wakeup_id>". Dynamic names —
+# each active wakeup's card element declares sse-swap for its own id; the
+# SSE handler treats any name with this prefix as "render that card".
+CARD_EVENT_PREFIX = "wakeup-card:"
+
 ALL_EVENTS: frozenset[str] = frozenset(
     {EVENT_STATS, EVENT_ACTIVITY, EVENT_AGENT_STATUS, EVENT_HEALTH}
 )
+
+
+@dataclass
+class LiveWakeup:
+    """Broadcaster-held streaming state for one active wakeup: an
+    incremental file tailer + the fold of everything it has read.
+    Shared by every SSE subscriber — one file read per poll tick total,
+    regardless of how many browser tabs are watching."""
+
+    wakeup: Wakeup
+    tailer: TranscriptTailer
+    folder: LiveTranscriptFolder
 
 
 @dataclass
@@ -54,16 +76,6 @@ class _Cursor:
     wakeup_max_ended: str | None = None
     wakeup_active_count: int | None = None
     agent_max_created: str | None = None
-    # Sum of file sizes for every active wakeup's transcript.jsonl.
-    # The DB-side high-water marks above only flip when a wakeup STARTS
-    # or ENDS — they're silent during the long middle of a turn while
-    # the agent writes thinking_delta / content_delta / tool_use rows.
-    # Watching transcript-file growth here is what makes mid-wakeup
-    # SSE refresh actually fire, so the dashboard can stream the
-    # model's reasoning as it happens instead of standing still until
-    # ended_at finally moves. Size (vs mtime) chosen because transcripts
-    # are append-only and ms-resolution mtime is filesystem-dependent.
-    transcript_size_total: int | None = None
 
 
 @dataclass
@@ -79,6 +91,12 @@ class DashboardBroadcaster:
     repos: Repositories
     poll_interval_s: float = 1.0
     queue_max: int = 64
+    # Root of the object store, for deriving active wakeups' transcript
+    # paths (their transcript_uri column is NULL until end-of-wakeup).
+    # None disables live cards (tests / minimal embeddings) — the DB
+    # high-water events still work.
+    object_store_root: Path | None = None
+    _live: dict[str, LiveWakeup] = field(default_factory=dict)
     # Each event payload is the set of event names that changed; the
     # shutdown sentinel is an empty `frozenset()` plus a closing None.
     _subscribers: set[asyncio.Queue[set[str] | None]] = field(default_factory=set)
@@ -191,12 +209,11 @@ class DashboardBroadcaster:
     """
 
     async def _snapshot(self) -> _Cursor:
-        """Read current high-water marks in a single SQL query, plus a
-        cheap stat-walk over any active wakeup's transcript file."""
+        """Read current high-water marks in a single SQL query."""
         async with self.repos.conn.execute(self._SNAPSHOT_SQL) as cur:
             row = await cur.fetchone()
         if row is None:
-            return _Cursor(transcript_size_total=0)
+            return _Cursor()
         return _Cursor(
             mailbox_max_id=row["mailbox_max_id"],
             task_max_updated=row["task_max_updated"],
@@ -204,38 +221,70 @@ class DashboardBroadcaster:
             wakeup_max_ended=row["wakeup_max_ended"],
             wakeup_active_count=row["wakeup_active_count"],
             agent_max_created=row["agent_max_created"],
-            transcript_size_total=await self._transcript_size_total(),
         )
 
-    async def _transcript_size_total(self) -> int:
-        """Sum file sizes for every in-flight wakeup's transcript.
+    def live_folders(self) -> dict[str, LiveTranscriptFolder]:
+        """Snapshot view for the activity renderers — folded streaming
+        state per active wakeup, no file I/O on the render path."""
+        return {wid: lw.folder for wid, lw in self._live.items()}
 
-        Returns 0 (not None) when there are no active wakeups so any
-        previous in-flight bytes cleanly clear from the cursor — the
-        cursor uses `!=` for delta detection, and 0→None would
-        spuriously look "changed" forever.
+    def live_wakeup(self, wakeup_id: str) -> LiveWakeup | None:
+        return self._live.get(wakeup_id)
 
-        Cheap: typically zero or one active wakeups, each a single
-        `stat()` syscall. Wrapped in try/except because the file may
-        not yet exist (wakeup just started, agent_loop hasn't written
-        anything) or vanish under us (object store cleanup) — neither
-        is fatal.
+    async def _poll_live(self) -> set[str]:
+        """Tail every active wakeup's transcript incrementally; return a
+        per-card event name for each card whose content advanced.
+
+        The DB-side high-water marks only flip when a wakeup STARTS or
+        ENDS — they're silent during the long middle of a turn while the
+        agent streams thinking_delta / content_delta / tool_use rows.
+        This is what makes mid-wakeup SSE updates actually fire, so the
+        dashboard streams the model's output as it happens instead of
+        standing still until ended_at finally moves. Each tick reads
+        only the NEW bytes (offset-based tailer), so cost stays O(new
+        output), not O(transcript length).
         """
+        if self.object_store_root is None:
+            return set()
         try:
             active = await self.repos.wakeups.list_active()
         except Exception:  # noqa: BLE001 — never let the watcher crash the loop
-            return 0
-        total = 0
+            return set()
+        changed: set[str] = set()
+        seen: set[str] = set()
         for w in active:
-            uri = w.transcript_uri
-            if not uri or not uri.startswith("file://"):
-                continue
-            path = Path(uri[len("file://"):])
-            try:
-                total += path.stat().st_size
-            except OSError:
-                continue  # missing / unreadable — treat as zero
-        return total
+            seen.add(w.id)
+            lw = self._live.get(w.id)
+            if lw is None:
+                started_iso = (
+                    w.started_at.isoformat()
+                    if isinstance(w.started_at, datetime)
+                    else (w.started_at or "")
+                )
+                lw = LiveWakeup(
+                    wakeup=w,
+                    tailer=TranscriptTailer(
+                        transcript_path(self.object_store_root, w.id)
+                    ),
+                    folder=LiveTranscriptFolder(
+                        wakeup_id=w.id,
+                        persona=w.persona_name,
+                        task_id=w.task_id,
+                        started_at=started_iso,
+                    ),
+                )
+                self._live[w.id] = lw
+            rows = await asyncio.to_thread(lw.tailer.poll)
+            if rows:
+                lw.folder.ingest(rows)
+                changed.add(f"{CARD_EVENT_PREFIX}{w.id}")
+        # Wakeups that ended (or vanished) drop their state — the
+        # wakeup_max_ended watermark fires EVENT_ACTIVITY on the same
+        # tick, and the full timeline render replaces the card with the
+        # regular ended-wakeup events.
+        for gone in set(self._live) - seen:
+            del self._live[gone]
+        return changed
 
     async def _detect_changes(self) -> set[str]:
         """Compare a fresh snapshot to the stored cursor; return the set
@@ -259,15 +308,6 @@ class DashboardBroadcaster:
             new_cur.wakeup_active_count != old_cur.wakeup_active_count
         )
         agent_changed = new_cur.agent_max_created != old_cur.agent_max_created
-        # `transcript_size_total` is the mid-wakeup pulse — wakeup_*
-        # cover start / end, this covers everything between. We compare
-        # against `old_cur` but only when it has a value already, so
-        # the very first tick (which always looks "changed") doesn't
-        # storm subscribers right after prime().
-        transcript_changed = (
-            old_cur.transcript_size_total is not None
-            and new_cur.transcript_size_total != old_cur.transcript_size_total
-        )
 
         # Map raw deltas → public event names.
         # stats card: anything that affects the four tiles
@@ -279,18 +319,20 @@ class DashboardBroadcaster:
             or active_changed
         ):
             events.add(EVENT_STATS)
-        # activity timeline: same DB events + the new transcript pulse
-        # so thinking / tool_use / content_delta land in the feed within
-        # one poll tick of being written, not just at wakeup_end.
+        # activity timeline: lifecycle changes only. Mid-wakeup streaming
+        # deliberately does NOT re-render the timeline — it rides the
+        # per-card events from _poll_live below, so one growing wakeup
+        # costs one small card render per tick, not a full feed
+        # re-render + whole-timeline DOM swap.
         if (
             mailbox_changed
             or task_changed
             or wakeup_started_changed
             or wakeup_ended_changed
             or agent_changed
-            or transcript_changed
         ):
             events.add(EVENT_ACTIVITY)
+        events |= await self._poll_live()
         # topnav agent-status badge (count of running wakeups)
         if wakeup_started_changed or wakeup_ended_changed or active_changed:
             events.add(EVENT_AGENT_STATUS)

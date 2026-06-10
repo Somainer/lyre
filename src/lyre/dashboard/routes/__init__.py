@@ -5,10 +5,13 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from fastapi import Request
     from fastapi.templating import Jinja2Templates
 
     from ...persistence.repositories import Repositories
+    from ..activity import LiveTranscriptFolder
     from ..dashboard_broadcaster import DashboardBroadcaster
     from ..sse import MailboxBroadcaster
 
@@ -40,3 +43,18 @@ def dashboard_broadcaster_from(
         "DashboardBroadcaster | None",
         request.app.state.dashboard_broadcaster,
     )
+
+
+def object_store_root_from(request: Request) -> Path | None:
+    return cast(
+        "Path | None",
+        getattr(request.app.state, "object_store_root", None),
+    )
+
+
+def live_folders_from(request: Request) -> dict[str, LiveTranscriptFolder]:
+    """The dashboard broadcaster's per-active-wakeup streaming state —
+    empty when no broadcaster is attached (tests / minimal embedding),
+    in which case renderers fall back to a bounded file tail."""
+    bc = dashboard_broadcaster_from(request)
+    return bc.live_folders() if bc is not None else {}
