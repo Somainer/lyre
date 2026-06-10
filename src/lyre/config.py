@@ -768,26 +768,34 @@ class Config:
         log_dir = (
             Path(log_dir_raw).expanduser() if log_dir_raw else home / "logs"
         )
+        # Explicit `is not None` (not an `or` chain): a toml 0 is falsy and
+        # would silently fall through to the default instead of being
+        # floored like the env string "0" — same convention as
+        # max_concurrent_tasks above.
+        mb_raw = os.environ.get("LYRE_LOG_MAX_BYTES")
+        if mb_raw is None:
+            mb_raw = logging_raw.get("max_bytes")
         try:
-            log_max_bytes = int(
-                os.environ.get("LYRE_LOG_MAX_BYTES")
-                or logging_raw.get("max_bytes")
-                or 10 * 1024 * 1024
+            log_max_bytes = (
+                int(mb_raw) if mb_raw is not None else 10 * 1024 * 1024
             )
         except (ValueError, TypeError):
             log_max_bytes = 10 * 1024 * 1024
         if log_max_bytes < 1024:
             log_max_bytes = 1024
+        bk_raw = os.environ.get("LYRE_LOG_BACKUPS")
+        if bk_raw is None:
+            bk_raw = logging_raw.get("backup_count")
         try:
-            log_backup_count = int(
-                os.environ.get("LYRE_LOG_BACKUPS")
-                or logging_raw.get("backup_count")
-                or 5
-            )
+            log_backup_count = int(bk_raw) if bk_raw is not None else 5
         except (ValueError, TypeError):
             log_backup_count = 5
-        if log_backup_count < 0:
-            log_backup_count = 0
+        # Floor 1: RotatingFileHandler(maxBytes>0, backupCount=0) never
+        # renames — the file would grow unbounded while paying a
+        # close/reopen on every emit past the threshold. Disabling file
+        # logging is LYRE_LOG_TO_FILE=0's job, not backup_count=0's.
+        if log_backup_count < 1:
+            log_backup_count = 1
 
         # ---- coding-agent credential bundles ----
         # [coding_backends.<name>] auth_env = "..." [allowed_personas = [...]].

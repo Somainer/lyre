@@ -155,3 +155,32 @@ def test_config_parses_logging_section_with_env_override(
     assert cfg.log_level == "INFO"  # garbage → default, not a crash
     assert cfg.log_to_file is False
     assert cfg.log_dir == tmp_path / "elsewhere"
+
+
+def test_config_zero_footguns_are_floored_consistently(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """backup_count=0 with rotation on means an unbounded file plus a
+    close/reopen on every emit past the threshold — floored to 1
+    (disabling the file sink is LYRE_LOG_TO_FILE's job). And a toml 0
+    must behave like the env string "0" (floored), not silently fall
+    back to the default through an `or` chain."""
+    from lyre.config import Config
+
+    monkeypatch.setenv("LYRE_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    for var in ("LYRE_LOG_MAX_BYTES", "LYRE_LOG_BACKUPS"):
+        monkeypatch.delenv(var, raising=False)
+    (tmp_path / "config.toml").write_text(
+        '[owner]\nname = "o"\n\n[logging]\nmax_bytes = 0\nbackup_count = 0\n',
+        encoding="utf-8",
+    )
+    cfg = Config.from_env()
+    assert cfg.log_max_bytes == 1024  # floored, not defaulted to 10MB
+    assert cfg.log_backup_count == 1
+
+    monkeypatch.setenv("LYRE_LOG_MAX_BYTES", "0")
+    monkeypatch.setenv("LYRE_LOG_BACKUPS", "0")
+    cfg = Config.from_env()
+    assert cfg.log_max_bytes == 1024  # env "0" — same floor
+    assert cfg.log_backup_count == 1

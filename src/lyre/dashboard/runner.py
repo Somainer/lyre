@@ -81,6 +81,12 @@ async def run_dashboard(
         log_level="warning",
         access_log=False,
         lifespan="off",
+        # log_config=None: skip uvicorn's own dictConfig, which attaches
+        # stderr handlers to `uvicorn`/`uvicorn.error` with
+        # propagate=False — that would silently keep uvicorn records out
+        # of Lyre's JSONL log file. With None they propagate to the root
+        # logger and land in both of our sinks.
+        log_config=None,
     )
     server = uvicorn.Server(config)
 
