@@ -560,12 +560,31 @@ class SqliteTaskRepository:
         await self.conn.execute(
             """
             UPDATE tasks SET checkpoint = ?,
-                             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                             checkpoint_updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
             WHERE id = ? AND lease_holder = ?
             """,
             (json.dumps(checkpoint), task_id, holder_wakeup_id),
         )
         await _commit(self.conn)
+
+    async def thread_activity_since(self, thread_id: str, since_iso: str) -> bool:
+        """H2 progress signals ②③: any task on this thread that was created
+        (a child got dispatched — an outward act), reached a terminal state,
+        or had its checkpoint advanced via report_progress since ``since_iso``.
+        Deliberately NOT keyed on updated_at — lease claim/renew churn touches
+        that column every heartbeat and would mask real stalls."""
+        async with self.conn.execute(
+            """
+            SELECT 1 FROM tasks
+            WHERE json_extract(metadata, '$.thread_id') = ?
+              AND (created_at > ? OR completed_at > ? OR checkpoint_updated_at > ?)
+            LIMIT 1
+            """,
+            (thread_id, since_iso, since_iso, since_iso),
+        ) as cur:
+            row = await cur.fetchone()
+        return row is not None
 
     async def update_status(
         self, task_id: str, status: str, holder_wakeup_id: str | None = None
@@ -1064,6 +1083,31 @@ class SqliteWakeupRepository:
             rows = await cur.fetchall()
         return [self._row_to_wakeup(r) for r in rows]
 
+    async def thread_work_since(
+        self, thread_id: str, since_iso: str
+    ) -> tuple[int, int]:
+        """H2 work signal: the LARGEST single-wakeup (tool calls, output
+        tokens) among this thread's wakeups started since ``since_iso``.
+        MAX, not SUM, on purpose: the criterion is "did some wakeup this
+        round do substantial work" — several light waiting-style peeks must
+        never sum past the floor and get a waiter killed, while a thrashing
+        round's single heavy wakeup trips it on its own."""
+        async with self.conn.execute(
+            """
+            SELECT COALESCE(MAX(w.tool_call_count), 0) AS tools,
+                   COALESCE(MAX(w.token_output), 0)    AS out_tokens
+            FROM wakeups w
+            JOIN tasks t ON t.id = w.task_id
+            WHERE json_extract(t.metadata, '$.thread_id') = ?
+              AND w.started_at > ?
+            """,
+            (thread_id, since_iso),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return (0, 0)
+        return (int(row["tools"]), int(row["out_tokens"]))
+
     async def has_active_for_agent(self, agent_id: str) -> bool:
         """True iff some wakeup of ``agent_id`` is currently running
         (``ended_at IS NULL``) AND its task is still in flight. The
@@ -1346,6 +1390,27 @@ class SqliteMailboxRepository:
         async with self.conn.execute(sql, tuple(params)) as cur:
             rows = await cur.fetchall()
         return [self._row_to_msg(r) for r in rows]
+
+    async def thread_has_nonself_message_since(
+        self, thread_id: str, since_iso: str, self_actor: str
+    ) -> bool:
+        """H2 progress signal ①: did any mail land on this thread since
+        ``since_iso`` that is NOT the loop agent talking to itself? Both an
+        outward send (self → other) and an inbound reply (other → self)
+        mean the thread is alive; only pure self↔self traffic (the loop's
+        own scheduled wakes and self-notes) is excluded."""
+        async with self.conn.execute(
+            """
+            SELECT 1 FROM mailbox_messages
+            WHERE json_extract(metadata, '$.thread_id') = ?
+              AND delivered_at > ?
+              AND NOT (sender = ? AND recipient = ?)
+            LIMIT 1
+            """,
+            (thread_id, since_iso, self_actor, self_actor),
+        ) as cur:
+            row = await cur.fetchone()
+        return row is not None
 
     async def count_unread(
         self, recipient: str, *, min_urgency: str | None = None
@@ -1771,9 +1836,9 @@ class SqliteScheduledMailRepository:
               recipient, sender, urgency, title, body, task_id,
               parent_msg_id, metadata, scheduled_for,
               recur_kind, recur_value, recur_until, max_occurrences,
-              created_by_agent, created_by_task, status
+              max_no_progress, created_by_agent, created_by_task, status
             )
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending')
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending')
             RETURNING id
             """,
             (
@@ -1790,6 +1855,7 @@ class SqliteScheduledMailRepository:
                 spec.recur_value,
                 _iso(spec.recur_until) if spec.recur_until else None,
                 spec.max_occurrences,
+                spec.max_no_progress,
                 spec.created_by_agent,
                 spec.created_by_task,
             ),
@@ -1857,30 +1923,43 @@ class SqliteScheduledMailRepository:
         delivered_msg_id: int,
         next_scheduled_for: str | None,
         completed: bool,
+        no_progress_count: int | None = None,
     ) -> None:
+        # no_progress_count=None means "leave unchanged" (rows without the H2
+        # gate). The H2 evaluation passes the freshly computed value — 0 on
+        # progress is a deliberate reset, so the sentinel must be None, not 0.
+        npc_set = "" if no_progress_count is None else ", no_progress_count = ?"
         if completed:
+            params: list[object] = [delivered_msg_id]
+            if no_progress_count is not None:
+                params.append(no_progress_count)
+            params.append(mail_id)
             await self.conn.execute(
-                """
+                f"""
                 UPDATE scheduled_mail
                 SET status='completed',
                     last_delivery_id = ?,
                     last_delivered_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
-                    occurrence_count = occurrence_count + 1
+                    occurrence_count = occurrence_count + 1{npc_set}
                 WHERE id = ?
                 """,
-                (delivered_msg_id, mail_id),
+                tuple(params),
             )
         else:
+            params = [delivered_msg_id]
+            if no_progress_count is not None:
+                params.append(no_progress_count)
+            params.extend([next_scheduled_for, mail_id])
             await self.conn.execute(
-                """
+                f"""
                 UPDATE scheduled_mail
                 SET last_delivery_id = ?,
                     last_delivered_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
-                    occurrence_count = occurrence_count + 1,
+                    occurrence_count = occurrence_count + 1{npc_set},
                     scheduled_for = ?
                 WHERE id = ?
                 """,
-                (delivered_msg_id, next_scheduled_for, mail_id),
+                tuple(params),
             )
         await _commit(self.conn)
 
@@ -1948,6 +2027,12 @@ class SqliteScheduledMailRepository:
             recur_until=row["recur_until"],
             occurrence_count=row["occurrence_count"],
             max_occurrences=row["max_occurrences"] if "max_occurrences" in keys else None,
+            no_progress_count=(
+                row["no_progress_count"] if "no_progress_count" in keys else 0
+            ),
+            max_no_progress=(
+                row["max_no_progress"] if "max_no_progress" in keys else None
+            ),
             created_at=row["created_at"],
             created_by_agent=row["created_by_agent"],
             created_by_task=row["created_by_task"],
@@ -2423,6 +2508,11 @@ class SqliteSupervisionRepository:
         return SupervisionState(
             agent_id=row["agent_id"],
             restart_count=row["restart_count"],
+            total_restart_count=(
+                row["total_restart_count"]
+                if "total_restart_count" in set(row.keys())
+                else 0
+            ),
             window_start_at=row["window_start_at"],
             last_restart_at=row["last_restart_at"],
             last_reason=row["last_reason"],
@@ -2436,12 +2526,17 @@ class SqliteSupervisionRepository:
         max_seconds: int,
         now: datetime,
         reason: str | None = None,
+        max_total: int | None = None,
     ) -> bool:
         """Record one restart and return True iff it's within budget — at most
-        ``max_restarts`` restarts within a sliding ``max_seconds`` window. The
-        window resets when ``max_seconds`` has elapsed since it opened. An
-        over-count from a redelivered signal is fail-safe: it pushes toward
-        EARLIER escalation, never a missed bound."""
+        ``max_restarts`` restarts within a sliding ``max_seconds`` window, AND
+        (when ``max_total`` is set) at most ``max_total`` restarts over the
+        agent's lifetime. The window resets when ``max_seconds`` has elapsed
+        since it opened — which is exactly why the window alone cannot bound
+        wakeup-paced failures (each retry takes minutes and opens a fresh
+        window); the cumulative bound closes that loop. An over-count from a
+        redelivered signal is fail-safe: it pushes toward EARLIER escalation,
+        never a missed bound."""
         state = await self.get(agent_id)
         if state is None or (
             (now - state.window_start_at).total_seconds() > max_seconds
@@ -2452,27 +2547,33 @@ class SqliteSupervisionRepository:
         else:
             count = state.restart_count + 1
             window_start = state.window_start_at
+        total = (state.total_restart_count if state else 0) + 1
         await self.conn.execute(
             """
             INSERT INTO supervision_state
-              (agent_id, restart_count, window_start_at, last_restart_at, last_reason)
-            VALUES (?, ?, ?, ?, ?)
+              (agent_id, restart_count, total_restart_count, window_start_at,
+               last_restart_at, last_reason)
+            VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(agent_id) DO UPDATE SET
-              restart_count   = excluded.restart_count,
-              window_start_at = excluded.window_start_at,
-              last_restart_at = excluded.last_restart_at,
-              last_reason     = excluded.last_reason
+              restart_count       = excluded.restart_count,
+              total_restart_count = excluded.total_restart_count,
+              window_start_at     = excluded.window_start_at,
+              last_restart_at     = excluded.last_restart_at,
+              last_reason         = excluded.last_reason
             """,
             (
                 agent_id,
                 count,
+                total,
                 window_start.isoformat(),
                 now.isoformat(),
                 reason,
             ),
         )
         await _commit(self.conn)
-        return count <= max_restarts
+        within_window = count <= max_restarts
+        within_total = max_total is None or total <= max_total
+        return within_window and within_total
 
     async def mark_escalated(self, agent_id: str, now: datetime) -> None:
         await self.conn.execute(

@@ -248,3 +248,32 @@ async def test_ephemeral_task_terminated_is_suppressed(
         task, "wk", "failed", summary="x", failure_reason="E", transcript_uri=None
     )
     assert await repos.outbox.dequeue_batch(limit=10) == []
+
+
+@pytest.mark.asyncio
+async def test_wakeup_paced_failures_hit_the_cumulative_cap(
+    repos: SqliteRepositories,
+) -> None:
+    """The sliding window alone cannot bound a fan-in leg that fails once
+    per wakeup (minutes apart): every restart opens a fresh window
+    (count=1, always within budget). The lifetime total closes that loop:
+    spaced far beyond the window, the 11th restart (default max_total=10)
+    must report over budget."""
+    await repos.agents.create("eph-1", "reviewer", parent_agent_id="owner")
+    base = datetime(2026, 6, 10, 12, 0, 0, tzinfo=UTC)
+    for i in range(10):
+        within = await repos.supervision.bump_and_check_intensity(
+            "eph-1", 3, 60, base + timedelta(minutes=5 * i),
+            reason="failed", max_total=10,
+        )
+        assert within, f"restart {i + 1} should still be within budget"
+    over = await repos.supervision.bump_and_check_intensity(
+        "eph-1", 3, 60, base + timedelta(minutes=55),
+        reason="failed", max_total=10,
+    )
+    assert not over, "11th lifetime restart must exceed the cumulative cap"
+    st = await repos.supervision.get("eph-1")
+    assert st is not None and st.total_restart_count == 11
+    # The windowed count meanwhile reset every time — proving the window
+    # alone would never have escalated this loop.
+    assert st.restart_count == 1

@@ -283,6 +283,11 @@ class ScheduledMail(BaseModel):
     occurrence_count: int = 0
     # Loop budget (T4): max recurrences the scheduler fires (None = unbounded).
     max_occurrences: int | None = None
+    # No-progress gate (H2): consecutive worked-but-silent rounds on the
+    # loop's thread; reset on progress, untouched for light (waiting)
+    # rounds. None/0 max = gate off.
+    no_progress_count: int = 0
+    max_no_progress: int | None = None
 
     created_at: datetime | None = None
     created_by_agent: str | None = None
@@ -453,6 +458,9 @@ class SupervisionState(BaseModel):
 
     agent_id: str
     restart_count: int = 0
+    # Lifetime total — never resets; bounds wakeup-paced failure loops the
+    # sliding window structurally cannot (each retry opens a fresh window).
+    total_restart_count: int = 0
     window_start_at: datetime
     last_restart_at: datetime | None = None
     last_reason: str | None = None

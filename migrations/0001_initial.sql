@@ -90,7 +90,11 @@ CREATE TABLE IF NOT EXISTS tasks (
   git_context       TEXT,
   created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   updated_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-  completed_at      TEXT
+  completed_at      TEXT,
+  -- Set ONLY by update_checkpoint (report_progress). updated_at is polluted
+  -- by lease churn (claim/renew touch it), so the H2 no-progress gate needs
+  -- a dedicated "the agent recorded real progress" timestamp.
+  checkpoint_updated_at TEXT
 );
 
 CREATE INDEX IF NOT EXISTS tasks_status_lease ON tasks(status, lease_until);
@@ -287,6 +291,14 @@ CREATE TABLE IF NOT EXISTS scheduled_mail (
   -- is reached and marks the final wake high-urgency, so a "loop" (a recurring
   -- self-mail) can't re-arm forever regardless of what the model wants.
   max_occurrences   INTEGER,
+  -- No-progress gate (H2): consecutive worked-but-silent rounds observed on
+  -- the loop's thread (work above floor AND no outward output since the
+  -- previous occurrence). Reset to 0 whenever the thread shows progress;
+  -- waiting-style heartbeats (work below floor) leave it unchanged. NULL/0
+  -- max = gate off. Phase -1 enforces the cap exactly like max_occurrences:
+  -- the capping delivery is the FINAL wake and the row stops re-arming.
+  no_progress_count INTEGER NOT NULL DEFAULT 0,
+  max_no_progress   INTEGER,
   created_at        TEXT NOT NULL
                     DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   created_by_agent  TEXT,
@@ -427,6 +439,12 @@ CREATE INDEX IF NOT EXISTS fan_in_members_group ON fan_in_members(group_id);
 CREATE TABLE IF NOT EXISTS supervision_state (
   agent_id        TEXT PRIMARY KEY REFERENCES agents(id),
   restart_count   INTEGER NOT NULL DEFAULT 0,   -- restarts inside the current window
+  -- Lifetime restart total — never resets. The sliding window alone cannot
+  -- bound wakeup-paced failure loops: each retry takes minutes, so every
+  -- restart opens a fresh window (count=1, always within budget) and a
+  -- fan-in leg could burn LLM wakeups forever. Ephemerals are short-lived
+  -- by design, so a lifetime bound is the right shape.
+  total_restart_count INTEGER NOT NULL DEFAULT 0,
   window_start_at TEXT NOT NULL,                -- ISO 8601 UTC; window resets past max_seconds
   last_restart_at TEXT,
   last_reason     TEXT,                          -- coarse outcome of the restarted task
