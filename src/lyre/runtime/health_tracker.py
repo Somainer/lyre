@@ -4,7 +4,9 @@ MVP: in-memory circuit breaker. Per Q9 decision:
   - 60-second sliding window of failures per model_id
   - 3 failures within the window → open circuit (model is `failing`)
   - 180-second cooldown → half-open: next call attempted; if it succeeds we
-    close again
+    close again, if it FAILS the circuit re-opens for a fresh cooldown
+    (one probe failure suffices — re-requiring 3 in-window failures would
+    disarm the breaker after its first cooldown)
   - Not persisted: process restart resets all to healthy. Adding a
     `model_health` table is left to a future iteration.
 """
@@ -78,7 +80,16 @@ class HealthTracker:
         st = self._get(model_id)
         self._prune(st, now)
         st.failures.append(now)
-        if len(st.failures) >= self.fail_threshold and st.opened_at is None:
+        if st.opened_at is None:
+            if len(st.failures) >= self.fail_threshold:
+                st.opened_at = now
+        elif (now - st.opened_at) >= self.cooldown_s:
+            # Failure during half_open re-opens the circuit for a fresh
+            # cooldown. Without this, opened_at stays at its original
+            # value forever once the first cooldown elapses, state() is
+            # permanently "half_open", and a still-dead model is retried
+            # at full timeout cost on every turn for the rest of the
+            # process lifetime — the breaker protects exactly once.
             st.opened_at = now
 
     def mark_success(self, model_id: str) -> None:

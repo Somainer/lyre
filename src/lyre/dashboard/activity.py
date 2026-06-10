@@ -69,9 +69,11 @@ def _severity_for_wakeup(end_status: str | None) -> str:
     if end_status == "needs_continuation":
         return "warn"
     # "abandoned" is set when the scheduler force-closes an orphan
-    # wakeup row (recovery sweep or failed claim_lease). Worth seeing
-    # in the timeline so operators notice repeat occurrences, but not
-    # an alert — the underlying task lifecycle is unaffected.
+    # wakeup row (the close_orphans_for_task recovery sweep; lost claim
+    # races no longer create these — start+claim commit atomically and
+    # roll back together). Worth seeing in the timeline so operators
+    # notice repeat occurrences, but not an alert — the underlying task
+    # lifecycle is unaffected.
     if end_status == "abandoned":
         return "warn"
     return "info"

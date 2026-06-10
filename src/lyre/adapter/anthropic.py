@@ -24,6 +24,7 @@ from .llm_adapter import (
     ContentDelta,
     LyreMessage,
     LyreToolSpec,
+    StopReason,
     StreamEvent,
     ThinkingBlockComplete,
     ThinkingDelta,
@@ -36,6 +37,24 @@ from .llm_adapter import (
 
 if TYPE_CHECKING:
     from ..runtime.blob_store import BlobStore
+
+# Anthropic wire stop_reason → Lyre StopReason. stop_sequence is a clean
+# intentional stop; refusal means no usable content (error-shaped, like
+# OpenAI's content_filter); pause_turn only occurs with server tools Lyre
+# never requests, end_turn is the safe degradation. Unknown values from
+# compat endpoints also degrade to end_turn via .get().
+_STOP_REASON_MAP: dict[str, StopReason] = {
+    "end_turn": "end_turn",
+    "tool_use": "tool_use",
+    "max_tokens": "max_tokens",
+    "stop_sequence": "end_turn",
+    "refusal": "error",
+    "pause_turn": "end_turn",
+    # Claude 4.5+ truncation signal when the turn would overflow the
+    # context window — same honest-truncation class as max_tokens; falling
+    # through to end_turn would classify a truncated wakeup 'completed'.
+    "model_context_window_exceeded": "max_tokens",
+}
 
 
 class AnthropicAdapter:
@@ -131,8 +150,10 @@ class AnthropicAdapter:
         # input count — without it every turn reports input_tokens=0, which
         # silently disables auto-compaction and pins context_peak_tokens at 0.
         # Default 0 preserves today's behavior for compat endpoints that omit
-        # a usable message_start usage.
-        usage_holder: dict[str, int] = {"input_tokens": 0}
+        # a usable message_start usage. The same holder also carries the
+        # stop_reason stashed at message_delta time (a str) for the single
+        # TurnComplete emitted at message_stop — hence the Any value type.
+        usage_holder: dict[str, Any] = {"input_tokens": 0}
 
         async with self.client.messages.stream(**kwargs) as stream:
             async for event in stream:
@@ -239,7 +260,7 @@ class AnthropicAdapter:
         evt: Any,
         tool_use_buffers: dict[int, dict[str, Any]],
         thinking_buffers: dict[int, dict[str, str]] | None = None,
-        usage_holder: dict[str, int] | None = None,
+        usage_holder: dict[str, Any] | None = None,
     ) -> StreamEvent | None:
         if thinking_buffers is None:
             thinking_buffers = {}
@@ -333,11 +354,19 @@ class AnthropicAdapter:
 
         # MessageDeltaEvent: contains stop_reason in .delta + usage tally in .usage
         if isinstance(evt, MessageDeltaEvent):
-            # Anthropic emits stop_reason here, not in MessageStopEvent.
+            # Anthropic emits stop_reason here, not in MessageStopEvent — but
+            # the SDK's delta usage is a REQUIRED field, so this branch must
+            # return Usage. Stash the stop_reason for MessageStopEvent to
+            # emit; returning it here would be unreachable (usage wins) and
+            # emitting both would double-fire TurnComplete (the loop is
+            # last-wins, so a trailing fallback would erase the real reason).
+            # Before this stash existed, every Anthropic turn surfaced as
+            # end_turn and max_tokens truncation was classified 'completed'.
             delta = getattr(evt, "delta", None)
             stop_reason = getattr(delta, "stop_reason", None) if delta else None
+            if stop_reason:
+                usage_holder["stop_reason"] = stop_reason
             usage = getattr(evt, "usage", None)
-            # Prefer emitting Usage first; TurnComplete is emitted by MessageStopEvent.
             if usage is not None:
                 # input_tokens comes from the stashed message_start count (the
                 # delta usage's input_tokens is None on the wire); fall back to
@@ -348,11 +377,17 @@ class AnthropicAdapter:
                     or (getattr(usage, "input_tokens", 0) or 0),
                     output_tokens=getattr(usage, "output_tokens", 0) or 0,
                 )
-            if stop_reason:
-                return TurnComplete(stop_reason=stop_reason)
 
-        # MessageStopEvent: stream ended; emit a fallback TurnComplete if not yet done
+        # MessageStopEvent: stream ended; emit the single TurnComplete with
+        # the stop_reason stashed from message_delta (end_turn when the
+        # stream never carried one).
         if isinstance(evt, MessageStopEvent):
-            return TurnComplete(stop_reason="end_turn")
+            raw = usage_holder.get("stop_reason")
+            mapped: StopReason = (
+                _STOP_REASON_MAP.get(raw, "end_turn")
+                if isinstance(raw, str)
+                else "end_turn"
+            )
+            return TurnComplete(stop_reason=mapped)
 
         return None

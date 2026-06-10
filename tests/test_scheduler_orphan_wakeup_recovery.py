@@ -304,12 +304,11 @@ async def test_run_task_inline_sweeps_prior_orphan_before_new_wakeup(
 async def test_failed_claim_lease_does_not_leak_wakeup_row(
     repos: SqliteRepositories, tmp_path: Path,
 ) -> None:
-    """The leak we found by reading code: ``wakeups.start`` commits
-    BEFORE ``claim_lease`` is attempted. When the claim fails (another
-    holder still owns the lease), the early-return must close the
-    wakeup row we just INSERTed — otherwise this very code path
-    silently creates orphans during normal lease contention, no crash
-    needed."""
+    """Losing the claim race must leave no open wakeup row. The wakeup
+    INSERT and the lease claim now commit in ONE transaction; on a lost
+    race the transaction rolls back, so normal lease contention leaves
+    no trace at all (previously the row was closed as 'abandoned' in a
+    second commit — itself a crash window)."""
     cfg = _make_config(tmp_path)
     await repos.personas.upsert(
         Persona(name="worker", role_description="w", system_prompt="w")
@@ -417,3 +416,59 @@ async def test_scheduler_startup_silent_when_no_orphans(
 
     captured = capsys.readouterr()
     assert "terminal_task_orphan_wakeups_detected" not in captured.out
+
+
+@pytest.mark.asyncio
+async def test_claim_lease_crash_window_cannot_brick_the_agent(
+    repos: SqliteRepositories, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The C-1 kill window: wakeups.start used to commit BEFORE
+    claim_lease, so a SIGKILL (or a claim raising, e.g. busy_timeout)
+    between the two left an open wakeup row on a still-'pending'
+    leaseless task. has_active_for_agent counts that as in-flight, so
+    Phase 3 skipped every future task of the agent forever — and the
+    only sweeper sits behind that very gate. With the atomic
+    start+claim transaction, a claim failure rolls the row back out:
+    the task stays pending and dispatchable."""
+    cfg = _make_config(tmp_path)
+    await repos.personas.upsert(
+        Persona(name="worker", role_description="w", system_prompt="w")
+    )
+    await repos.agents.create(agent_id="worker", persona_name="worker")
+    task_id = await repos.tasks.create(
+        TaskSpec(
+            persona_name="worker", agent_id="worker",
+            goal="g", acceptance="a",
+        )
+    )
+
+    async def _claim_boom(*args: object, **kwargs: object) -> bool:
+        raise RuntimeError("simulated kill between start and claim")
+
+    monkeypatch.setattr(repos.tasks, "claim_lease", _claim_boom)
+
+    fake = FakeAdapter()
+    registry = fake_registry(fake_entry(id="fake.workhorse", tier="workhorse"))
+    scheduler = Scheduler(
+        repos, cfg, poll_interval_s=0.05,
+        registry=registry, adapter_for_test=lambda e: fake,
+    )
+
+    with pytest.raises(RuntimeError, match="simulated kill"):
+        await scheduler._run_task_inline(task_id)
+
+    # The transaction must have rolled the wakeup INSERT back out.
+    async with repos.conn.execute(
+        "SELECT COUNT(*) AS n FROM wakeups WHERE task_id = ?", (task_id,),
+    ) as cur:
+        row = await cur.fetchone()
+    assert row is not None
+    assert row["n"] == 0, "no wakeup row may survive the failed claim"
+
+    # The agent is NOT bricked: the dispatch gate sees it as idle and the
+    # task is still pending, so the next tick simply retries.
+    assert not await repos.wakeups.has_active_for_agent("worker")
+    task = await repos.tasks.get(task_id)
+    assert task is not None
+    assert task.status == "pending"
