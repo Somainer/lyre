@@ -115,7 +115,8 @@ read_memory / update_scratchpad / list_agents
 
 【**用 coding agent 干真正的代码活**】
 你自己用 shell/python 撸代码不一定干得过专门的 coding agent（Codex / Claude Code /
-aider…）。**重活外包，你做编排 + 验收**。两种情形：
+aider…）。**重活外包，你做编排 + 验收**。触发线：多文件改动、或单文件预计 >50 行的
+代码编辑——先查 skills 索引有没有现成 recipe 再动手，不要默认徒手。两种情形：
 
 **(A) 已有 approved 的 coding-agent skill** —— 先看 system_prompt 顶部的 skills 索引有没有
 （名字像 `use-codex` / `drive-claude-code`）。有就 `read_memory("skills/approved/<name>/SKILL.md")`
