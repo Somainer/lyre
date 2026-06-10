@@ -216,7 +216,7 @@ Set in shell or `.env` (auto-loaded). Main knobs in `docs/configuration.md`
 |---|---|
 | `ANTHROPIC_API_KEY` / `DEEPSEEK_API_KEY` / `OPENAI_API_KEY` | Provider auth (at least one) |
 | `LYRE_MODEL_OVERRIDE` | Force every wakeup to one `model_id` (testing) |
-| `LYRE_DEFAULT_MODEL` | Parsed but **not consumed** by the runtime — there is no fallback; personas must declare `model_preference` (the scheduler raises otherwise). Implement-or-delete is pending (DEEP_REVIEW E5) |
+| `LYRE_DEFAULT_MODEL` | Parsed but **not consumed** by the runtime — there is no fallback; personas must declare `model_preference` (the scheduler raises otherwise). Implement-or-delete decision pending |
 | `LYRE_COMPACT_THRESHOLD` | Compaction trigger as fraction of context window (default `0.7`) |
 | `LYRE_HOME` / `LYRE_DB_PATH` / `LYRE_OBJECT_STORE` / `LYRE_MEMORY_PATH` | Storage paths |
 
@@ -226,7 +226,6 @@ Set in shell or `.env` (auto-loaded). Main knobs in `docs/configuration.md`
 `FOUNDATION.md`, `AGENT_CONTRACT.md`, `TRANSACTION_BOUNDARIES.md`,
 `PERSISTENCE_SCHEMA.md`, `AGENT_RUNTIME.md`, `PERSONAS.md`, `DASHBOARD.md`,
 `RUNTIME_CURRENT.md` (living as-built runtime overview — start here for how
-the runtime works today), `DEEP_REVIEW_2026-06.md` (deep review: findings +
-entropy-reduction/iteration plans), `PLUGINS.md` (parked spec — proposed,
-not scheduled).
+the runtime works today; §7 carries the known-deviations table) and
+`PLUGINS.md` (parked spec — proposed, not scheduled).
 Don't translate when editing — a one-line English summary alongside is enough.

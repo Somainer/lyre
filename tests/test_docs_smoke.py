@@ -1,4 +1,4 @@
-"""Doc-drift tripwires (E1 canon alignment, DEEP_REVIEW_2026-06).
+"""Doc-drift tripwires (2026-06 canon alignment).
 
 Fully offline: no subprocess, no DB, no provider keys. Each test pins one
 high-value fact in the public docs to the code that implements it, so the
@@ -19,8 +19,8 @@ def _seeded_agent_ids() -> set[str]:
     ``seed.seed_default_agents`` does: every shipped persona whose kind is
     not ``spawn_only`` gets one agent whose id is ``display_name or name``.
 
-    Deliberately NOT hardcoded (the whole point of finding [45] was that
-    the docs said ``leader`` while the seeded singleton is ``dispatcher``):
+    Deliberately NOT hardcoded (the original drift was exactly that the
+    docs said ``leader`` while the seeded singleton is ``dispatcher``):
     if the persona roster or a display_name changes, this set follows the
     code and the docs must follow too.
     """
@@ -33,7 +33,7 @@ def _seeded_agent_ids() -> set[str]:
 
 
 def test_quick_start_send_targets_are_seeded_agent_ids() -> None:
-    """Finding [45]: the user docs said `lyre send leader ...` but
+    """Drift class: the user docs said `lyre send leader ...` but
     bootstrap seeds `dispatcher` — the very first command a new user runs
     failed with 'unknown agent'. Pin every `lyre send <target>` in ALL
     three user-facing docs to the seeded set (the drift class hit all of
@@ -68,7 +68,7 @@ def test_quick_start_send_targets_are_seeded_agent_ids() -> None:
 
 
 def test_cli_reference_send_flags_all_exist_on_the_click_command() -> None:
-    """Finding [36]: cli-reference.md documented a `--reply-to` flag that
+    """Drift class: cli-reference.md documented a `--reply-to` flag that
     `lyre send` never had. Every `--flag` the doc shows for `lyre send`
     must be a registered option on the click command (introspected from
     lyre.main — offline, no subprocess).

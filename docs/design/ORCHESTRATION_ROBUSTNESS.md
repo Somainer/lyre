@@ -8,7 +8,7 @@
 >
 > **owner 对齐**:2026-06-08。范围 **O1+O2+O3**(P0+P1),**O4 缓**。顺序:**O1+O2 先于 Round-3 的 H2**,O3 在 H2 之后。源自 11-agent 复盘(5 findings → 3 真缺口 + 2 非缺口)。
 >
-> **状态**:**已落地**——O1+O2 shipped in PR #51(commit `a267a34`),O3a shipped in PR #54(commit `cbabf27`)。§7 全局顺序中**仍未落地的只剩 H2**(跨 wakeup 无进展闸,设计在 [`LONG_RUNNING_ROBUSTNESS_3.md`](./LONG_RUNNING_ROBUSTNESS_3.md),零代码,planned as F1 in `DEEP_REVIEW_2026-06.md`);O3b 维持 deferred(未观测)。
+> **状态**:**已落地**——O1+O2 shipped in PR #51(commit `a267a34`),O3a shipped in PR #54(commit `cbabf27`)。§7 全局顺序中**仍未落地的只剩 H2**(跨 wakeup 无进展闸,设计在 [`LONG_RUNNING_ROBUSTNESS_3.md`](./LONG_RUNNING_ROBUSTNESS_3.md),零代码,planned next);O3b 维持 deferred(未观测)。
 
 ---
 
