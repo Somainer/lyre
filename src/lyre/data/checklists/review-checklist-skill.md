@@ -38,6 +38,9 @@ body 不应包含：
 
 ## 5. 准确
 - frontmatter `description` 跟 body 实际能解决的问题一致？
+- `description` 含明确的"何时用"触发条件？agent 平时只看得到 name + description
+  （skills 索引是折叠的，body 要 `read_memory` 才展开）——描述里没有触发词的 skill
+  等于不存在。2026-06 实地取证：3 个 approved coding-agent skill 在 26h 窗口内 0 次被调用。
 - `scope` 字段标识合理（global / per-repo / per-language）？
 
 ## 决议落地

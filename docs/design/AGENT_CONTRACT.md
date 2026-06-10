@@ -253,6 +253,7 @@ MVP Lyre 工具集：
 
 > **说明**：每个 persona 的实际可用工具是上表的子集，由 `personas/<name>.md` 的 `allowed_lyre_tools` 决定。例如 `worker-maintainer` 没有 `dispatch_task` / `create_agent`；`owner` 不是 LLM agent 不持有任何工具。
 > **read_file / write_file / git_commit / git_push 等不在此处** —— 它们都通过 `python_exec` / `shell_exec` 在 agent 进程内执行，不经 Lyre gateway。Lyre 仅作事后观测（通过 agent 自报 `report_side_effect` 或 git 状态检查）。
+> **2026-06 实地复核：维持排除。**（English: file tools stay excluded — field-validated; falsifiable revival conditions below.）对一次 live 部署的全量取证（434 transcripts / 1522 次 exec 调用）显示：原地编辑仅占 exec 的 0.46%，无一例失败可归因于缺文件工具；大参数截断的真实根因是输出预算在 content-in-args 发射中途耗尽（runtime 对 `_raw` 的处理即针对此），换成 `write_file` 形状的工具不改变 content-in-args 的预算占用，救不了截断。**复活条件**——任一 tier、可观比例地观测到下列任一类时重审，引入最小文件工具组（read_file / edit_file / write_file）：① 编辑重试死循环、且 edit_file 的唯一匹配检查本可避免；② max_turns 耗尽且 turn log 以编辑为主；③ 进程被杀导致半写文件损坏。第一响应是 prompt 层指导（skill / persona 提示），引入工具是第二响应。
 > **mark_processed → mark_read 重命名（migration 0005）**：旧 `mark_processed(msg_id)` 推进 cursor 的语义已被 per-message `read_at` 取代。新工具叫 `mark_read`，并且 `mailbox_read` 自动 mark，所以大多数时候根本不需要显式调用。
 
 > **`read_file` / `write_file` / `run_command` / `git_commit` / `git_push` 等不在此处**——它们都通过 agent 进程内 shell 直接执行，不经 Lyre gateway。Lyre 仅作事后观测（通过 agent 自报或 git 状态检查）。
