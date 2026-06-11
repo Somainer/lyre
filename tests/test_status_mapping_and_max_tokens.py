@@ -272,6 +272,145 @@ async def test_dispatch_tool_passes_through_well_formed_args(
 
 
 # ---------------------------------------------------------------------------
+# S1: a budget-truncated turn's FINAL tool call is refused even when its
+# arguments parse — constrained decoding / JSON-repairing gateways can close
+# a string cut mid-emission into a VALID but silently shortened payload
+# (the classic catastrophe: `rm /path/...` arriving as `rm /`).
+# ---------------------------------------------------------------------------
+
+
+def _recording_registry() -> tuple[object, list[dict[str, object]]]:
+    from lyre.runtime.tools import Tool, ToolRegistry
+
+    executed: list[dict[str, object]] = []
+
+    async def _handler(ctx: object, args: dict[str, object]) -> str:
+        executed.append({k: v for k, v in args.items() if k != "_tool_use_id"})
+        return "ok"
+
+    registry = ToolRegistry()
+    registry.register(
+        Tool(
+            name="probe",
+            description="records executions",
+            input_schema={"type": "object"},
+            handler=_handler,
+        )
+    )
+    return registry, executed
+
+
+def _probe_loop(tmp_path: Path, adapter: object, wakeup_id: str):  # type: ignore[no-untyped-def]
+    from lyre.runtime.tools import ToolContext
+
+    from .helpers import build_single_candidate_loop
+
+    registry, executed = _recording_registry()
+    object_store = tmp_path / "objstore"
+    object_store.mkdir(exist_ok=True)
+    transcript = TranscriptWriter(object_store, wakeup_id)
+    loop = build_single_candidate_loop(
+        adapter, transcript, max_turns=10,
+        tool_registry=registry,
+        tool_context=ToolContext(
+            repos=None,  # type: ignore[arg-type]
+            task_id="t", wakeup_id="w",
+            persona_name="worker-maintainer", agent_id="worker-maintainer/x",
+        ),
+        allowed_tools=["probe"],
+    )
+    return loop, transcript, executed
+
+
+@pytest.mark.asyncio
+async def test_truncated_turn_final_tool_call_is_not_executed(
+    tmp_path: Path,
+) -> None:
+    """Turn 1 is cut by max_tokens after emitting two parseable calls: the
+    first (output followed it — provably complete) executes; the LAST is
+    refused with re-issue guidance. The model re-issues it on turn 2 (a
+    clean turn) and it runs."""
+    from lyre.adapter.llm_adapter import (
+        ContentDelta,
+        LyreContentBlock,
+        LyreMessage,
+        ToolUseComplete,
+        TurnComplete,
+    )
+
+    from .fake_adapter import FakeAdapter
+
+    adapter = FakeAdapter()
+    adapter.push_turn([
+        ToolUseComplete(id="t1", name="probe", input={"path": "/tmp/full"}),
+        ToolUseComplete(id="t2", name="probe", input={"path": "/"}),
+        TurnComplete(stop_reason="max_tokens"),
+    ])
+    adapter.push_turn([
+        ToolUseComplete(id="t3", name="probe", input={"path": "/"}),
+        TurnComplete(stop_reason="tool_use"),
+    ])
+    adapter.push_turn([
+        ContentDelta(text="done"),
+        TurnComplete(stop_reason="end_turn"),
+    ])
+    loop, transcript, executed = _probe_loop(tmp_path, adapter, "wakeup-s1")
+
+    await loop.run(
+        system_prompt="",
+        initial_messages=[LyreMessage(
+            role="user",
+            content=[LyreContentBlock(type="text", text="go")],
+        )],
+    )
+    transcript.close()
+
+    # Turn 1: only the provably-complete first call ran. Turn 2: the
+    # re-issue ran.
+    assert executed == [{"path": "/tmp/full"}, {"path": "/"}]
+    text = transcript.path.read_text()
+    assert "was NOT executed" in text
+    assert "re-issue it EXACTLY" in text
+
+
+@pytest.mark.asyncio
+async def test_clean_turn_executes_every_tool_call(tmp_path: Path) -> None:
+    """No false positive: a turn that ends with stop_reason=tool_use runs
+    every call, including the last."""
+    from lyre.adapter.llm_adapter import (
+        ContentDelta,
+        LyreContentBlock,
+        LyreMessage,
+        ToolUseComplete,
+        TurnComplete,
+    )
+
+    from .fake_adapter import FakeAdapter
+
+    adapter = FakeAdapter()
+    adapter.push_turn([
+        ToolUseComplete(id="t1", name="probe", input={"n": 1}),
+        ToolUseComplete(id="t2", name="probe", input={"n": 2}),
+        TurnComplete(stop_reason="tool_use"),
+    ])
+    adapter.push_turn([
+        ContentDelta(text="done"),
+        TurnComplete(stop_reason="end_turn"),
+    ])
+    loop, transcript, executed = _probe_loop(tmp_path, adapter, "wakeup-s1c")
+
+    await loop.run(
+        system_prompt="",
+        initial_messages=[LyreMessage(
+            role="user",
+            content=[LyreContentBlock(type="text", text="go")],
+        )],
+    )
+    transcript.close()
+    assert executed == [{"n": 1}, {"n": 2}]
+
+
+# ---------------------------------------------------------------------------
 # P3: phantom-delegation observability
 # ---------------------------------------------------------------------------
 

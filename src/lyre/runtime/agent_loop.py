@@ -684,6 +684,12 @@ class AgentLoop:
                 result, is_error, view_blocks = await self._dispatch_tool(
                     tu["name"], tu["id"], tu["input"],
                     stop_reason=stop_reason,
+                    # Only the call being emitted AT the budget cut can be
+                    # silently shortened — that's necessarily the last one.
+                    suspect_truncated=(
+                        stop_reason == "max_tokens"
+                        and tu is tool_uses_this_turn[-1]
+                    ),
                 )
                 tool_outcomes.append(is_error)
                 tool_result_blocks.append(
@@ -1326,6 +1332,7 @@ class AgentLoop:
         tool_use_id: str,
         tool_input: dict[str, Any],
         stop_reason: str | None = None,
+        suspect_truncated: bool = False,
     ) -> tuple[str, bool, list[LyreContentBlock]]:
         # Third element: multimodal view blocks drained from a dict result.
         # They MUST be popped off the result dict BEFORE it is serialized,
@@ -1384,6 +1391,34 @@ class AgentLoop:
                 f"calls), omit verbose inline content, or skip this tool "
                 f"for now and continue the task differently. "
                 f"First bytes received: {raw[:200]!r}…",
+                True,
+                [],
+            )
+        # A budget-truncated turn's FINAL tool call is refused even when its
+        # arguments parse: constrained decoding / JSON-repairing gateways can
+        # close a string that was cut mid-emission, yielding a VALID but
+        # silently shortened payload — the classic catastrophe is
+        # `rm /path/...` arriving as `rm /`. Syntax checking (`_raw` above)
+        # cannot see this; the turn-level truncation signal can. Calls
+        # BEFORE the last one had output after them, so they are complete
+        # and run normally. Observed in the wild on another coding agent;
+        # gated here preemptively (owner decision 2026-06-11).
+        if suspect_truncated:
+            log.warning(
+                "tool_call_suspect_truncated",
+                tool=name,
+                stop_reason=stop_reason,
+            )
+            return (
+                f"Tool '{name}' was NOT executed. This turn hit its "
+                f"output-token budget (max_tokens={self.max_tokens}) while "
+                f"or just after emitting this call — a truncated emission "
+                f"can be silently 'repaired' into a shorter, valid-looking "
+                f"payload (e.g. a path cut mid-string), so the final call "
+                f"of a truncated turn is never run. If this call was "
+                f"complete as you intended it, re-issue it EXACTLY as "
+                f"before and it will run normally. If you were emitting a "
+                f"large payload, split it across multiple smaller calls.",
                 True,
                 [],
             )
