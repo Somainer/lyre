@@ -94,6 +94,12 @@ XML（只有 name+description，正文按需经 `read_memory` 加载）。初始
   畸形参数走 `_raw` 守护；多模态结果块挂在 tool_result user 消息上。assistant 消息
   追加时 thinking block 必须在最前（Anthropic extended-thinking 绑定约束，见
   `compact.py` / AGENT_RUNTIME 对应节）。
+- **截断 turn 末位调用门控（S1）**：`stop_reason=max_tokens` 的 turn，其**最后一个**
+  tool_use 即使参数解析合法也拒绝执行——约束解码/修复型网关可把切在字符串中间的
+  发射"补"成合法但腰斩的负载（`rm /path/...` 到达时变成 `rm /`，他厂实例）。语法
+  检测（`_raw`）看不见这种截断，turn 级截断信号看得见。末位之前的调用后面还有输出、
+  必然完整，照常执行；模型收到"未执行，若完整请原样重发"的 tool_result，下一 turn
+  重发即正常运行。
 - **silent-turn nudge**：本 turn 只用了信息收集类工具（不在 `_USER_FACING_TOOLS`
   集合内）且还没做过用户可见动作 → 注入催促，预算 2 次。
 - **H1 死循环闸**：对本 turn 工具调用做 (name, args) 指纹；与上 turn 完全相同连续
