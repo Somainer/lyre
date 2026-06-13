@@ -15,10 +15,8 @@ from lyre.runtime.identity import (
     agent_notes_rel_path,
     compose_id,
     flat_id,
-    is_bare_id,
     is_valid_agent_id,
     split_id,
-    validate_agent_id,
 )
 
 # ---------------------------------------------------------------------------
@@ -69,21 +67,6 @@ def test_invalid_ids(agent_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# validate_agent_id raises
-# ---------------------------------------------------------------------------
-
-
-def test_validate_agent_id_raises_on_bad_id() -> None:
-    with pytest.raises(ValueError, match="invalid agent_id"):
-        validate_agent_id("Bad Id")
-
-
-def test_validate_agent_id_accepts_good_id() -> None:
-    # No raise.
-    validate_agent_id("worker-maintainer/refactor-auth")
-
-
-# ---------------------------------------------------------------------------
 # split_id / compose_id round-trip
 # ---------------------------------------------------------------------------
 
@@ -106,30 +89,6 @@ def test_compose_id_roundtrip() -> None:
     assert compose_id("worker", "scout") == "worker/scout"
     assert compose_id("worker", None) == "worker"
     assert compose_id("worker", "") == "worker"
-
-
-# ---------------------------------------------------------------------------
-# Bare-id predicate
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    "agent_id,bare",
-    [
-        ("owner", True),
-        ("dispatcher", True),
-        ("luna", True),         # custom display_name for the dispatcher persona
-        ("analyst-1", True),
-        ("worker-maintainer/refactor-auth", False),
-        ("reviewer/pr-142", False),
-    ],
-)
-def test_is_bare_id(agent_id: str, bare: bool) -> None:
-    """``is_bare_id`` is purely syntactic — it's TRUE iff the id has no
-    ``/``. It deliberately does NOT know about which personas are
-    bootstrap-seeded (that's DB state, queried via
-    ``parent_agent_id IS NULL`` at call sites that need it)."""
-    assert is_bare_id(agent_id) == bare
 
 
 # ---------------------------------------------------------------------------

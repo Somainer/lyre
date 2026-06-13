@@ -14,7 +14,6 @@ TaskStatus = Literal[
     "pending", "in_progress", "needs_input", "completed", "failed", "cancelled"
 ]
 PersonaStatus = Literal["proposed", "approved", "deprecated"]
-SkillStatus = Literal["proposed", "approved", "deprecated"]
 # "busy" used to be a third value here but nothing in the runtime ever
 # wrote it back — true running-vs-not-running state lives in the
 # wakeups table (``ended_at IS NULL`` = running). Both ``list_agents``
@@ -193,7 +192,6 @@ class Task(BaseModel):
     lease_until: datetime | None = None
     checkpoint: dict[str, Any] | None = None
     tier_overrides: dict[str, Any] | None = None
-    deadline: datetime | None = None
     metadata: dict[str, Any] | None = None
     # Optional git working-copy provisioning. See ``GitContext``.
     git_context: GitContext | None = None
@@ -219,7 +217,6 @@ class TaskSpec(BaseModel):
     parent_task_id: str | None = None
     lease_duration_s: int = 1800
     tier_overrides: dict[str, Any] | None = None
-    deadline: datetime | None = None
     metadata: dict[str, Any] | None = None
     # See Task.git_context — set when the worker needs a checked-out
     # working copy; omit when the task is non-git (research, skill
@@ -403,33 +400,6 @@ class OutboxRow(BaseModel):
     last_error: str | None = None
 
 
-class Skill(BaseModel):
-    id: str
-    name: str
-    frontmatter: dict[str, Any]
-    body: str
-    status: SkillStatus
-    source_task_id: str | None = None
-    reviewer: str | None = None
-    reviewed_at: datetime | None = None
-    scope: str | None = None
-    metadata: dict[str, Any] | None = None
-    created_at: datetime | None = None
-    updated_at: datetime | None = None
-
-
-class Artifact(BaseModel):
-    id: str
-    task_id: str
-    wakeup_id: str
-    kind: str
-    content_hash: str
-    blob_uri: str
-    size_bytes: int | None = None
-    metadata: dict[str, Any] | None = None
-    created_at: datetime | None = None
-
-
 class FanInGroup(BaseModel):
     """A workflow fan-in barrier — pure coordination contract, NO payload.
 
@@ -447,8 +417,6 @@ class FanInGroup(BaseModel):
     expect_replies: int
     quorum: int
     result_schema: dict[str, Any]
-    budget_tokens: int | None = None
-    dry_round: int = 0
     deadline: datetime
     status: FanInStatus = "open"
     created_at: datetime | None = None

@@ -82,7 +82,6 @@ CREATE TABLE IF NOT EXISTS tasks (
   resume_ready      INTEGER NOT NULL DEFAULT 0,
   checkpoint        TEXT,
   tier_overrides    TEXT,
-  deadline          TEXT,
   metadata          TEXT,
   -- Optional per-task git working copy. JSON-encoded GitContext
   -- (repo_url / base_branch / target_branch). NULL means the worker
@@ -327,50 +326,11 @@ CREATE INDEX IF NOT EXISTS scheduled_mail_creator
   ON scheduled_mail(created_by_agent, status);
 
 ------------------------------------------------------------
--- Local-hot, Artifacts, Skills, Blobs
+-- Blobs
 ------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS local_hot (
-  task_id      TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-  key          TEXT NOT NULL,
-  value        TEXT,
-  blob_uri     TEXT,
-  updated_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-  PRIMARY KEY (task_id, key)
-);
-
-CREATE TABLE IF NOT EXISTS artifacts (
-  id             TEXT PRIMARY KEY,
-  task_id        TEXT NOT NULL REFERENCES tasks(id),
-  wakeup_id      TEXT NOT NULL REFERENCES wakeups(id),
-  kind           TEXT NOT NULL,
-  content_hash   TEXT NOT NULL,
-  blob_uri       TEXT NOT NULL,
-  size_bytes     INTEGER,
-  metadata       TEXT,
-  created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-  UNIQUE (content_hash)
-);
-
-CREATE INDEX IF NOT EXISTS artifacts_task ON artifacts(task_id);
-
-CREATE TABLE IF NOT EXISTS skills (
-  id              TEXT PRIMARY KEY,
-  name            TEXT NOT NULL UNIQUE,
-  frontmatter     TEXT NOT NULL,
-  body            TEXT NOT NULL,
-  status          TEXT NOT NULL
-                  CHECK (status IN ('proposed','approved','deprecated')),
-  source_task_id  TEXT REFERENCES tasks(id),
-  reviewer        TEXT,
-  reviewed_at     TEXT,
-  scope           TEXT,
-  metadata        TEXT,
-  created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-  updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-);
-
-CREATE INDEX IF NOT EXISTS skills_status ON skills(status);
-CREATE INDEX IF NOT EXISTS skills_scope ON skills(scope, status);
+-- (The local_hot / artifacts / skills tables were removed as dead schema
+-- — never written or read by live code. Local-hot state is tasks.checkpoint;
+-- skills are direct-read markdown under ~/.lyre/skills/, not DB-backed.)
 
 -- Blob registry: multimodal attachments (images, PDFs, ...) the dashboard
 -- uploads and adapters resolve at send time. Bytes live in the object
@@ -407,8 +367,6 @@ CREATE TABLE IF NOT EXISTS fan_in_groups (
   expect_replies       INTEGER NOT NULL,            -- intended width (durable)
   quorum               INTEGER NOT NULL,            -- trips at >= quorum delivered
   result_schema        TEXT NOT NULL,               -- JSON Schema each result validates against
-  budget_tokens        INTEGER,                     -- reserved for loop-until-budget (PR7)
-  dry_round            INTEGER NOT NULL DEFAULT 0,   -- reserved for loop-until-dry (PR7)
   -- NOT NULL: every group is reapable, so a dead coordinator cannot leak an
   -- open group forever — Phase 0.5 expires it past deadline (liveness).
   deadline             TEXT NOT NULL,

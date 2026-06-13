@@ -40,9 +40,6 @@ async def _fan_in_open(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]
     deadline_s = args.get("deadline_in_s", _DEFAULT_DEADLINE_S)
     if not isinstance(deadline_s, int) or not (1 <= deadline_s <= _MAX_DEADLINE_S):
         raise ToolError(f"deadline_in_s must be an integer in 1..{_MAX_DEADLINE_S}")
-    budget = args.get("budget_tokens")
-    if budget is not None and (not isinstance(budget, int) or budget < 0):
-        raise ToolError("budget_tokens must be a non-negative integer if provided")
 
     group = FanInGroup(
         id=f"fanin-{uuid.uuid4().hex[:16]}",
@@ -51,7 +48,6 @@ async def _fan_in_open(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]
         expect_replies=expect,
         quorum=quorum,
         result_schema=schema,
-        budget_tokens=budget,
         deadline=datetime.now(tz=UTC) + timedelta(seconds=deadline_s),
     )
     await ctx.repos.fan_in.create_group(group)
@@ -204,10 +200,6 @@ FAN_IN_OPEN = Tool(
                     "Soft timeout in seconds (default 1800). Past it the barrier "
                     "resolves with whatever arrived so it never hangs forever."
                 ),
-            },
-            "budget_tokens": {
-                "type": "integer",
-                "description": "Reserved for loop-until-budget (not enforced yet).",
             },
         },
         "required": ["expect_replies", "result_schema"],

@@ -257,21 +257,6 @@ async def test_outbox_enqueue_idempotent_and_dequeue(
 
 
 @pytest.mark.asyncio
-async def test_local_hot_round_trip(repos: SqliteRepositories) -> None:
-    await repos.personas.upsert(
-        Persona(name="w", role_description="w", system_prompt="w")
-    )
-    task_id = await repos.tasks.create(TaskSpec(persona_name="w", goal="g", acceptance="a"))
-
-    await repos.local_hot.put(task_id, "edits", {"files": ["README.md"]})
-    val = await repos.local_hot.get(task_id, "edits")
-    assert val == {"files": ["README.md"]}
-
-    await repos.local_hot.clear_task(task_id)
-    assert await repos.local_hot.get(task_id, "edits") is None
-
-
-@pytest.mark.asyncio
 async def test_wakeup_start_persists_agent_id(
     repos: SqliteRepositories,
 ) -> None:
