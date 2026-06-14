@@ -299,7 +299,7 @@ CREATE TABLE IF NOT EXISTS scheduled_mail (
   -- the capping delivery is the FINAL wake and the row stops re-arming.
   no_progress_count INTEGER NOT NULL DEFAULT 0,
   max_no_progress   INTEGER,
-  -- Poison-row quarantine (F2): CONSECUTIVE Phase −1 delivery attempts that
+  -- Poison-row quarantine: CONSECUTIVE Phase −1 delivery attempts that
   -- raised — mark_delivered resets it to 0, so transient blips spread over a
   -- recurring row's lifetime never accumulate. At the quarantine threshold
   -- the row flips to status='quarantined' (terminal, excluded by the

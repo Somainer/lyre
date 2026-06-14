@@ -348,9 +348,9 @@ class Config:
     # tools dispatch only post-turn, so a discarded partial has no durable side
     # effect. 0 keeps the old mid-stream-fatal behavior. See FAILURE_ROBUSTNESS.md §5.
     midstream_max_retries: int = 1
-    # F2 observability — structured logs to a rotating file under
+    # Observability: structured logs to a rotating file under
     # <lyre_home>/logs/ in addition to the console. log_level filters BOTH
-    # sinks; log_to_file=False keeps the pre-F2 console-only behavior.
+    # sinks; log_to_file=False keeps the console-only behavior.
     # The file is JSONL (one structlog event per line) so incidents are a
     # grep/jq away instead of "whatever scrolled past in the terminal" —
     # and wakeup SUBPROCESSES append to the same file, whose stdout was

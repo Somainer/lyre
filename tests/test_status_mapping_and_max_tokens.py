@@ -272,7 +272,7 @@ async def test_dispatch_tool_passes_through_well_formed_args(
 
 
 # ---------------------------------------------------------------------------
-# S1: a budget-truncated turn's FINAL tool call is refused even when its
+# A budget-truncated turn's FINAL tool call is refused even when its
 # arguments parse — constrained decoding / JSON-repairing gateways can close
 # a string cut mid-emission into a VALID but silently shortened payload
 # (the classic catastrophe: `rm /path/...` arriving as `rm /`).

@@ -1,4 +1,4 @@
-"""configure_logging: the F2 observability contract — structlog events
+"""configure_logging: the observability contract — structlog events
 reach BOTH the human console (stdout, unchanged dev experience) and a
 JSONL file; the serve process rotates, subprocesses follow rotation.
 

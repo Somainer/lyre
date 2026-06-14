@@ -290,7 +290,7 @@ class ScheduledMail(BaseModel):
     # rounds. None/0 max = gate off.
     no_progress_count: int = 0
     max_no_progress: int | None = None
-    # Poison-row quarantine (F2): consecutive Phase −1 delivery attempts
+    # Poison-row quarantine: consecutive Phase −1 delivery attempts
     # that raised; at the threshold the row is quarantined (terminal).
     delivery_failure_count: int = 0
 
