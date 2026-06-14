@@ -145,12 +145,6 @@ class Usage(StreamEvent):
     output_tokens: int
 
 
-@dataclass
-class StreamError(StreamEvent):
-    error_kind: Literal["api_error", "timeout", "rate_limit", "cancelled"]
-    detail: str
-
-
 # ---------------------------------------------------------------------------
 # Adapter Protocol
 # ---------------------------------------------------------------------------

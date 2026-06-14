@@ -18,7 +18,6 @@ if TYPE_CHECKING:
 from .models import (
     Agent,
     AgentIdle,
-    Artifact,
     Blob,
     FanInGroup,
     FanInMember,
@@ -28,7 +27,6 @@ from .models import (
     OutboxRow,
     Persona,
     ScheduledMail,
-    Skill,
     SupervisionState,
     Task,
     TaskSpec,
@@ -623,42 +621,6 @@ class ScheduledMailRepository(Protocol):
         ...
 
 
-class SkillRepository(Protocol):
-    async def get_by_name(self, name: str) -> Skill | None: ...
-    async def list_active(
-        self, scope: str | None = None, status: str = "approved"
-    ) -> list[Skill]: ...
-    async def propose(
-        self,
-        name: str,
-        frontmatter: dict[str, Any],
-        body: str,
-        source_task_id: str,
-        scope: str | None = None,
-    ) -> str: ...
-    async def approve(
-        self,
-        skill_id: str,
-        reviewer: str,
-        status: str,
-        comment: str | None = None,
-    ) -> None: ...
-
-
-class ArtifactRepository(Protocol):
-    async def insert(
-        self,
-        task_id: str,
-        wakeup_id: str,
-        kind: str,
-        content_hash: str,
-        blob_uri: str,
-        size_bytes: int | None = None,
-    ) -> str: ...
-    async def get_by_hash(self, content_hash: str) -> Artifact | None: ...
-    async def find_by_task(self, task_id: str) -> list[Artifact]: ...
-
-
 class FanInRepository(Protocol):
     """Workflow fan-in barrier: the coordination contract + lineage roster.
     Payload-free — results ride mailbox_messages, not these rows."""
@@ -709,12 +671,6 @@ class SupervisionRepository(Protocol):
     async def mark_escalated(self, agent_id: str, now: datetime) -> None: ...
 
 
-class LocalHotRepository(Protocol):
-    async def put(self, task_id: str, key: str, value: Any) -> None: ...
-    async def get(self, task_id: str, key: str) -> Any | None: ...
-    async def clear_task(self, task_id: str) -> None: ...
-
-
 class BlobRepository(Protocol):
     """Content-addressed binary blobs (images, documents).
 
@@ -744,9 +700,6 @@ class Repositories(Protocol):
     mailbox: MailboxRepository
     scheduled_mail: ScheduledMailRepository
     outbox: OutboxRepository
-    skills: SkillRepository
-    artifacts: ArtifactRepository
-    local_hot: LocalHotRepository
     blobs: BlobRepository
     fan_in: FanInRepository
     supervision: SupervisionRepository

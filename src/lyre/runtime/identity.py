@@ -48,13 +48,6 @@ def is_valid_agent_id(agent_id: str) -> bool:
     return bool(AGENT_ID_RE.fullmatch(agent_id))
 
 
-def is_bare_id(agent_id: str) -> bool:
-    """True iff ``agent_id`` has no ``/`` — i.e. is in the bare form used
-    by bootstrap-seeded agents. NOT a check on whether the agent IS
-    bootstrap (that's DB state via ``parent_agent_id IS NULL``)."""
-    return "/" not in agent_id
-
-
 def split_id(agent_id: str) -> tuple[str, str | None]:
     """``worker-maintainer/refactor-auth`` → (``worker-maintainer``,
     ``refactor-auth``). Bare ids return (id, None)."""
@@ -89,19 +82,3 @@ def agent_notes_rel_path(agent_id: str) -> str:
     identity preamble that tells the agent where its notebook lives), and
     wakeup_summary (the runtime appender/rotator)."""
     return f"facts/agent-{flat_id(agent_id)}-notes.md"
-
-
-def validate_agent_id(agent_id: str) -> None:
-    """Raise ValueError if ``agent_id`` doesn't match the grammar.
-
-    Use at trust boundaries: the ``create_agent`` tool, the
-    ``mailbox_send`` recipient validator, the dashboard send form. Anti-
-    hallucination measure: models invent agent ids like
-    ``leader-scheduler`` from time to time.
-    """
-    if not is_valid_agent_id(agent_id):
-        raise ValueError(
-            f"invalid agent_id {agent_id!r}: must be a bare lowercase "
-            f"token or ``persona/name`` with each segment matching "
-            f"{_PERSONA_RE!r}."
-        )

@@ -27,7 +27,6 @@ from .fs_personas import FilesystemPersonaRepository
 from .models import (
     Agent,
     AgentIdle,
-    Artifact,
     Blob,
     FanInGroup,
     FanInMember,
@@ -37,7 +36,6 @@ from .models import (
     MailReaction,
     OutboxRow,
     ScheduledMail,
-    Skill,
     SupervisionState,
     Task,
     TaskSpec,
@@ -45,15 +43,12 @@ from .models import (
 )
 from .repositories import (
     AgentRepository,
-    ArtifactRepository,
     BlobRepository,
     FanInRepository,
-    LocalHotRepository,
     MailboxRepository,
     OutboxRepository,
     PersonaRepository,
     ScheduledMailRepository,
-    SkillRepository,
     SupervisionRepository,
     TaskRepository,
     WakeupRepository,
@@ -475,9 +470,9 @@ class SqliteTaskRepository:
             """
             INSERT INTO tasks (
               id, parent_task_id, agent_id, persona_name, goal, acceptance,
-              status, lease_duration_s, tier_overrides, deadline, metadata,
+              status, lease_duration_s, tier_overrides, metadata,
               git_context
-            ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -488,7 +483,6 @@ class SqliteTaskRepository:
                 spec.acceptance,
                 spec.lease_duration_s,
                 _json(spec.tier_overrides),
-                spec.deadline.isoformat() if spec.deadline else None,
                 _json(spec.metadata),
                 git_ctx_json,
             ),
@@ -2209,109 +2203,6 @@ class SqliteOutboxRepository:
             return await cur.fetchone() is not None
 
 
-# -----------------------------------------------------------------------
-# Local-hot
-# -----------------------------------------------------------------------
-class SqliteLocalHotRepository:
-    def __init__(self, conn: aiosqlite.Connection):
-        self.conn = conn
-
-    async def put(self, task_id: str, key: str, value: Any) -> None:
-        await self.conn.execute(
-            """
-            INSERT INTO local_hot (task_id, key, value)
-            VALUES (?, ?, ?)
-            ON CONFLICT(task_id, key) DO UPDATE SET
-              value = excluded.value,
-              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-            """,
-            (task_id, key, _json(value)),
-        )
-        await _commit(self.conn)
-
-    async def get(self, task_id: str, key: str) -> Any | None:
-        async with self.conn.execute(
-            "SELECT value FROM local_hot WHERE task_id = ? AND key = ?",
-            (task_id, key),
-        ) as cur:
-            row = await cur.fetchone()
-        return _parse_json(row["value"]) if row else None
-
-    async def clear_task(self, task_id: str) -> None:
-        await self.conn.execute(
-            "DELETE FROM local_hot WHERE task_id = ?", (task_id,)
-        )
-        await _commit(self.conn)
-
-
-# -----------------------------------------------------------------------
-# Stubs for Sprint 0: declared to satisfy Protocol, raise NotImplementedError
-# -----------------------------------------------------------------------
-class SqliteSkillRepository:
-    def __init__(self, conn: aiosqlite.Connection):
-        self.conn = conn
-
-    async def get_by_name(self, name: str) -> Skill | None:
-        return None
-
-    async def list_active(
-        self, scope: str | None = None, status: str = "approved"
-    ) -> list[Skill]:
-        return []
-
-    async def propose(
-        self,
-        name: str,
-        frontmatter: dict[str, Any],
-        body: str,
-        source_task_id: str,
-        scope: str | None = None,
-    ) -> str:
-        raise NotImplementedError("Sprint 0 stub")
-
-    async def approve(
-        self,
-        skill_id: str,
-        reviewer: str,
-        status: str,
-        comment: str | None = None,
-    ) -> None:
-        raise NotImplementedError("Sprint 0 stub")
-
-
-class SqliteArtifactRepository:
-    def __init__(self, conn: aiosqlite.Connection):
-        self.conn = conn
-
-    async def insert(
-        self,
-        task_id: str,
-        wakeup_id: str,
-        kind: str,
-        content_hash: str,
-        blob_uri: str,
-        size_bytes: int | None = None,
-    ) -> str:
-        artifact_id = _uuid7()
-        await self.conn.execute(
-            """
-            INSERT INTO artifacts (
-              id, task_id, wakeup_id, kind, content_hash, blob_uri, size_bytes
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT (content_hash) DO NOTHING
-            """,
-            (artifact_id, task_id, wakeup_id, kind, content_hash, blob_uri, size_bytes),
-        )
-        await _commit(self.conn)
-        return artifact_id
-
-    async def get_by_hash(self, content_hash: str) -> Artifact | None:
-        return None
-
-    async def find_by_task(self, task_id: str) -> list[Artifact]:
-        return []
-
-
 class SqliteBlobRepository:
     """Metadata for content-addressed blobs (images, documents).
 
@@ -2403,8 +2294,8 @@ class SqliteFanInRepository:
             """
             INSERT INTO fan_in_groups (
               id, coordinator_agent_id, parent_task_id, expect_replies,
-              quorum, result_schema, budget_tokens, deadline, status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open')
+              quorum, result_schema, deadline, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'open')
             """,
             (
                 group.id,
@@ -2413,7 +2304,6 @@ class SqliteFanInRepository:
                 group.expect_replies,
                 group.quorum,
                 _json(group.result_schema),
-                group.budget_tokens,
                 group.deadline.isoformat(),
             ),
         )
@@ -2550,8 +2440,6 @@ class SqliteFanInRepository:
             expect_replies=row["expect_replies"],
             quorum=row["quorum"],
             result_schema=_parse_json(row["result_schema"]) or {},
-            budget_tokens=row["budget_tokens"],
-            dry_round=row["dry_round"],
             deadline=row["deadline"],  # pydantic coerces the ISO string
             status=row["status"],
             created_at=row["created_at"],  # needed by the global fan-in TTL
@@ -2679,9 +2567,6 @@ class SqliteRepositories:
     mailbox: MailboxRepository
     scheduled_mail: ScheduledMailRepository
     outbox: OutboxRepository
-    skills: SkillRepository
-    artifacts: ArtifactRepository
-    local_hot: LocalHotRepository
     blobs: BlobRepository
     fan_in: FanInRepository
     supervision: SupervisionRepository
@@ -2720,9 +2605,6 @@ class SqliteRepositories:
         self.mailbox = SqliteMailboxRepository(conn)
         self.scheduled_mail = SqliteScheduledMailRepository(conn)
         self.outbox = SqliteOutboxRepository(conn)
-        self.skills = SqliteSkillRepository(conn)
-        self.artifacts = SqliteArtifactRepository(conn)
-        self.local_hot = SqliteLocalHotRepository(conn)
         self.blobs = SqliteBlobRepository(conn)
         self.fan_in = SqliteFanInRepository(conn)
         self.supervision = SqliteSupervisionRepository(conn)

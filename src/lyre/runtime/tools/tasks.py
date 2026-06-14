@@ -156,7 +156,6 @@ async def _dispatch_task(ctx: ToolContext, args: dict[str, Any]) -> dict[str, An
         acceptance=acceptance,
         parent_task_id=ctx.task_id,
         lease_duration_s=lease_duration_s,
-        deadline=None,
         metadata=metadata,
         git_context=git_ctx,
         tier_overrides=tier_overrides,
