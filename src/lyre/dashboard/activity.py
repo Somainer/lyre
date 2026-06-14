@@ -555,8 +555,8 @@ def _tail_transcript_events(
 
 
 def wakeup_matches_agent(w: Wakeup, agent_id: str) -> bool:
-    """Match on agent_id when the column is populated (post-A3), falling
-    back to persona_name for legacy rows."""
+    """Match on agent_id when the column is populated (newer rows), falling
+    back to persona_name for legacy rows where it's NULL."""
     return (
         (w.agent_id == agent_id)
         or (w.agent_id is None and w.persona_name == agent_id)
@@ -617,8 +617,8 @@ async def build_activity(
 
     if agent_id is not None:
         # Filter to events that involve this agent. We match on agent_id
-        # when the column is populated (post-A3) and fall back to
-        # persona_name for legacy rows.
+        # when the column is populated (newer rows) and fall back to
+        # persona_name for legacy rows where it's NULL.
         def _task_matches(t: Task) -> bool:
             return (
                 (t.agent_id == agent_id)

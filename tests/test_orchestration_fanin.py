@@ -129,7 +129,7 @@ def _fake_sched(repos: SqliteRepositories) -> SimpleNamespace:
     fake = SimpleNamespace(
         repos=repos,
         config=SimpleNamespace(fanin_max_age_s=0),
-        # F2 poison-group counter the real __init__ owns.
+        # Poison-group counter the real __init__ owns.
         _fanin_failures={},
     )
     # _resolve_fan_in_barriers calls these on self; bind the real methods

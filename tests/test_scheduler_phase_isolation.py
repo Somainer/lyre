@@ -1,4 +1,4 @@
-"""F2 scheduler phase isolation: one poison row must fail ALONE.
+"""Scheduler phase isolation: one poison row must fail ALONE.
 
 Before these guards, one exception anywhere in Phase −1/0.5/0 aborted the
 whole tick — run() caught it, the next tick failed at the same row, and a

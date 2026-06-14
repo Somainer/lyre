@@ -70,7 +70,7 @@ from ..runtime.worktree import WorktreeHandle, WorktreeManager
 log = structlog.get_logger()
 
 
-# F2 poison-row thresholds: consecutive failing attempts before the
+# Poison-row thresholds: consecutive failing attempts before the
 # scheduler stops retrying a row it can never process. Small on purpose —
 # every attempt burns a delivery/resolution slot each tick, and a
 # genuinely transient failure (DB lock blip) clears in one tick, not
@@ -282,7 +282,7 @@ class Scheduler:
         # C4: monotonic timestamp of the last DB maintenance run (None = never).
         # The maintenance phase runs at most once per maintenance_interval_s.
         self._last_maintenance: float | None = None
-        # F2 poison-group guard: consecutive Phase 0.5 resolution failures
+        # Poison-group guard: consecutive Phase 0.5 resolution failures
         # per fan-in group id. In-memory on purpose — a restart retries the
         # group fresh, and if it's genuinely poisoned it re-quarantines
         # within _FANIN_QUARANTINE_AFTER ticks; no schema rent for a counter
@@ -613,7 +613,7 @@ class Scheduler:
             try:
                 await self._auto_dispatch_one_agent(agent, busy_agent_ids)
             except Exception as exc:  # noqa: BLE001
-                # F2 row isolation: one agent whose wake bookkeeping raises
+                # Row isolation: one agent whose wake bookkeeping raises
                 # (corrupt mail metadata, FK surprise) must not block the
                 # auto-wake scan for every OTHER agent with unread mail.
                 log.exception(
@@ -746,7 +746,7 @@ class Scheduler:
                 await self._resolve_one_fan_in_group(g, now, max_age)
                 self._fanin_failures.pop(g.id, None)
             except Exception as exc:  # noqa: BLE001
-                # F2 row isolation: one unresolvable group must not block
+                # Row isolation: one unresolvable group must not block
                 # the other barriers (or, pre-guard, the whole tick).
                 log.exception(
                     "fan_in_resolution_failed", group_id=g.id, error=str(exc)
@@ -1413,7 +1413,7 @@ class Scheduler:
             try:
                 await self._deliver_one_scheduled_mail(sched, now)
             except Exception as exc:  # noqa: BLE001
-                # F2 row isolation: one undeliverable row must not block the
+                # Row isolation: one undeliverable row must not block the
                 # rest of this tick's due mail — before this guard it aborted
                 # the WHOLE tick, so a single poison row (corrupt recurrence,
                 # FK surprise, …) starved every dispatch phase forever.

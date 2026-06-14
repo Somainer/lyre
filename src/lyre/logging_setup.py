@@ -1,4 +1,4 @@
-"""Process-wide logging configuration (F2 observability).
+"""Process-wide logging configuration (observability).
 
 Before this module, structlog ran on its import-time defaults: pretty
 console lines to stdout, nothing persisted. A `lyre serve` running as a
